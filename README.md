@@ -31,7 +31,9 @@ cargo build --locked -p lispm-kernel-emacs
 python3 scripts/test-emacs.py
 ```
 
-For desktop parity/broker tests, set `LISPM_DESKTOP_ROOT=/path/to/lispm-desktop`.
+Check this repository out next to lispm-desktop (`~/agents/lispm-kernel` beside
+`~/agents/lispm-desktop`, say): the desktop parity/broker tests and the session
+benchmark find it as `../lispm-desktop`. Set `LISPM_DESKTOP_ROOT` to use another checkout.
 Build a distributable local module with:
 
 ```

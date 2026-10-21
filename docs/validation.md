@@ -43,16 +43,12 @@ G0 still needs representative desktop workloads and before/after evidence. G3 no
 polling is used at the Emacs boundary; direct notification wiring remains optional.
 The shared broker preserves the existing terminal implementation.
 
-Linux/macOS CI is configured but has not run remotely. Local Git signing and network
-access were blocked in this execution environment; this checkout was initialized
-locally and has not fetched or reconciled the remote README history. After restoring access, fetch remote main and reconcile this staged working tree
-with that existing history before committing/publishing; do not force-push a new root.
-
 ## Real session client and broker checkpoint
 
 The current suite includes 34 Rust tests and 23 real-module/desktop ERT tests.
-Use `LISPM_DESKTOP_ROOT=/path/to/lispm-desktop python3 scripts/test-emacs.py` to
-include parser parity, reversible desktop integration, bounded admission retries,
+`python3 scripts/test-emacs.py` runs the desktop tests against a lispm-desktop
+checkout next to this one (`../lispm-desktop`), or against `LISPM_DESKTOP_ROOT`.
+They include parser parity, reversible desktop integration, bounded admission retries,
 and shared broker scheduling. These load the real module; they are not mock-only
 transport tests. Existing terminal regression with integration enabled: 24/24 pass.
 The full desktop suite with kernel integration loaded but disabled: 421 pass,
@@ -88,8 +84,10 @@ Reproduce the real PTY mixed load using:
 ```
 cargo build --release --locked -p lispm-kernel-emacs
 LISPM_KERNEL_PROFILE=release LISPM_BENCH_TERMINALS=8 LISPM_BENCH_BROKER=1 \
-  python3 scripts/bench-sessions.py /path/to/lispm-desktop
+  python3 scripts/bench-sessions.py [/path/to/lispm-desktop]
 ```
+
+Without an argument the benchmark uses `../lispm-desktop`.
 
 These are generated fixtures and batch timer-lateness probes. Physical key delivery,
 GUI redisplay, and actual input-to-paint percentiles remain an explicit acceptance
@@ -100,9 +98,4 @@ packaged module and bundled Lisp files. All four Lisp files also pass byte
 compilation with warnings treated as errors; compiled and source integration
 paths were verified. Idle workers now use retained park/unpark tokens rather than
 periodic polling. Three final 8-PTY shared-broker runs pass all provisional batch
-checks recorded in session-benchmark.json. GUI acceptance and remote CI remain open.
-
-Remote branch creation was retried via the authenticated GitHub connector and
-returned 403 Resource not accessible by integration. Terminal Git still cannot
-resolve github.com; no implementation branch, PR, signed commit or release has
-been published. The previously created repository and design Issue still exist.
+checks recorded in session-benchmark.json. GUI acceptance remains open.

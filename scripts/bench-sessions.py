@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
-"""Run synthetic session benchmark against an explicitly selected desktop checkout."""
+# Copyright (C) 2026  Ryan.K
+# SPDX-License-Identifier: AGPL-3.0-or-later
+"""Run synthetic session benchmark against a desktop checkout (default: ../lispm-desktop)."""
 import json
 import os
 from pathlib import Path
@@ -7,9 +9,11 @@ import subprocess
 import resource
 import sys
 root = Path(__file__).resolve().parents[1]
-if len(sys.argv) != 2:
-    sys.exit("Usage: python3 scripts/bench-sessions.py /path/to/lispm-desktop")
-desktop = Path(sys.argv[1]).resolve()
+if len(sys.argv) > 2:
+    sys.exit("Usage: python3 scripts/bench-sessions.py [/path/to/lispm-desktop]")
+desktop = Path(sys.argv[1]).resolve() if len(sys.argv) == 2 else root.parent / "lispm-desktop"
+if not (desktop / "lisp").is_dir():
+    sys.exit(f"No lispm-desktop checkout at {desktop}")
 metadata = json.loads(subprocess.check_output(["cargo", "metadata", "--offline", "--no-deps", "--format-version", "1"], cwd=root))
 suffix = ".dylib" if sys.platform == "darwin" else ".so"
 modules = [p for p in Path(metadata["target_directory"]).rglob("liblispm_kernel_emacs" + suffix) if p.parent.name == os.environ.get("LISPM_KERNEL_PROFILE", "debug")]

@@ -65,18 +65,10 @@ See `docs/session-benchmark.json` and `docs/validation.md`.
 - [x] Restore original schedulers/providers and cancel owned timers on disable.
 - [x] Build a local release bundle with four Lisp files, protocol/hash manifest and
   binary-derived architecture labeling.
-- [ ] Run Linux/macOS CI and publish a reviewable branch/PR/release after access works.
+- [ ] Green Linux/macOS CI on main and a first tagged release.
 - [ ] Complete interactive G0 acceptance before default enablement/API stabilization.
 
-## Collaboration and current blockers
+## Baseline
 
-Codex scope: kernel repository, adapter/bridge/broker, opt-in integration, tests,
-benchmarks and documentation. No tracked desktop files or Claude's work were edited.
-The desktop baseline during this execution was e6c4adc24e335522874c009df336e624ba31c733.
-
-The local repository was initialized because GitHub DNS was unavailable; it has not
-fetched remote history. GPG signing was also inaccessible in the sandbox. Reconcile
-with remote main before any commit/push; do not force-push a new root history.
-
-Current verified counts: 34 Rust tests, 23 integration ERT tests, 24 terminal tests.
-Full desktop regression: 421 pass / 1 skip / 1 failure due to denied server socket bind.
+Desktop baseline: e6c4adc24e335522874c009df336e624ba31c733, the commit CI checks out.
+Verified counts: 34 Rust tests, 23 integration ERT tests, 24 terminal tests.

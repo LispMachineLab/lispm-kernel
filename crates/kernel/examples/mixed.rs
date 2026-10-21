@@ -1,3 +1,6 @@
+// Copyright (C) 2026  Ryan.K
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Synthetic runtime pressure benchmark, NOT an Emacs input-latency benchmark.
 use lispm_kernel::{Config, Error, JobOptions, Kernel, Outcome, WorkClass};
 use std::thread;
