@@ -1,4 +1,4 @@
-;;; lispm-kernel-broker.el --- Shared cooperative frontend budget -*- lexical-binding: t; -*-
+;;; lispm-kernel-broker.el --- Kernel dispatch on the desktop's frame clock -*- lexical-binding: t; -*-
 
 ;; Copyright (C) 2026  Ryan.K
 
@@ -22,128 +22,72 @@
 ;; along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 ;;; Commentary:
-;; Coordinate one desktop kernel runtime and the existing terminal frame scheduler.
-;; PTY threads, parsing, retained status/exit/clipboard events, visible-first ordering
-;; and actual rendering remain the terminal module's responsibility.
+;; Run one kernel runtime's dispatch as a client of LispM Desktop's frame clock
+;; (lispm-desktop-frame): after the terminals of each frame, within what is left
+;; of the frame's budget.  The clock gives way to typing for every client after
+;; the first, so terminals keep their own policy and the kernel waits.
 ;;; Code:
 (require 'lispm-kernel)
-(declare-function lispm-kernel-module-monotonic "ext:lispm-kernel-module" ())
-(defvar lispm-desktop-term--last-frame)
-(defvar lispm-desktop-term-frame-interval)
-(defvar lispm-desktop-term-frame-budget)
-(defvar lispm-desktop-term--timer)
-(declare-function lispm-desktop-term--tick "ext:lispm-desktop-term" ())
-(declare-function lispm-desktop-term--schedule "ext:lispm-desktop-term" ())
-(defcustom lispm-kernel-broker-slice-seconds 0.008
-  "Soft total budget for terminal drawing and native result application."
-  :type 'number :group 'lispm-kernel)
-(defvar lispm-kernel-broker--runtime nil)
-(defvar lispm-kernel-broker--timer nil)
-(defvar lispm-kernel-broker--terminal-due nil)
-(defvar lispm-kernel-broker--kernel-due nil)
-(defvar lispm-kernel-broker--running nil)
-(defvar lispm-kernel-broker-overruns 0)
-(defvar lispm-kernel-broker-last-error nil)
+(declare-function lispm-desktop-frame-add-client "ext:lispm-desktop-frame" (name function &optional depth))
+(declare-function lispm-desktop-frame-remove-client "ext:lispm-desktop-frame" (name))
+(declare-function lispm-desktop-frame-request "ext:lispm-desktop-frame" (name))
 
-(defun lispm-kernel-broker--arm ()
-  "Schedule one timer for the earliest outstanding cooperative slice."
-  (unless lispm-kernel-broker--running
-    (when lispm-kernel-broker--timer (cancel-timer lispm-kernel-broker--timer))
-    (setq lispm-kernel-broker--timer nil)
-    (let ((times (delq nil (list lispm-kernel-broker--terminal-due lispm-kernel-broker--kernel-due))))
-      (when times
-        ;; Positive delay returns control to the event loop between busy slices.
-        (setq lispm-kernel-broker--timer
-              (run-at-time (max 0.001 (- (apply #'min times) (lispm-kernel-module-monotonic)))
-                           nil #'lispm-kernel-broker--tick))))))
+(defconst lispm-kernel-broker-depth 10
+  "Frame clock depth of kernel dispatch: after the terminals, at depth 0.")
 
-(defun lispm-kernel-broker--terminal-schedule (original &rest args)
-  "Coordinate ORIGINAL terminal scheduler without changing its frame interval."
-  (if (null lispm-kernel-broker--runtime) (apply original args)
-    (unless lispm-kernel-broker--terminal-due
-      (setq lispm-kernel-broker--terminal-due
-            (+ (lispm-kernel-module-monotonic)
-               (max 0 (- (+ lispm-desktop-term--last-frame lispm-desktop-term-frame-interval)
-                         (float-time))))))
-    (lispm-kernel-broker--arm)))
+(defvar lispm-kernel-broker--runtime nil
+  "The runtime dispatched on the frame clock, or nil.")
 
-(defun lispm-kernel-broker--kernel-schedule (original runtime &optional immediate)
-  "Coordinate RUNTIME dispatch while keeping unrelated runtimes independent."
-  (if (not (eq runtime lispm-kernel-broker--runtime)) (funcall original runtime immediate)
-    (let ((due (+ (lispm-kernel-module-monotonic) (if immediate 0.001 lispm-kernel-poll-seconds))))
-      (setq lispm-kernel-broker--kernel-due
-            (min due (or lispm-kernel-broker--kernel-due due))))
-    (lispm-kernel-broker--arm)))
+(defun lispm-kernel-broker-available-p ()
+  "Return non-nil when LispM Desktop's frame clock can be loaded."
+  (and (require 'lispm-desktop-frame nil t)
+       (fboundp 'lispm-desktop-frame-add-client)))
 
-(defun lispm-kernel-broker--tick ()
-  "Run due terminal work first, then kernel callbacks within the remaining budget."
-  (setq lispm-kernel-broker--timer nil)
-  (when (and lispm-kernel-broker--runtime (not lispm-kernel-broker--running))
-    (let* ((lispm-kernel-broker--running t)
-           (start (lispm-kernel-module-monotonic))
-           (deadline (+ start lispm-kernel-broker-slice-seconds)))
-      (unwind-protect
-          (if (input-pending-p)
-              (progn
-                (when lispm-kernel-broker--terminal-due
-                  (setq lispm-kernel-broker--terminal-due (+ start lispm-kernel-poll-seconds)))
-                (when lispm-kernel-broker--kernel-due
-                  (setq lispm-kernel-broker--kernel-due (+ start lispm-kernel-poll-seconds))))
-            (when (and lispm-kernel-broker--terminal-due
-                       (<= lispm-kernel-broker--terminal-due start))
-              (setq lispm-kernel-broker--terminal-due nil)
-              (let ((lispm-desktop-term-frame-budget (min lispm-desktop-term-frame-budget
-                                                          lispm-kernel-broker-slice-seconds)))
-                (condition-case error
-                    (lispm-desktop-term--tick)
-                  (error (setq lispm-kernel-broker-last-error error)))))
-            (when (and lispm-kernel-broker--kernel-due
-                       (<= lispm-kernel-broker--kernel-due (lispm-kernel-module-monotonic))
-                       (< (lispm-kernel-module-monotonic) deadline)
-                       (not (input-pending-p)))
-              (setq lispm-kernel-broker--kernel-due nil)
-              (let ((lispm-kernel-slice-seconds
-                     (min lispm-kernel-slice-seconds (- deadline (lispm-kernel-module-monotonic)))))
-                (condition-case error
-                    (lispm-kernel-dispatch lispm-kernel-broker--runtime)
-                  (error
-                   (setq lispm-kernel-broker-last-error error
-                         lispm-kernel-broker--kernel-due
-                         (+ (lispm-kernel-module-monotonic) lispm-kernel-poll-seconds)))))))
-        (when (> (lispm-kernel-module-monotonic) deadline) (cl-incf lispm-kernel-broker-overruns))))
-    ;; Running is dynamically rebound above; arming now cannot recurse.
-    (lispm-kernel-broker--arm)))
+(defun lispm-kernel-broker--schedule (runtime _immediate)
+  "Ask the frame clock for a frame when RUNTIME is the broker's.
+Return non-nil when it took RUNTIME, see `lispm-kernel-scheduler'."
+  (when (and lispm-kernel-broker--runtime (eq runtime lispm-kernel-broker--runtime))
+    (lispm-desktop-frame-request 'lispm-kernel)
+    t))
+
+(defun lispm-kernel-broker--frame (deadline)
+  "Dispatch the broker's runtime until DEADLINE, a `float-time'.
+Return non-nil while it waits for results, so the clock comes back."
+  (when-let* ((runtime lispm-kernel-broker--runtime))
+    (let ((lispm-kernel-slice-seconds (max 0 (- deadline (float-time)))))
+      (lispm-kernel-dispatch runtime))
+    (lispm-kernel-pending-p runtime)))
 
 (defun lispm-kernel-broker-start (runtime)
-  "Coordinate RUNTIME with the loaded desktop terminal scheduler."
+  "Dispatch RUNTIME on LispM Desktop's frame clock instead of its own timers."
+  (unless (lispm-kernel-broker-available-p)
+    (user-error "This LispM Desktop has no frame clock (lispm-desktop-frame); update it"))
   (when lispm-kernel-broker--runtime (lispm-kernel-broker-stop))
-  (require 'lispm-desktop-term)
-  (setq lispm-kernel-broker--runtime runtime)
-  (advice-add 'lispm-desktop-term--schedule :around #'lispm-kernel-broker--terminal-schedule)
-  (advice-add 'lispm-kernel--schedule :around #'lispm-kernel-broker--kernel-schedule)
-  (when lispm-desktop-term--timer
-    (cancel-timer lispm-desktop-term--timer)
-    (setq lispm-desktop-term--timer nil)
-    (lispm-desktop-term--schedule))
+  (setq lispm-kernel-broker--runtime runtime
+        lispm-kernel-scheduler #'lispm-kernel-broker--schedule)
+  (lispm-desktop-frame-add-client 'lispm-kernel #'lispm-kernel-broker--frame
+                                  lispm-kernel-broker-depth)
   (when-let* ((timer (lispm-kernel-runtime-timer runtime)))
     (cancel-timer timer)
-    (setf (lispm-kernel-runtime-timer runtime) nil)
-    (lispm-kernel--schedule runtime)))
+    (setf (lispm-kernel-runtime-timer runtime) nil))
+  (when (lispm-kernel-pending-p runtime)
+    (lispm-desktop-frame-request 'lispm-kernel)))
 
 (defun lispm-kernel-broker-stop ()
-  "Restore the original terminal scheduler and leave no broker timer behind."
-  (let ((runtime lispm-kernel-broker--runtime)
-        (terminal-pending lispm-kernel-broker--terminal-due))
+  "Leave the frame clock; the runtime schedules itself with timers again."
+  (let ((runtime lispm-kernel-broker--runtime))
     (setq lispm-kernel-broker--runtime nil)
-    (when lispm-kernel-broker--timer (cancel-timer lispm-kernel-broker--timer))
-    (setq lispm-kernel-broker--timer nil lispm-kernel-broker--terminal-due nil
-          lispm-kernel-broker--kernel-due nil)
-    (advice-remove 'lispm-desktop-term--schedule #'lispm-kernel-broker--terminal-schedule)
-    (advice-remove 'lispm-kernel--schedule #'lispm-kernel-broker--kernel-schedule)
-    (when terminal-pending (lispm-desktop-term--schedule))
-    (when (and runtime (not (lispm-kernel-runtime-closed runtime))
-               (> (hash-table-count (lispm-kernel-runtime-callbacks runtime)) 0))
+    (when (eq lispm-kernel-scheduler #'lispm-kernel-broker--schedule)
+      (setq lispm-kernel-scheduler nil))
+    (when (fboundp 'lispm-desktop-frame-remove-client)
+      (lispm-desktop-frame-remove-client 'lispm-kernel))
+    (when (and runtime (lispm-kernel-pending-p runtime))
       (lispm-kernel--schedule runtime))))
+
+(defun lispm-kernel-broker-unload-function ()
+  "Leave the frame clock before `unload-feature' removes this library."
+  (lispm-kernel-broker-stop)
+  nil)
 
 (provide 'lispm-kernel-broker)
 ;;; lispm-kernel-broker.el ends here

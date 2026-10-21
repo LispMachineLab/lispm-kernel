@@ -22,10 +22,16 @@ fn start<F>(kernel: &Kernel, options: JobOptions, job: F) -> u64
 where
     F: FnOnce(Context, Vec<u8>) -> Result<Vec<u8>, JobFailed> + Send + 'static,
 {
+    start_for(kernel, 1, options, job)
+}
+fn start_for<F>(kernel: &Kernel, owner: u64, options: JobOptions, job: F) -> u64
+where
+    F: FnOnce(Context, Vec<u8>) -> Result<Vec<u8>, JobFailed> + Send + 'static,
+{
     let job = Arc::new(Mutex::new(Some(job)));
     retry(|| {
         let job = job.clone();
-        kernel.submit_with_options(1, 0, vec![], 0, options, move |context, input| {
+        kernel.submit_with_options(owner, 0, vec![], 0, options, move |context, input| {
             let job = job.lock().unwrap().take().unwrap();
             job(context, input)
         })
@@ -127,26 +133,98 @@ fn waiting_emitter_resumes_when_frontend_drains() {
     assert_eq!(result[1].outcome, Outcome::Success(vec![]));
 }
 
+// Regression: the job's own assertion used to be the only check, and its panic
+// was masked as Cancelled. The observed reason now reaches the test thread.
 #[test]
-fn cancellation_interrupts_backpressure_wait_and_retains_prior_chunk() {
+fn cancellation_interrupts_backpressure_wait_and_drops_undrained_chunks() {
     let kernel = kernel();
     let (tx, rx) = mpsc::channel();
+    let (reason_tx, reason_rx) = mpsc::channel();
     let id = start(&kernel, JobOptions::default(), move |ctx, _| {
         ctx.emit(vec![1]).unwrap();
         tx.send(()).unwrap();
-        assert_eq!(
-            ctx.emit(vec![2]).unwrap_err().reason,
-            EmitFailure::Cancelled
-        );
+        let _ = reason_tx.send(ctx.emit(vec![2]).map_err(|error| error.reason));
         Ok(vec![])
     });
     rx.recv_timeout(Duration::from_secs(3)).unwrap();
+    assert_eq!(retry(|| kernel.stats()).stream_items, 1);
     assert!(retry(|| kernel.cancel(id)));
+    // The undrained chunk and its stream budget are released by the cancel itself.
+    let stats = retry(|| kernel.stats());
+    assert_eq!((stats.stream_items, stats.stream_bytes), (0, 0));
+    assert_eq!(
+        reason_rx.recv_timeout(Duration::from_secs(3)).unwrap(),
+        Err(EmitFailure::Cancelled)
+    );
     wait(|| retry(|| kernel.stats()).completed == 1);
     let result = retry(|| kernel.drain(2, 1024));
-    assert!(matches!(result[0].outcome, Outcome::Chunk { .. }));
-    assert_eq!(result[1].outcome, Outcome::Cancelled);
-    assert_eq!(retry(|| kernel.stats()).cancelled, 1);
+    assert_eq!(result.len(), 1);
+    assert_eq!(result[0].outcome, Outcome::Cancelled);
+    let stats = retry(|| kernel.stats());
+    assert_eq!(
+        (stats.cancelled, stats.panicked, stats.outstanding),
+        (1, 0, 0)
+    );
+}
+
+#[test]
+fn replaced_state_is_delivered_after_chunks_emitted_before_it() {
+    let kernel = Kernel::new(Config {
+        max_stream_items: 4,
+        ..Config::default()
+    })
+    .unwrap();
+    start(&kernel, JobOptions::default(), |ctx, _| {
+        ctx.try_replace(7, vec![1]).unwrap();
+        ctx.try_emit(vec![2]).unwrap();
+        ctx.try_replace(7, vec![3]).unwrap();
+        Ok(vec![])
+    });
+    wait(|| retry(|| kernel.stats()).completed == 1);
+    let outcomes: Vec<_> = retry(|| kernel.drain(8, 4096))
+        .into_iter()
+        .map(|event| event.outcome)
+        .collect();
+    assert_eq!(
+        outcomes,
+        vec![
+            Outcome::Chunk {
+                key: None,
+                bytes: vec![2]
+            },
+            Outcome::Chunk {
+                key: Some(7),
+                bytes: vec![3]
+            },
+            Outcome::Success(vec![]),
+        ]
+    );
+}
+
+#[test]
+fn per_owner_stream_quota_backpressures_one_owner_but_not_another() {
+    let kernel = Kernel::new(Config {
+        workers: 2,
+        max_stream_items: 4,
+        max_stream_items_per_owner: 1,
+        ..Config::default()
+    })
+    .unwrap();
+    let (tx, rx) = mpsc::channel();
+    for owner in [1, 2] {
+        let tx = tx.clone();
+        start_for(&kernel, owner, JobOptions::default(), move |ctx, _| {
+            let first = ctx.try_emit(vec![1]).map_err(|error| error.reason);
+            let second = ctx.try_emit(vec![2]).map_err(|error| error.reason);
+            tx.send((first, second)).unwrap();
+            Ok(vec![])
+        });
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(3)).unwrap(),
+            (Ok(()), Err(EmitFailure::Backpressure))
+        );
+    }
+    assert_eq!(retry(|| kernel.stats()).stream_items, 2);
 }
 
 #[test]
@@ -226,31 +304,77 @@ fn dropped_reader_does_not_kill_workers_and_reregistration_wakes_retained_work()
     use std::io::Read;
     let kernel = kernel();
     drop(retry(|| kernel.attach_notifications()));
+    assert!(!retry(|| kernel.stats()).notifications_broken);
     start(&kernel, JobOptions::default(), |_, _| Ok(vec![]));
     wait(|| retry(|| kernel.stats()).completed == 1);
+    assert!(retry(|| kernel.stats()).notifications_broken);
     let mut reader = retry(|| kernel.attach_notifications());
+    assert!(!retry(|| kernel.stats()).notifications_broken);
     assert_eq!(reader.read(&mut [0; 1]).unwrap(), 1);
     assert_eq!(retry(|| kernel.drain(1, 1024)).len(), 1);
+}
+
+// Regression: shutdown used to leave the writer registered, so a worker finishing
+// later wrote a hint after shutdown returned.
+#[cfg(unix)]
+#[test]
+fn shutdown_disables_notifications_before_returning() {
+    use std::io::Read;
+    let kernel = kernel();
+    let mut reader = retry(|| kernel.attach_notifications());
+    let (tx, rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel::<()>();
+    start(&kernel, JobOptions::default(), move |_, _| {
+        tx.send(()).unwrap();
+        release_rx.recv().unwrap();
+        Ok(vec![])
+    });
+    rx.recv_timeout(Duration::from_secs(3)).unwrap();
+    kernel.shutdown();
+    release_tx.send(()).unwrap();
+    wait(|| retry(|| kernel.stats()).ready == 1);
+    // EOF, never a hint byte: the writer was closed before shutdown returned.
+    assert_eq!(reader.read(&mut [0; 1]).unwrap(), 0);
+    assert_eq!(kernel.attach_notifications().unwrap_err(), Error::Closed);
+    assert_eq!(
+        retry(|| kernel.drain(1, 1024))[0].outcome,
+        Outcome::Cancelled
+    );
 }
 
 #[test]
 fn shutdown_wakes_blocked_emitter() {
     let kernel = kernel();
     let (tx, rx) = mpsc::channel();
+    let (reason_tx, reason_rx) = mpsc::channel();
     start(&kernel, JobOptions::default(), move |ctx, _| {
         ctx.emit(vec![1]).unwrap();
         tx.send(()).unwrap();
-        assert_eq!(
-            ctx.emit(vec![2]).unwrap_err().reason,
-            EmitFailure::Cancelled
-        );
+        let _ = reason_tx.send(ctx.emit(vec![2]).map_err(|error| error.reason));
         Ok(vec![])
     });
     rx.recv_timeout(Duration::from_secs(3)).unwrap();
     kernel.shutdown();
+    assert_eq!(
+        reason_rx.recv_timeout(Duration::from_secs(3)).unwrap(),
+        Err(EmitFailure::Cancelled)
+    );
     wait(|| kernel.workers_finished());
-    let result = retry(|| kernel.drain(2, 1024));
-    assert_eq!(result[1].outcome, Outcome::Cancelled);
+    // Shutdown does not take the state lock, so chunks stay drainable.
+    let outcomes: Vec<_> = retry(|| kernel.drain(2, 1024))
+        .into_iter()
+        .map(|event| event.outcome)
+        .collect();
+    assert_eq!(
+        outcomes,
+        vec![
+            Outcome::Chunk {
+                key: None,
+                bytes: vec![1]
+            },
+            Outcome::Cancelled,
+        ]
+    );
 }
 
 #[test]

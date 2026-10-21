@@ -1,35 +1,83 @@
 // Copyright (C) 2026  Ryan.K
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-use super::*;
+//! Incremental emission from running jobs.
 
+use crate::state::PushRefused;
+use crate::{Context, Corrupt};
+use std::fmt;
+
+/// Why a chunk was not emitted.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EmitFailure {
+    /// Stream capacity is exhausted for now; drain or cancellation frees it.
     Backpressure,
+    /// The chunk exceeds a global or per-owner stream byte limit on its own.
     TooLarge,
+    /// The request was cancelled or the runtime is shutting down.
     Cancelled,
+    /// The request already completed, or the runtime is gone.
     Closed,
+    /// The state lock was poisoned and its invariant audit failed.
     Poisoned,
 }
 
+impl fmt::Display for EmitFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Backpressure => "stream capacity exhausted",
+            Self::TooLarge => "chunk exceeds the stream limits",
+            Self::Cancelled => "request cancelled",
+            Self::Closed => "request closed",
+            Self::Poisoned => "kernel state failed its audit after a panic",
+        })
+    }
+}
+
+/// A rejected chunk, returned to the adapter so no chunk is silently lost.
 #[derive(Debug, PartialEq, Eq)]
 pub struct EmitError {
+    /// Why the chunk was rejected.
     pub reason: EmitFailure,
-    /// Returned to the adapter so backpressure does not silently lose a chunk.
+    /// The rejected payload, unchanged.
     pub bytes: Vec<u8>,
 }
 
+impl fmt::Display for EmitError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "chunk of {} bytes not emitted: {}",
+            self.bytes.len(),
+            self.reason
+        )
+    }
+}
+
+impl std::error::Error for EmitError {}
+
 impl Context {
-    /// Worker-only incremental emission. Backpressure returns ownership of bytes.
+    /// Emit a reliable chunk now, or return it with `Backpressure`.
+    ///
+    /// Worker-only. Each chunk is charged its allocation capacity plus
+    /// `EVENT_OVERHEAD` against the global and per-owner stream limits.
     pub fn try_emit(&self, bytes: Vec<u8>) -> Result<(), EmitError> {
         self.publish(None, bytes, false)
     }
-    /// Worker-only cooperative wait for stream capacity; cancellation wakes it.
+
+    /// Emit a reliable chunk, waiting on the worker thread for stream capacity.
+    ///
+    /// Cancellation and shutdown end the wait with `Cancelled`.
     pub fn emit(&self, bytes: Vec<u8>) -> Result<(), EmitError> {
         self.publish(None, bytes, true)
     }
-    /// Replace a queued state update with the same request/key. Reliable chunks
-    /// use emit/try_emit and are never coalesced.
+
+    /// Replace the undrained state update with the same key, or append one.
+    ///
+    /// The old update is removed and the new one appended, so it is ordered after
+    /// everything emitted before it. A replacement reuses its predecessor's item but
+    /// must fit the byte limits. Reliable chunks use `emit`/`try_emit` and are
+    /// never coalesced.
     pub fn try_replace(&self, key: u64, bytes: Vec<u8>) -> Result<(), EmitError> {
         self.publish(Some(key), bytes, false)
     }
@@ -39,65 +87,38 @@ impl Context {
         let Some(shared) = self.shared.upgrade() else {
             return fail(EmitFailure::Closed, bytes);
         };
-        let Some(cost) = EVENT_OVERHEAD.checked_add(bytes.capacity()) else {
-            return fail(EmitFailure::TooLarge, bytes);
-        };
-        if cost > shared.config.max_stream_bytes {
-            return fail(EmitFailure::TooLarge, bytes);
-        }
-        let Ok(mut state) = shared.state.lock() else {
+        let Ok(mut state) = shared.lock() else {
             return fail(EmitFailure::Poisoned, bytes);
         };
+        let mut bytes = bytes;
         loop {
             if self.is_cancelled() {
                 return fail(EmitFailure::Cancelled, bytes);
             }
-            let Some(record) = state.records.get(&self.request).filter(|r| !r.complete) else {
-                return fail(EmitFailure::Closed, bytes);
-            };
-            let (owner, generation) = (record.owner, record.generation);
-            let replace = key.and_then(|key| state.ready.iter().position(|event| event.request == self.request && matches!(&event.outcome, Outcome::Chunk { key: Some(old), .. } if *old == key)));
-            let old_cost = replace
-                .map(|index| match &state.ready[index].outcome {
-                    Outcome::Chunk { bytes, .. } => EVENT_OVERHEAD + bytes.capacity(),
-                    _ => unreachable!(),
-                })
-                .unwrap_or(0);
-            if (replace.is_some() || state.stream_items < shared.config.max_stream_items)
-                && cost <= shared.config.max_stream_bytes - (state.stream_bytes - old_cost)
-            {
-                let event = Event {
-                    epoch: shared.epoch,
-                    request: self.request,
-                    owner,
-                    generation,
-                    outcome: Outcome::Chunk { key, bytes },
-                };
-                if let Some(index) = replace {
-                    state.ready[index] = event;
-                } else {
-                    state.ready.push_back(event);
-                    state.stream_items += 1;
+            match state.push_chunk(self.request, key, bytes) {
+                Ok(replaced) => {
+                    shared.hint(&state);
+                    drop(state);
+                    if replaced.is_some() {
+                        // A smaller replacement frees stream bytes for waiting emitters.
+                        shared.space.notify_all();
+                    }
+                    drop(replaced);
+                    return Ok(());
                 }
-                state.stream_bytes = state.stream_bytes - old_cost + cost;
-                state.metrics.stream_items_high_water = state
-                    .metrics
-                    .stream_items_high_water
-                    .max(state.stream_items);
-                state.metrics.stream_bytes_high_water = state
-                    .metrics
-                    .stream_bytes_high_water
-                    .max(state.stream_bytes);
-                state.signal();
-                return Ok(());
+                Err(PushRefused::TooLarge(rejected)) => {
+                    return fail(EmitFailure::TooLarge, rejected)
+                }
+                Err(PushRefused::Closed(rejected)) => return fail(EmitFailure::Closed, rejected),
+                Err(PushRefused::Full(rejected)) if !wait => {
+                    return fail(EmitFailure::Backpressure, rejected)
+                }
+                Err(PushRefused::Full(rejected)) => bytes = rejected,
             }
-            if !wait {
-                return fail(EmitFailure::Backpressure, bytes);
-            }
-            let Ok((next, _)) = shared.space.wait_timeout(state, Duration::from_millis(50)) else {
-                return fail(EmitFailure::Poisoned, bytes);
+            state = match shared.wait_for_space(state) {
+                Ok(state) => state,
+                Err(Corrupt) => return fail(EmitFailure::Poisoned, bytes),
             };
-            state = next;
         }
     }
 }
