@@ -2,42 +2,110 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 //! Owned native jobs with bounded admission and retained terminal outcomes.
+//!
+//! A [`Kernel`] runs trusted Rust jobs on fixed CPU and blocking-I/O worker pools.
+//! The frontend (Emacs) submits owned input, polls with nonblocking calls and
+//! drains retained [`Event`]s within item and byte budgets.
+//!
+//! # Model
+//!
+//! Every accepted request yields exactly one final outcome (any [`Outcome`] other
+//! than `Chunk`), preceded by the chunks its job emitted. Admission charges a slot,
+//! the input capacity, the maximum output and [`EVENT_OVERHEAD`] against global and
+//! per-owner limits until the final outcome is drained. Cancelling a request
+//! releases its slot, owner quota and payload reservation as soon as no job holds
+//! it (at once when queued, at commit when running), drops its undrained chunks,
+//! and keeps only the `EVENT_OVERHEAD` charge of its final `Cancelled` event.
+//!
+//! # Locking and poisoning
+//!
+//! One mutex guards the admission table. Frontend calls use `try_lock` and return
+//! [`Error::Busy`] instead of waiting. Adapter code never runs under the lock, and
+//! every critical section is total, so the lock can only be poisoned by a kernel
+//! bug or a panic on allocation failure. Every lock site then recovers the guard
+//! with `PoisonError::into_inner`, audits the full table invariant, and continues
+//! if it holds, so workers still publish computed outcomes. If the audit fails,
+//! frontend calls return [`Error::Poisoned`], emitters [`EmitFailure::Poisoned`],
+//! and workers exit without publishing.
+//!
+//! # Wake hints (Unix)
+//!
+//! [`Kernel::attach_notifications`] returns the reader of a socket pair; the kernel
+//! writes at most one coalesced byte to it while retained events wait. No hint
+//! write can raise `SIGPIPE`: std passes `MSG_NOSIGNAL` on Linux and the BSDs,
+//! the kernel sets `SO_NOSIGPIPE` on Apple platforms, and other Unix platforms
+//! refuse to attach. A failed write shuts the writer down so the reader sees EOF,
+//! and [`Stats::notifications_broken`] reports it. After [`Kernel::shutdown`]
+//! returns, the kernel never writes a hint again.
 #![forbid(unsafe_code)]
+#![deny(missing_docs)]
 
-use std::collections::{BTreeMap, VecDeque};
-use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Weak;
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, TryLockError};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, TryLockError, Weak};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-mod scheduler;
-mod stream;
-pub use scheduler::{JobOptions, Priority, WorkClass};
-pub use stream::{EmitError, EmitFailure};
+mod audit;
+mod ledger;
+mod lifecycle;
 #[cfg(unix)]
 mod notification;
+mod scheduler;
+mod state;
+mod stream;
+mod worker;
 
+use ledger::Limits;
+use lifecycle::Cancellation;
+pub use scheduler::{JobOptions, Priority, WorkClass};
+use state::{State, Task};
+pub use stream::{EmitError, EmitFailure};
+
+/// Identifies the frontend object that owns requests, such as a buffer or provider.
 pub type Owner = u64;
+/// Identifies one accepted request within a runtime epoch.
 pub type RequestId = u64;
+/// Fixed byte charge of every retained event, added to its payload.
 pub const EVENT_OVERHEAD: usize = 64;
 static NEXT_EPOCH: AtomicU64 = AtomicU64::new(1);
+/// Backstop for emitters waiting on stream capacity: `shutdown` notifies them
+/// without the state lock, so a notification can race their final check.
+const SPACE_POLL: Duration = Duration::from_millis(50);
 
+/// Pool sizes and resource limits. Every limit is checked at admission or emission.
+///
+/// Per-owner limits above their global counterpart are allowed; the global limit
+/// then binds.
 #[derive(Clone, Copy, Debug)]
 pub struct Config {
+    /// CPU worker threads. At least 1.
     pub workers: usize,
+    /// Blocking-I/O worker threads. At least 1.
     pub io_workers: usize,
+    /// Undrained incremental chunks across all owners. At least 1.
     pub max_stream_items: usize,
+    /// Allocation bytes of undrained chunks across all owners, each charged
+    /// `EVENT_OVERHEAD` plus its capacity. At least `EVENT_OVERHEAD`.
     pub max_stream_bytes: usize,
-    /// Includes completed outcomes that have not yet been drained.
+    /// Requests holding a slot: queued, running, or completed but not drained.
+    /// Cancelled requests give their slot back at once. At least 1.
     pub max_requests: usize,
+    /// Slots of one owner. At least 1.
     pub max_requests_per_owner: usize,
     /// Sum of input and output reservations of all accepted requests.
+    /// At least `EVENT_OVERHEAD`.
     pub max_reserved_bytes: usize,
+    /// Reserved bytes of one owner. At least `EVENT_OVERHEAD`.
+    pub max_reserved_bytes_per_owner: usize,
+    /// Undrained chunks of one owner. At least 1.
+    pub max_stream_items_per_owner: usize,
+    /// Undrained chunk bytes of one owner. At least `EVENT_OVERHEAD`.
+    pub max_stream_bytes_per_owner: usize,
 }
 
 impl Default for Config {
+    /// Two workers per pool; each owner may hold a quarter of every global limit.
     fn default() -> Self {
         Self {
             workers: 2,
@@ -47,171 +115,353 @@ impl Default for Config {
             max_requests: 64,
             max_requests_per_owner: 16,
             max_reserved_bytes: 8 * 1024 * 1024,
+            max_reserved_bytes_per_owner: 2 * 1024 * 1024,
+            max_stream_items_per_owner: 16,
+            max_stream_bytes_per_owner: 256 * 1024,
         }
     }
 }
 
+impl Config {
+    /// Whether every pool can run and every limit admits a minimal request and chunk.
+    fn is_valid(&self) -> bool {
+        let counts = [
+            self.workers,
+            self.io_workers,
+            self.max_stream_items,
+            self.max_stream_items_per_owner,
+            self.max_requests,
+            self.max_requests_per_owner,
+        ];
+        let byte_limits = [
+            self.max_stream_bytes,
+            self.max_stream_bytes_per_owner,
+            self.max_reserved_bytes,
+            self.max_reserved_bytes_per_owner,
+        ];
+        counts.iter().all(|count| *count > 0)
+            && byte_limits.iter().all(|bytes| *bytes >= EVENT_OVERHEAD)
+    }
+}
+
+/// Why a kernel operation did not take effect.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Error {
+    /// A `Config` limit cannot admit any work.
     InvalidConfig,
+    /// The state lock is held; retry later without blocking the caller.
     Busy,
+    /// The kernel is shut down and accepts no new work or registrations.
     Closed,
+    /// A global or per-owner admission limit is exhausted, or the reservation overflows.
     Capacity,
+    /// This runtime has issued every request ID.
     IdExhausted,
+    /// The process has created every runtime epoch.
     EpochExhausted,
-    DrainBudget { required: usize },
+    /// The next event needs a larger drain byte budget; it was not consumed.
+    DrainBudget {
+        /// Drain bytes the next event needs.
+        required: usize,
+    },
+    /// A worker thread could not be spawned.
     WorkerStart,
+    /// The state lock was poisoned and its invariant audit failed.
     Poisoned,
+    /// The notification transport could not be created or configured.
     NotificationIo,
 }
 
+impl fmt::Display for Error {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidConfig => formatter.write_str("invalid kernel configuration"),
+            Self::Busy => formatter.write_str("kernel state is busy; retry later"),
+            Self::Closed => formatter.write_str("kernel is shut down"),
+            Self::Capacity => formatter.write_str("admission capacity exhausted"),
+            Self::IdExhausted => formatter.write_str("request IDs exhausted"),
+            Self::EpochExhausted => formatter.write_str("runtime epochs exhausted"),
+            Self::DrainBudget { required } => {
+                write!(
+                    formatter,
+                    "drain budget too small: next event needs {required} bytes"
+                )
+            }
+            Self::WorkerStart => formatter.write_str("failed to start a worker thread"),
+            Self::Poisoned => formatter.write_str("kernel state failed its audit after a panic"),
+            Self::NotificationIo => formatter.write_str("notification transport failed"),
+        }
+    }
+}
+
+impl std::error::Error for Error {}
+
+/// One retained result of a request.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Outcome {
-    Chunk { key: Option<u64>, bytes: Vec<u8> },
+    /// An incremental chunk; zero or more precede the final outcome.
+    Chunk {
+        /// Replacement key of a coalescible state update, or `None` for a reliable chunk.
+        key: Option<u64>,
+        /// Chunk payload.
+        bytes: Vec<u8>,
+    },
+    /// Final: the job returned these bytes.
     Success(Vec<u8>),
+    /// Final: the job returned `JobFailed`.
     Failed,
+    /// Final: the request was cancelled, superseded, closed or shut down.
     Cancelled,
+    /// Final: the job panicked, whether or not it was also cancelled.
     Panicked,
+    /// Final: the job's output capacity exceeded its declared maximum.
     OutputTooLarge,
 }
 
+/// A retained outcome with the identity of its request.
 #[derive(Debug, PartialEq, Eq)]
 pub struct Event {
+    /// Runtime epoch; distinguishes request IDs of different runtimes in a process.
     pub epoch: u64,
+    /// Request that produced the outcome.
     pub request: RequestId,
+    /// Owner given at submission.
     pub owner: Owner,
+    /// Generation given at submission.
     pub generation: u64,
+    /// The outcome itself.
     pub outcome: Outcome,
 }
 
 impl Event {
+    /// Drain budget charge: `EVENT_OVERHEAD` plus the payload length.
     pub fn byte_cost(&self) -> usize {
-        EVENT_OVERHEAD
-            + match &self.outcome {
-                Outcome::Success(bytes) | Outcome::Chunk { bytes, .. } => bytes.len(),
-                _ => 0,
-            }
+        EVENT_OVERHEAD.saturating_add(match &self.outcome {
+            Outcome::Success(bytes) | Outcome::Chunk { bytes, .. } => bytes.len(),
+            Outcome::Failed | Outcome::Cancelled | Outcome::Panicked | Outcome::OutputTooLarge => 0,
+        })
     }
 }
 
+/// A snapshot of occupancy, high-water marks and counters.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Stats {
+    /// Accepted requests whose final outcome has not been drained.
     pub outstanding: usize,
+    /// Requests waiting for a worker.
     pub queued: usize,
+    /// Retained events: chunks and final outcomes.
     pub ready: usize,
+    /// Reserved bytes of accepted requests.
     pub reserved_bytes: usize,
+    /// Whether `shutdown` has been called.
     pub closed: bool,
+    /// Undrained chunks.
     pub stream_items: usize,
+    /// Allocation bytes of undrained chunks.
     pub stream_bytes: usize,
+    /// Highest `queued` observed.
     pub queue_high_water: usize,
+    /// Highest `reserved_bytes` observed.
     pub reserved_high_water: usize,
+    /// Highest `stream_items` observed.
     pub stream_items_high_water: usize,
+    /// Highest `stream_bytes` observed.
     pub stream_bytes_high_water: usize,
+    /// Final outcomes committed, including cancellations of queued requests.
     pub completed: u64,
+    /// Final `Cancelled` outcomes.
     pub cancelled: u64,
+    /// Final `Failed` outcomes.
+    pub failed: u64,
+    /// Final `Panicked` outcomes.
+    pub panicked: u64,
+    /// Longest time a request waited in the queue.
     pub max_queue_wait: Duration,
+    /// Longest job run time.
     pub max_run_time: Duration,
+    /// Whether the attached wake channel failed and was shut down (EOF).
+    pub notifications_broken: bool,
 }
 
+/// A running job's view of its request.
+///
 /// A cooperative adapter must check cancellation and bound temporary allocations.
 pub struct Context {
     cancelled: Arc<AtomicBool>,
     stopping: Arc<AtomicBool>,
+    /// Maximum allocation capacity of the job's final output.
     pub max_output_bytes: usize,
     shared: Weak<Shared>,
     request: RequestId,
 }
 
 impl Context {
+    /// Whether the request was cancelled or the runtime is shutting down.
     pub fn is_cancelled(&self) -> bool {
         self.cancelled.load(Ordering::Acquire) || self.stopping.load(Ordering::Acquire)
     }
 }
 
+/// A job's failure; reported as `Outcome::Failed`.
 #[derive(Debug)]
 pub struct JobFailed;
-type Job = Box<dyn FnOnce(Context, Vec<u8>) -> Result<Vec<u8>, JobFailed> + Send>;
-struct Task {
-    id: RequestId,
-    input: Vec<u8>,
-    job: Job,
-    options: JobOptions,
-    submitted: Instant,
-}
-struct Record {
-    owner: Owner,
-    generation: u64,
-    cancelled: Arc<AtomicBool>,
-    output_limit: usize,
-    reservation: usize,
-    complete: bool,
-}
-struct State {
-    next_id: RequestId,
-    records: BTreeMap<RequestId, Record>,
-    queue: VecDeque<Task>,
-    ready: VecDeque<Event>,
-    reserved: usize,
-    stream_items: usize,
-    stream_bytes: usize,
-    last_owner: [Option<Owner>; 2],
-    metrics: Metrics,
-    #[cfg(unix)]
-    notification: Option<notification::Writer>,
-}
-#[derive(Default)]
-struct Metrics {
-    queue_high_water: usize,
-    reserved_high_water: usize,
-    stream_items_high_water: usize,
-    stream_bytes_high_water: usize,
-    completed: u64,
-    cancelled: u64,
-    max_queue_wait: Duration,
-    max_run_time: Duration,
-}
 
-impl State {
-    fn rearm(&mut self) {
-        #[cfg(unix)]
-        if let Some(writer) = &mut self.notification {
-            writer.rearm();
-        }
-        if !self.ready.is_empty() {
-            self.signal();
-        }
-    }
-    fn signal(&mut self) {
-        #[cfg(unix)]
-        if let Some(writer) = &mut self.notification {
-            writer.signal();
-        }
+impl fmt::Display for JobFailed {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("job failed")
     }
 }
 
-struct Shared {
+impl std::error::Error for JobFailed {}
+
+/// A submission the kernel did not accept; the caller keeps job and input to retry.
+pub struct Rejected<F> {
+    /// Why the submission was rejected.
+    pub error: Error,
+    /// The submitted input, unchanged.
+    pub input: Vec<u8>,
+    /// The submitted job, never called.
+    pub job: F,
+}
+
+impl<F> Rejected<F> {
+    fn new(error: Error, input: Vec<u8>, job: F) -> Self {
+        Self { error, input, job }
+    }
+}
+
+impl<F> fmt::Debug for Rejected<F> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Rejected")
+            .field("error", &self.error)
+            .field("input_len", &self.input.len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl<F> fmt::Display for Rejected<F> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "submission rejected: {}", self.error)
+    }
+}
+
+impl<F> std::error::Error for Rejected<F> {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.error)
+    }
+}
+
+/// The state lock failed its invariant audit after being poisoned.
+pub(crate) struct Corrupt;
+
+pub(crate) struct Shared {
     epoch: u64,
-    config: Config,
     state: Mutex<State>,
     space: Condvar,
     stopping: Arc<AtomicBool>,
+    /// Lock order: `state` before `notifier`. Only `shutdown` and `detach` take the
+    /// notifier alone; every notifier critical section is a bounded nonblocking step.
+    #[cfg(unix)]
+    notifier: Mutex<notification::Notifier>,
 }
 
+impl Shared {
+    fn is_stopping(&self) -> bool {
+        self.stopping.load(Ordering::Acquire)
+    }
+
+    /// Blocking lock for workers and emitters.
+    fn lock(&self) -> Result<MutexGuard<'_, State>, Corrupt> {
+        match self.state.lock() {
+            Ok(guard) => Ok(guard),
+            Err(poisoned) => self.recover(poisoned.into_inner()),
+        }
+    }
+
+    /// Nonblocking lock for frontend calls.
+    fn try_lock(&self) -> Result<MutexGuard<'_, State>, Error> {
+        match self.state.try_lock() {
+            Ok(guard) => Ok(guard),
+            Err(TryLockError::WouldBlock) => Err(Error::Busy),
+            Err(TryLockError::Poisoned(poisoned)) => self
+                .recover(poisoned.into_inner())
+                .map_err(|Corrupt| Error::Poisoned),
+        }
+    }
+
+    /// Wait until stream capacity may have changed, or `SPACE_POLL` elapses.
+    fn wait_for_space<'a>(
+        &self,
+        guard: MutexGuard<'a, State>,
+    ) -> Result<MutexGuard<'a, State>, Corrupt> {
+        match self.space.wait_timeout(guard, SPACE_POLL) {
+            Ok((guard, _)) => Ok(guard),
+            Err(poisoned) => self.recover(poisoned.into_inner().0),
+        }
+    }
+
+    /// Continue with a poisoned guard iff the table invariant still holds.
+    fn recover<'a>(&self, guard: MutexGuard<'a, State>) -> Result<MutexGuard<'a, State>, Corrupt> {
+        if guard.audit().is_ok() {
+            self.state.clear_poison();
+            Ok(guard)
+        } else {
+            Err(Corrupt)
+        }
+    }
+
+    /// Hint that events are ready. `_held` witnesses the state lock, which orders
+    /// this hint with `drain`'s rearm.
+    fn hint(&self, _held: &State) {
+        #[cfg(unix)]
+        self.notifier().signal();
+    }
+
+    /// Allow the next hint, and send it at once if events remain.
+    fn rearm(&self, held: &State) {
+        #[cfg(unix)]
+        {
+            let mut notifier = self.notifier();
+            notifier.rearm();
+            if held.has_ready() {
+                notifier.signal();
+            }
+        }
+        #[cfg(not(unix))]
+        let _ = held;
+    }
+
+    fn notifications_broken(&self, _held: &State) -> bool {
+        #[cfg(unix)]
+        return self.notifier().is_broken();
+        #[cfg(not(unix))]
+        false
+    }
+
+    /// Post: no hint is written after this returns.
+    fn disable_notifications(&self) {
+        #[cfg(unix)]
+        {
+            let writer = self.notifier().disable();
+            drop(writer);
+        }
+    }
+}
+
+/// The background runtime: worker pools and the retained-outcome table.
+///
+/// Dropping the kernel shuts it down without joining workers.
 pub struct Kernel {
     shared: Arc<Shared>,
     workers: Vec<JoinHandle<()>>,
 }
 
 impl Kernel {
+    /// Start a runtime with a fresh epoch and its worker pools.
     pub fn new(config: Config) -> Result<Self, Error> {
-        if config.workers == 0
-            || config.io_workers == 0
-            || config.max_stream_items == 0
-            || config.max_stream_bytes < EVENT_OVERHEAD
-            || config.max_requests == 0
-            || config.max_requests_per_owner == 0
-            || config.max_reserved_bytes == 0
-        {
+        if !config.is_valid() {
             return Err(Error::InvalidConfig);
         }
         // Never wrap and reuse a runtime epoch.
@@ -220,40 +470,29 @@ impl Kernel {
             .map_err(|_| Error::EpochExhausted)?;
         let shared = Arc::new(Shared {
             epoch,
-            config,
-            state: Mutex::new(State {
-                next_id: 1,
-                records: BTreeMap::new(),
-                queue: VecDeque::new(),
-                ready: VecDeque::new(),
-                reserved: 0,
-                stream_items: 0,
-                stream_bytes: 0,
-                last_owner: [None; 2],
-                metrics: Metrics::default(),
-                #[cfg(unix)]
-                notification: None,
-            }),
+            state: Mutex::new(State::new(epoch, Limits::from_config(&config))),
             space: Condvar::new(),
             stopping: Arc::new(AtomicBool::new(false)),
+            #[cfg(unix)]
+            notifier: Mutex::new(notification::Notifier::default()),
         });
         let mut kernel = Self {
             shared,
             workers: Vec::new(),
         };
-        for (class, count) in [
+        let pools = [
             (WorkClass::Cpu, config.workers),
             (WorkClass::Io, config.io_workers),
-        ] {
-            for index in 0..count {
+        ];
+        for (class, count) in pools {
+            for ordinal in 0..count {
                 let shared = Arc::clone(&kernel.shared);
-                match thread::Builder::new()
-                    .name(format!("lispm-{class:?}-{index}"))
-                    .spawn(move || worker(shared, class))
-                {
-                    Ok(handle) => kernel.workers.push(handle),
-                    Err(_) => return Err(Error::WorkerStart),
-                }
+                let index = kernel.workers.len();
+                let handle = thread::Builder::new()
+                    .name(format!("lispm-{class:?}-{ordinal}"))
+                    .spawn(move || worker::run(&shared, class, index))
+                    .map_err(|_| Error::WorkerStart)?;
+                kernel.workers.push(handle);
             }
         }
         Ok(kernel)
@@ -265,13 +504,10 @@ impl Kernel {
     }
 
     fn state(&self) -> Result<MutexGuard<'_, State>, Error> {
-        self.shared.state.try_lock().map_err(|error| match error {
-            TryLockError::WouldBlock => Error::Busy,
-            TryLockError::Poisoned(_) => Error::Poisoned,
-        })
+        self.shared.try_lock()
     }
 
-    /// Captured closure allocations are trusted adapter state, not accounted input.
+    /// Submit a CPU job with normal priority. See [`Kernel::try_submit_with_options`].
     pub fn submit<F>(
         &self,
         owner: Owner,
@@ -293,6 +529,8 @@ impl Kernel {
         )
     }
 
+    /// Submit a job; on rejection the job and input are dropped.
+    /// See [`Kernel::try_submit_with_options`].
     pub fn submit_with_options<F>(
         &self,
         owner: Owner,
@@ -305,268 +543,178 @@ impl Kernel {
     where
         F: FnOnce(Context, Vec<u8>) -> Result<Vec<u8>, JobFailed> + Send + 'static,
     {
-        let reservation = input
-            .capacity()
-            .checked_add(max_output_bytes)
-            .and_then(|n| n.checked_add(EVENT_OVERHEAD))
-            .ok_or(Error::Capacity)?;
-        let mut state = self.state()?;
-        if self.shared.stopping.load(Ordering::Acquire) {
-            return Err(Error::Closed);
+        self.try_submit_with_options(owner, generation, input, max_output_bytes, options, job)
+            .map_err(|rejected| rejected.error)
+    }
+
+    /// Submit a job, or get job and input back with the reason for a later retry.
+    ///
+    /// Never blocks: a held state lock is `Busy`. Admission reserves the input's
+    /// allocation capacity, `max_output_bytes` and `EVENT_OVERHEAD` against the
+    /// global and per-owner limits. Captured closure allocations are trusted adapter
+    /// state, not accounted input. An accepted job wakes at most one idle worker,
+    /// and only of its own class.
+    pub fn try_submit_with_options<F>(
+        &self,
+        owner: Owner,
+        generation: u64,
+        input: Vec<u8>,
+        max_output_bytes: usize,
+        options: JobOptions,
+        job: F,
+    ) -> Result<RequestId, Rejected<F>>
+    where
+        F: FnOnce(Context, Vec<u8>) -> Result<Vec<u8>, JobFailed> + Send + 'static,
+    {
+        let mut state = match self.state() {
+            Ok(state) => state,
+            Err(error) => return Err(Rejected::new(error, input, job)),
+        };
+        if self.shared.is_stopping() {
+            return Err(Rejected::new(Error::Closed, input, job));
         }
-        let config = self.shared.config;
-        if state.records.len() >= config.max_requests
-            || state.records.values().filter(|r| r.owner == owner).count()
-                >= config.max_requests_per_owner
-            || reservation > config.max_reserved_bytes.saturating_sub(state.reserved)
-        {
-            return Err(Error::Capacity);
-        }
-        let id = state.next_id;
-        state.next_id = id.checked_add(1).ok_or(Error::IdExhausted)?;
-        state.records.insert(
-            id,
-            Record {
-                owner,
-                generation,
-                cancelled: Arc::new(AtomicBool::new(false)),
-                output_limit: max_output_bytes,
-                reservation,
-                complete: false,
-            },
-        );
-        state.reserved += reservation;
-        state.queue.push_back(Task {
-            id,
+        let now = Instant::now();
+        let id = state.admit(
+            owner,
+            generation,
             input,
-            job: Box::new(job),
+            max_output_bytes,
             options,
-            submitted: Instant::now(),
-        });
-        state.metrics.queue_high_water = state.metrics.queue_high_water.max(state.queue.len());
-        state.metrics.reserved_high_water = state.metrics.reserved_high_water.max(state.reserved);
+            job,
+            now,
+        )?;
+        let wake = state.idle.claim(options.class);
         drop(state);
-        for worker in &self.workers {
-            worker.thread().unpark();
+        if let Some(handle) = wake.and_then(|index| self.workers.get(index)) {
+            handle.thread().unpark();
         }
         Ok(id)
     }
 
-    /// Returns false for unknown or already completed requests.
+    /// Cancel one queued or running request.
+    ///
+    /// A queued request gets its final `Cancelled` event at once and gives back its
+    /// slot, owner quota and payload reservation. A running request is told through
+    /// its `Context`. Undrained chunks of the request are dropped. Returns true while
+    /// the request has not completed, cancelled before or not, and false for unknown
+    /// or completed requests, whose outcome stays unchanged.
     pub fn cancel(&self, id: RequestId) -> Result<bool, Error> {
-        let state = self.state()?;
-        let Some(record) = state.records.get(&id).filter(|r| !r.complete) else {
-            return Ok(false);
-        };
-        record.cancelled.store(true, Ordering::Release);
-        self.shared.space.notify_all();
-        Ok(true)
+        let mut state = self.state()?;
+        let cancellation = state.cancel_one(id);
+        Ok(self.finish_cancellation(state, cancellation) > 0)
     }
 
-    fn cancel_owner(&self, owner: Owner, before: Option<u64>) -> Result<usize, Error> {
-        let state = self.state()?;
-        let mut count = 0;
-        for record in state
-            .records
-            .values()
-            .filter(|r| r.owner == owner && !r.complete && before.is_none_or(|g| r.generation < g))
-        {
-            record.cancelled.store(true, Ordering::Release);
-            count += 1;
-        }
-        self.shared.space.notify_all();
-        Ok(count)
-    }
-
-    /// Cancels current owner work. The caller must prevent future submissions.
+    /// Cancel every current request of `owner` as `cancel` does; returns how many.
+    /// The caller must prevent future submissions to the closed owner.
     pub fn close_owner(&self, owner: Owner) -> Result<usize, Error> {
-        self.cancel_owner(owner, None)
-    }
-    pub fn supersede(&self, owner: Owner, generation: u64) -> Result<usize, Error> {
-        self.cancel_owner(owner, Some(generation))
+        let mut state = self.state()?;
+        let cancellation = state.cancel_where(|record| record.belongs_to(owner));
+        Ok(self.finish_cancellation(state, cancellation))
     }
 
+    /// Cancel current requests of `owner` older than `generation`; returns how many.
+    /// This is not a persistent registration: later submissions are unaffected.
+    pub fn supersede(&self, owner: Owner, generation: u64) -> Result<usize, Error> {
+        let mut state = self.state()?;
+        let cancellation = state.cancel_where(|record| record.is_superseded_by(owner, generation));
+        Ok(self.finish_cancellation(state, cancellation))
+    }
+
+    /// Hint new finals under the lock, then drop removed jobs, inputs and chunk
+    /// payloads outside it and wake emitters that may now proceed or stop.
+    fn finish_cancellation(
+        &self,
+        state: MutexGuard<'_, State>,
+        cancellation: Cancellation,
+    ) -> usize {
+        if cancellation.finals > 0 {
+            self.shared.hint(&state);
+        }
+        drop(state);
+        let Cancellation {
+            count,
+            tasks,
+            payloads,
+            ..
+        } = cancellation;
+        drop(tasks);
+        drop(payloads);
+        if count > 0 {
+            self.shared.space.notify_all();
+        }
+        count
+    }
+
+    /// Remove up to `max_items` events in order, charging `byte_cost` against
+    /// `max_bytes`.
+    ///
+    /// If the first event alone exceeds `max_bytes`, nothing is consumed and
+    /// `DrainBudget` reports its cost. Every call, successful or not, rearms the
+    /// wake hint and hints again if events remain.
     pub fn drain(&self, max_items: usize, max_bytes: usize) -> Result<Vec<Event>, Error> {
         let mut state = self.state()?;
-        let mut events = Vec::new();
-        let mut remaining = max_bytes;
-        while events.len() < max_items {
-            let Some(front) = state.ready.front() else {
-                break;
-            };
-            let cost = front.byte_cost();
-            if cost > remaining {
-                if events.is_empty() {
-                    state.rearm();
-                    return Err(Error::DrainBudget { required: cost });
-                }
-                break;
-            }
-            let event = state.ready.pop_front().expect("front exists");
-            if let Outcome::Chunk { bytes, .. } = &event.outcome {
-                state.stream_items -= 1;
-                state.stream_bytes -= EVENT_OVERHEAD + bytes.capacity();
-            } else {
-                let record = state
-                    .records
-                    .remove(&event.request)
-                    .expect("accepted request");
-                state.reserved -= record.reservation;
-            }
-            remaining -= cost;
-            events.push(event);
-        }
-        state.rearm();
+        let result = state.drain(max_items, max_bytes);
+        self.shared.rearm(&state);
         drop(state);
-        self.shared.space.notify_all();
-        Ok(events)
+        if result.as_ref().is_ok_and(|events| !events.is_empty()) {
+            self.shared.space.notify_all();
+        }
+        result
     }
 
+    /// Snapshot occupancy and counters.
     pub fn stats(&self) -> Result<Stats, Error> {
         let state = self.state()?;
+        let usage = state.ledger.total();
+        let metrics = &state.metrics;
         Ok(Stats {
-            outstanding: state.records.len(),
+            outstanding: state.outstanding(),
             queued: state.queue.len(),
             ready: state.ready.len(),
-            reserved_bytes: state.reserved,
-            closed: self.shared.stopping.load(Ordering::Acquire),
-            stream_items: state.stream_items,
-            stream_bytes: state.stream_bytes,
-            queue_high_water: state.metrics.queue_high_water,
-            reserved_high_water: state.metrics.reserved_high_water,
-            stream_items_high_water: state.metrics.stream_items_high_water,
-            stream_bytes_high_water: state.metrics.stream_bytes_high_water,
-            completed: state.metrics.completed,
-            cancelled: state.metrics.cancelled,
-            max_queue_wait: state.metrics.max_queue_wait,
-            max_run_time: state.metrics.max_run_time,
+            reserved_bytes: usage.reserved,
+            closed: self.shared.is_stopping(),
+            stream_items: usage.stream_items,
+            stream_bytes: usage.stream_bytes,
+            queue_high_water: metrics.queue_high_water,
+            reserved_high_water: metrics.reserved_high_water,
+            stream_items_high_water: metrics.stream_items_high_water,
+            stream_bytes_high_water: metrics.stream_bytes_high_water,
+            completed: metrics.completed,
+            cancelled: metrics.cancelled,
+            failed: metrics.failed,
+            panicked: metrics.panicked,
+            max_queue_wait: metrics.max_queue_wait,
+            max_run_time: metrics.max_run_time,
+            notifications_broken: self.shared.notifications_broken(&state),
         })
     }
 
-    /// Never joins workers or waits for adapters. Remaining outcomes can be drained.
+    /// Close admission, disable wake hints, and ask all work to stop.
+    ///
+    /// Never takes the state lock, joins workers or waits for adapters; it waits
+    /// only for an in-flight nonblocking hint write. Queued jobs are skipped and
+    /// running jobs are cancelled; their outcomes stay drainable by polling. After
+    /// this returns, no hint is written, so the frontend may tear down its reader.
     pub fn shutdown(&self) {
         self.shared.stopping.store(true, Ordering::Release);
+        self.shared.disable_notifications();
         for worker in &self.workers {
             worker.thread().unpark();
         }
         self.shared.space.notify_all();
     }
+
+    /// Whether every worker thread has exited.
     pub fn workers_finished(&self) -> bool {
         self.workers.iter().all(JoinHandle::is_finished)
     }
 }
+
 impl Drop for Kernel {
     fn drop(&mut self) {
         self.shutdown();
     }
 }
 
-fn worker(shared: Arc<Shared>, class: WorkClass) {
-    loop {
-        let (task, context) = {
-            let Ok(mut state) = shared.state.lock() else {
-                return;
-            };
-            while !state.queue.iter().any(|task| task.options.class == class) {
-                if shared.stopping.load(Ordering::Acquire) {
-                    return;
-                }
-                drop(state);
-                // unpark retains a token even if submission/shutdown happens
-                // before park. No timeout poll or check/wait lost-wakeup race.
-                thread::park();
-                let Ok(next) = shared.state.lock() else {
-                    return;
-                };
-                state = next;
-            }
-            let task = scheduler::take(&mut state, class).expect("matching task");
-            state.metrics.max_queue_wait =
-                state.metrics.max_queue_wait.max(task.submitted.elapsed());
-            let record = &state.records[&task.id];
-            let context = Context {
-                cancelled: Arc::clone(&record.cancelled),
-                stopping: Arc::clone(&shared.stopping),
-                max_output_bytes: record.output_limit,
-                shared: Arc::downgrade(&shared),
-                request: task.id,
-            };
-            (task, context)
-        };
-        let Task { id, input, job, .. } = task;
-        let started = Instant::now();
-        // Drop cancelled adapters and their captures on a worker, outside the state lock.
-        let outcome = match catch_unwind(AssertUnwindSafe(|| {
-            if context.is_cancelled() {
-                return Outcome::Cancelled;
-            }
-            match job(context, input) {
-                Ok(bytes) => Outcome::Success(bytes),
-                Err(_) => Outcome::Failed,
-            }
-        })) {
-            Ok(outcome) => outcome,
-            Err(_) => Outcome::Panicked,
-        };
-        let Ok(mut state) = shared.state.lock() else {
-            return;
-        };
-        let record = state.records.get_mut(&id).expect("accepted request");
-        let outcome = if record.cancelled.load(Ordering::Acquire)
-            || shared.stopping.load(Ordering::Acquire)
-        {
-            Outcome::Cancelled
-        } else if matches!(&outcome, Outcome::Success(bytes) if bytes.capacity() > record.output_limit)
-        {
-            Outcome::OutputTooLarge
-        } else {
-            outcome
-        };
-        record.complete = true;
-        let (owner, generation) = (record.owner, record.generation);
-        state.metrics.completed = state.metrics.completed.saturating_add(1);
-        if outcome == Outcome::Cancelled {
-            state.metrics.cancelled = state.metrics.cancelled.saturating_add(1);
-        }
-        state.metrics.max_run_time = state.metrics.max_run_time.max(started.elapsed());
-        state.ready.push_back(Event {
-            epoch: shared.epoch,
-            request: id,
-            owner,
-            generation,
-            outcome,
-        });
-        state.signal();
-    }
-}
-
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn frontend_reports_busy_instead_of_waiting() {
-        let kernel = Kernel::new(Config::default()).unwrap();
-        let _guard = kernel.shared.state.lock().unwrap();
-        assert_eq!(kernel.stats(), Err(Error::Busy));
-        assert_eq!(kernel.cancel(1), Err(Error::Busy));
-        assert_eq!(kernel.close_owner(1), Err(Error::Busy));
-        assert_eq!(kernel.drain(1, 1024), Err(Error::Busy));
-        assert_eq!(
-            kernel.submit(1, 0, vec![], 0, |_, _| Ok(vec![])),
-            Err(Error::Busy)
-        );
-        kernel.shutdown(); // Even shutdown does not need the state lock.
-    }
-
-    #[test]
-    fn invalid_configuration_is_rejected() {
-        assert!(matches!(
-            Kernel::new(Config {
-                workers: 0,
-                ..Config::default()
-            }),
-            Err(Error::InvalidConfig)
-        ));
-    }
-}
+mod tests;
