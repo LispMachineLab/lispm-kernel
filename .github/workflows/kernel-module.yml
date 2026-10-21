@@ -1,0 +1,189 @@
+name: kernel module
+
+# The kernel's Emacs module, built for the computers LispM runs on and,
+# from main, published where lispm-kernel-library.el downloads it: the
+# release kernel-module-VERSION, VERSION being what
+# `lispm-kernel-library-source-version' makes of the sources it is built
+# from.  A version is built and released once, then left as it is; its
+# release is never marked the latest, which stays the kernel's own.
+# LispM keeps a download only when its SHA-256 is the one
+# lisp/lispm-kernel-module-sums.eld pins, which scripts/pin-module.py
+# writes from the release, in a commit of its own.
+on:
+  push:
+    branches: [main]
+    paths:
+      - Cargo.toml
+      - Cargo.lock
+      - crates/**
+      - lisp/lispm-kernel-library.el
+      - lisp/lispm-kernel-module-sums.eld
+      - scripts/package-module.py
+      - scripts/pin-module.py
+      - .github/workflows/kernel-module.yml
+  pull_request:
+    paths:
+      - Cargo.toml
+      - Cargo.lock
+      - crates/**
+      - lisp/lispm-kernel-library.el
+      - lisp/lispm-kernel-module-sums.eld
+      - scripts/package-module.py
+      - scripts/pin-module.py
+      - .github/workflows/kernel-module.yml
+  # Sources main never had at its tip, so never published, are built and
+  # published, for scripts/pin-module.py to pin, by running this on main
+  # with their commit as REF.
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: The commit whose sources to build and publish (by default the branch's tip)
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  version:
+    name: Version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      published: ${{ steps.version.outputs.published }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref }}
+      - uses: purcell/setup-emacs@v8.0
+        with:
+          version: '31.1'
+      - id: version
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version=$(emacs -Q --batch -L lisp -l lispm-kernel-library --eval '(princ (lispm-kernel-library-source-version))')
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          if gh release view "kernel-module-$version" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "published=true" >> "$GITHUB_OUTPUT"
+            echo "kernel-module-$version is published already"
+          else
+            echo "published=false" >> "$GITHUB_OUTPUT"
+          fi
+      # What the Lisp pins is what the release holds, when it pins these
+      # sources; between a change of them and the next pin it pins others.
+      - name: Check the pins
+        run: python3 scripts/pin-module.py --check
+
+  build:
+    name: ${{ matrix.target }}
+    needs: version
+    # A change of the Lisp alone leaves the version, and its release, as
+    # they are; a pull request builds all the same, to check the build.
+    if: github.event_name == 'pull_request' || needs.version.outputs.published == 'false'
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            extension: dylib
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+            extension: dylib
+          # The oldest glibc of the runners: its library loads with any
+          # newer one.
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            extension: so
+    env:
+      # The macOS LispM's installer and Emacs's builds support.
+      MACOSX_DEPLOYMENT_TARGET: '11.0'
+      ASSET: liblispm_kernel_emacs-${{ matrix.target }}.${{ matrix.extension }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: Test
+        run: cargo test --workspace --locked --target ${{ matrix.target }}
+      # Built for the target, its binary header checked for the target's
+      # machine, loaded here with an Emacs module's entry points found,
+      # and named as it is published.
+      - name: Build
+        run: |
+          python3 scripts/package-module.py --target ${{ matrix.target }} --output package
+          mkdir dist
+          cp "package/$ASSET" dist/
+          file "dist/$ASSET"
+      - name: Check the macOS it needs
+        if: runner.os == 'macOS'
+        run: |
+          otool -L "dist/$ASSET"
+          otool -l "dist/$ASSET" | grep -A4 LC_BUILD_VERSION | grep -q "minos $MACOSX_DEPLOYMENT_TARGET\$"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: kernel-module-${{ matrix.target }}
+          path: dist/
+          if-no-files-found: error
+
+  release:
+    name: Release
+    needs: [version, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    concurrency:
+      group: kernel-module-release
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref }}
+      - uses: purcell/setup-emacs@v8.0
+        with:
+          version: '31.1'
+      # Laid out as the release is, under the URL lispm-kernel-library.el
+      # derives from `lispm-kernel-library-prebuilt-url'.
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: kernel-module-*
+          path: releases/kernel-module-${{ needs.version.outputs.version }}
+          merge-multiple: true
+      - name: Checksums
+        working-directory: releases/kernel-module-${{ needs.version.outputs.version }}
+        run: |
+          sha256sum liblispm_kernel_emacs-* > SHA256SUMS
+          cat SHA256SUMS
+      # Pinned as a release of the kernel pins it, then fetched as LispM
+      # fetches it, from the release laid out here: the names are the ones
+      # Emacs wants, the checksums the ones pinned, and the library for
+      # this computer loads into Emacs and speaks its protocol.
+      - name: Pin it as a release does
+        run: python3 scripts/pin-module.py --url "file://$PWD/releases"
+      - name: Download it as LispM does
+        run: |
+          emacs -Q --batch -L lisp -l lispm-kernel-library \
+            --eval "(setq lispm-kernel-library-prebuilt-url \"file://$PWD/releases\")" \
+            -f lispm-kernel-library-batch-download
+          test -f "prebuilt/$VERSION/liblispm_kernel_emacs-x86_64-unknown-linux-gnu.so"
+      - name: Publish
+        if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag=kernel-module-$VERSION
+          if gh release view "$tag" >/dev/null 2>&1; then
+            echo "$tag is published already"
+            exit 0
+          fi
+          commit=$(git rev-parse HEAD)
+          gh release create "$tag" releases/"$tag"/* \
+            --target "$commit" --latest=false \
+            --title "Kernel module $VERSION" \
+            --notes "The kernel's Emacs module, crates/emacs-module, built from $commit for macOS on Apple silicon and on Intel (11 and later) and for GNU/Linux on x86_64, by $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID.
+
+          lispm-kernel downloads the one for its computer, and keeps it only when its SHA-256 is the one its Lisp pins in lisp/lispm-kernel-module-sums.eld, which scripts/pin-module.py writes from this release: nothing here needs to be fetched by hand."

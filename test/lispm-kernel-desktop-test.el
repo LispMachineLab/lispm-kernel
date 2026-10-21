@@ -158,6 +158,69 @@
     (should-not lispm-kernel-desktop-test--readers)
     (should-not lispm-kernel-broker--runtime)))
 
+(defmacro lispm-kernel-desktop-test--without-module (&rest body)
+  "Run BODY as if the module, loaded for the other tests, were not yet."
+  (declare (indent 0))
+  `(let ((featurep (symbol-function 'featurep)))
+     (cl-letf (((symbol-function 'featurep)
+                (lambda (feature &rest subfeatures)
+                  (and (not (eq feature 'lispm-kernel-module)) (apply featurep feature subfeatures)))))
+       ,@body)))
+
+(ert-deftest lispm-kernel-desktop-waits-for-the-module ()
+  "With no module configured or loaded, the mode is on while one is built
+or downloaded, the desktop's own readers answering; the kernel's are
+registered once it is there, and the mode turns off when none can be had."
+  (lispm-kernel-desktop-test--with-desktop
+    (let ((lispm-kernel-desktop-module nil)
+          (lispm-kernel-desktop-last-error nil)
+          (lispm-kernel-library-problem nil)
+          (messages nil)
+          (lispm-kernel-library-obtained-functions nil)
+          (inhibit-message t)
+          (asked 0))
+      (cl-letf (((symbol-function 'lispm-kernel-library-obtain) (lambda () (cl-incf asked) 'pending)))
+        (lispm-kernel-desktop-test--without-module (lispm-kernel-desktop-mode 1))
+        (should lispm-kernel-desktop-mode)
+        (should (= asked 1))
+        (should-not lispm-kernel-desktop--runtime)
+        (should-not lispm-kernel-desktop-test--readers)
+        (run-hook-with-args 'lispm-kernel-library-obtained-functions t)
+        (should lispm-kernel-desktop--runtime)
+        (should (eq lispm-kernel-broker--runtime lispm-kernel-desktop--runtime))
+        (should (assq 'codex lispm-kernel-desktop-test--readers))
+        (should (assq 'claude lispm-kernel-desktop-test--readers))
+        (should-not lispm-kernel-library-obtained-functions)
+        (lispm-kernel-desktop-mode -1)
+        ;; None could be got, and the user is told why.
+        (lispm-kernel-desktop-test--without-module (lispm-kernel-desktop-mode 1))
+        (setq lispm-kernel-library-problem "its SHA-256 differs, so it was refused")
+        (cl-letf (((symbol-function 'message)
+                   (lambda (format &rest args) (push (apply #'format format args) messages))))
+          (run-hook-with-args 'lispm-kernel-library-obtained-functions nil))
+        (should-not lispm-kernel-desktop-mode)
+        (should-not lispm-kernel-desktop-test--readers)
+        (should (equal lispm-kernel-desktop-last-error lispm-kernel-library-problem))
+        (should (seq-some (lambda (text) (string-search "so it was refused" text)) messages))
+        (setq lispm-kernel-library-problem nil)
+        ;; Turned off while waiting, it stays off once the module is there.
+        (lispm-kernel-desktop-test--without-module (lispm-kernel-desktop-mode 1))
+        (lispm-kernel-desktop-mode -1)
+        (should-not lispm-kernel-library-obtained-functions)
+        (should-not lispm-kernel-desktop--runtime))
+      ;; Nothing to be had at all.
+      (cl-letf (((symbol-function 'lispm-kernel-library-obtain) #'ignore))
+        (lispm-kernel-desktop-test--without-module
+          (should-error (lispm-kernel-desktop-mode 1) :type 'user-error)))
+      (should-not lispm-kernel-desktop-mode)
+      (should-not lispm-kernel-library-obtained-functions)
+      ;; A module configured is loaded as it is: nothing is got.
+      (cl-letf (((symbol-function 'lispm-kernel-library-obtain) (lambda () (cl-incf asked) 'pending)))
+        (let ((lispm-kernel-desktop-module "/configured/module.so"))
+          (lispm-kernel-desktop-mode 1))
+        (should (= asked 3))
+        (should lispm-kernel-desktop--runtime)))))
+
 (ert-deftest lispm-kernel-desktop-remote-root-uses-the-desktop-reader ()
   (let ((lispm-desktop-agent-codex-sessions-directory "/ssh:host:/sessions/") called)
     (lispm-kernel-desktop-test--with-desktop

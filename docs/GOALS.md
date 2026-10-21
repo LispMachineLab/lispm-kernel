@@ -68,8 +68,12 @@ See `docs/session-benchmark.json` and `docs/validation.md`.
 - [x] Test frame-clock registration, remaining-budget application and return to
   timers; the desktop tests the clock's ordering, input yielding and error isolation.
 - [x] Give sessions and scheduling back on disable and on `unload-feature`.
-- [x] Build a local release bundle with four Lisp files, protocol/hash manifest and
+- [x] Build a local release bundle with the Lisp files, protocol/hash manifest and
   binary-derived architecture labeling.
+- [x] Get the module with no path configured: downloaded in the background from the
+  `kernel-module-<version>` release of the sources and kept only when its SHA-256 is
+  the one pinned with the Lisp; built with Cargo only when asked. The workflow
+  publishes one release per source version; `scripts/pin-module.py` pins it.
 - [ ] Green Linux/macOS CI on main and a first tagged release.
 - [ ] Complete interactive G0 acceptance before default enablement/API stabilization.
 
