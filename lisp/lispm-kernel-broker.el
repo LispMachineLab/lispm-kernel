@@ -1,4 +1,4 @@
-;;; lispm-kernel-broker.el --- Kernel dispatch on the desktop's frame clock -*- lexical-binding: t; -*-
+;;; lispm-kernel-broker.el --- The kernel's messages on the desktop's frame clock -*- lexical-binding: t; -*-
 
 ;; Copyright (C) 2026  Ryan.K
 
@@ -22,28 +22,32 @@
 ;; along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 ;;; Commentary:
-;; Run one kernel runtime's dispatch as a client of LispM Desktop's frame clock
-;; (lispm-desktop-frame): after the terminals of each frame, within what is left
-;; of the frame's budget.  The clock gives way to typing for every client after
-;; the first, so terminals keep their own policy and the kernel waits.
+
+;; Take in one kernel's messages as a client of LispM Desktop's frame
+;; clock (lispm-desktop-frame): after the terminals of each frame, within
+;; what is left of the frame's budget.  The clock gives way to typing for
+;; every client after the first, so terminals keep their own policy and
+;; the kernel waits.
+
 ;;; Code:
+
 (require 'lispm-kernel)
 (declare-function lispm-desktop-frame-add-client "ext:lispm-desktop-frame" (name function &optional depth))
 (declare-function lispm-desktop-frame-remove-client "ext:lispm-desktop-frame" (name))
 (declare-function lispm-desktop-frame-request "ext:lispm-desktop-frame" (name))
 
 (defconst lispm-kernel-broker-depth 10
-  "Frame clock depth of kernel dispatch: after the terminals, at depth 0.")
+  "Frame clock depth of the kernel: after the terminals, at depth 0.")
 
 (defvar lispm-kernel-broker--runtime nil
-  "The runtime dispatched on the frame clock, or nil.")
+  "The runtime whose messages the frame clock takes in, or nil.")
 
 (defun lispm-kernel-broker-available-p ()
   "Return non-nil when LispM Desktop's frame clock can be loaded."
   (and (require 'lispm-desktop-frame nil t)
        (fboundp 'lispm-desktop-frame-add-client)))
 
-(defun lispm-kernel-broker--schedule (runtime _immediate)
+(defun lispm-kernel-broker--schedule (runtime)
   "Ask the frame clock for a frame when RUNTIME is the broker's.
 Return non-nil when it took RUNTIME, see `lispm-kernel-scheduler'."
   (when (and lispm-kernel-broker--runtime (eq runtime lispm-kernel-broker--runtime))
@@ -51,15 +55,17 @@ Return non-nil when it took RUNTIME, see `lispm-kernel-scheduler'."
     t))
 
 (defun lispm-kernel-broker--frame (deadline)
-  "Dispatch the broker's runtime until DEADLINE, a `float-time'.
-Return non-nil while it waits for results, so the clock comes back."
+  "Take in the broker's runtime's messages until DEADLINE, a `float-time'.
+Return non-nil while there are more, so the clock comes back."
   (when-let* ((runtime lispm-kernel-broker--runtime))
     (let ((lispm-kernel-slice-seconds (max 0 (- deadline (float-time)))))
       (lispm-kernel-dispatch runtime))
-    (lispm-kernel-pending-p runtime)))
+    (and (not (lispm-kernel-runtime-closed runtime))
+         (lispm-kernel--lines-p runtime)
+         t)))
 
 (defun lispm-kernel-broker-start (runtime)
-  "Dispatch RUNTIME on LispM Desktop's frame clock instead of its own timers."
+  "Take in RUNTIME's messages on LispM Desktop's frame clock instead of timers."
   (unless (lispm-kernel-broker-available-p)
     (user-error "This LispM Desktop has no frame clock (lispm-desktop-frame); update it"))
   (when lispm-kernel-broker--runtime (lispm-kernel-broker-stop))
@@ -70,18 +76,18 @@ Return non-nil while it waits for results, so the clock comes back."
   (when-let* ((timer (lispm-kernel-runtime-timer runtime)))
     (cancel-timer timer)
     (setf (lispm-kernel-runtime-timer runtime) nil))
-  (when (lispm-kernel-pending-p runtime)
+  (when (lispm-kernel--lines-p runtime)
     (lispm-desktop-frame-request 'lispm-kernel)))
 
 (defun lispm-kernel-broker-stop ()
-  "Leave the frame clock; the runtime schedules itself with timers again."
+  "Leave the frame clock; the runtime's messages are taken in by timers again."
   (let ((runtime lispm-kernel-broker--runtime))
     (setq lispm-kernel-broker--runtime nil)
     (when (eq lispm-kernel-scheduler #'lispm-kernel-broker--schedule)
       (setq lispm-kernel-scheduler nil))
     (when (fboundp 'lispm-desktop-frame-remove-client)
       (lispm-desktop-frame-remove-client 'lispm-kernel))
-    (when (and runtime (lispm-kernel-pending-p runtime))
+    (when (and runtime (not (lispm-kernel-runtime-closed runtime)) (lispm-kernel--lines-p runtime))
       (lispm-kernel--schedule runtime))))
 
 (defun lispm-kernel-broker-unload-function ()

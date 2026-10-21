@@ -1,0 +1,208 @@
+name: kernel program
+
+# The kernel program, SBCL's runtime with the kernel's core, built for the
+# computers LispM runs on and, from main, published where
+# lispm-kernel-program.el downloads it: the release kernel-program-VERSION,
+# VERSION being what `lispm-kernel-program-source-version' makes of the
+# sources it is built from.  A version is built and released once, then
+# left as it is; its release is never marked the latest, which stays the
+# kernel's own.  LispM keeps a download only when its SHA-256 is the one
+# lisp/lispm-kernel-program-sums.eld pins, which `make pin' writes from
+# the release, in a commit of its own.
+on:
+  push:
+    branches: [main]
+    paths:
+      - lispm-kernel.asd
+      - src/**
+      - scripts/build.lisp
+      - scripts/build-sbcl.sh
+      - lisp/lispm-kernel-program.el
+      - lisp/lispm-kernel-program-sums.eld
+      - .github/workflows/kernel-program.yml
+  pull_request:
+    paths:
+      - lispm-kernel.asd
+      - src/**
+      - scripts/build.lisp
+      - scripts/build-sbcl.sh
+      - lisp/lispm-kernel-program.el
+      - lisp/lispm-kernel-program-sums.eld
+      - .github/workflows/kernel-program.yml
+  # Sources main never had at its tip, so never published, are built and
+  # published, to be pinned, by running this on main with their commit as REF.
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: The commit whose sources to build and publish (by default the branch's tip)
+        required: false
+
+permissions:
+  contents: read
+
+env:
+  # The SBCL the program is built with, from its source release.  The
+  # SHA-256 is of sbcl-2.6.9-source.tar.bz2, whose tar is the one SBCL's
+  # signed list, sbcl-2.6.9-crhodes.asc, names.
+  SBCL_VERSION: 2.6.9
+  SBCL_SHA256: c6fd1d735570eb4ff34caf9609988ca77ed0bd12b55d09a4fed075be890da513
+
+jobs:
+  version:
+    name: Version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      published: ${{ steps.version.outputs.published }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref }}
+      - uses: purcell/setup-emacs@v8.0
+        with:
+          version: '31.1'
+      - id: version
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version=$(emacs -Q --batch -L lisp -l lispm-kernel-program --eval '(princ (lispm-kernel-program-source-version))')
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          if gh release view "kernel-program-$version" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "published=true" >> "$GITHUB_OUTPUT"
+            echo "kernel-program-$version is published already"
+          else
+            echo "published=false" >> "$GITHUB_OUTPUT"
+          fi
+      # What the Lisp pins is what the release holds, when it pins these
+      # sources; between a change of them and the next pin it pins others.
+      - name: Check the pins
+        run: make check-pins
+
+  build:
+    name: ${{ matrix.target }}
+    needs: version
+    # A change of the Emacs Lisp alone leaves the version, and its release,
+    # as they are; a pull request builds all the same, to check the build.
+    if: github.event_name == 'pull_request' || needs.version.outputs.published == 'false'
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            target: aarch64-apple-darwin
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+          # The oldest glibc of the runners: its program runs with any newer one.
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+    env:
+      # The macOS LispM's installer and Emacs's builds support.
+      MACOSX_DEPLOYMENT_TARGET: '11.0'
+      ASSET: lispm-kernel-${{ matrix.target }}.gz
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref }}
+      - id: sbcl
+        uses: actions/cache@v6
+        with:
+          path: ~/sbcl
+          key: sbcl-${{ env.SBCL_VERSION }}-${{ env.SBCL_SHA256 }}-${{ matrix.target }}-macos11
+      # Built from source by an SBCL of the system's, which the program
+      # does not use.
+      - name: Build SBCL
+        if: steps.sbcl.outputs.cache-hit != 'true'
+        run: |
+          if [ "$RUNNER_OS" = macOS ]; then brew install sbcl; else sudo apt-get update && sudo apt-get install -y sbcl; fi
+          sh scripts/build-sbcl.sh "$SBCL_VERSION" "$SBCL_SHA256" "$HOME/sbcl"
+      - name: Test
+        run: make test-lisp SBCL="$HOME/sbcl/bin/sbcl"
+      - name: Build
+        run: |
+          make SBCL="$HOME/sbcl/bin/sbcl"
+          build/lispm-kernel --version
+          file build/lispm-kernel
+      # It needs the system's libraries only, and on macOS no newer one
+      # than LispM supports.
+      - name: Check what it needs
+        run: |
+          if [ "$RUNNER_OS" = macOS ]; then
+            otool -L build/lispm-kernel
+            ! otool -L build/lispm-kernel | tail -n +2 | grep -v -e '^\s*/usr/lib/' -e '^\s*/System/'
+            otool -l build/lispm-kernel | grep -A4 LC_BUILD_VERSION | grep -q "minos $MACOSX_DEPLOYMENT_TARGET\$"
+          else
+            ldd build/lispm-kernel
+          fi
+      - name: Compress
+        run: |
+          mkdir dist
+          gzip -9 -n -c build/lispm-kernel > "dist/$ASSET"
+          ls -l dist
+      - uses: actions/upload-artifact@v7
+        with:
+          name: kernel-program-${{ matrix.target }}
+          path: dist/
+          if-no-files-found: error
+
+  release:
+    name: Release
+    needs: [version, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    concurrency:
+      group: kernel-program-release
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref }}
+      - uses: purcell/setup-emacs@v8.0
+        with:
+          version: '31.1'
+      # Laid out as the release is, under the URL lispm-kernel-program.el
+      # derives from `lispm-kernel-program-prebuilt-url'.
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: kernel-program-*
+          path: releases/kernel-program-${{ needs.version.outputs.version }}
+          merge-multiple: true
+      - name: Checksums
+        working-directory: releases/kernel-program-${{ needs.version.outputs.version }}
+        run: |
+          sha256sum lispm-kernel-* > SHA256SUMS
+          cat SHA256SUMS
+      # Pinned as a release of the kernel pins it, then fetched as LispM
+      # fetches it, from the release laid out here: the names are the ones
+      # Emacs wants, the checksums the ones pinned, and the program for
+      # this computer runs and speaks Emacs's protocol.
+      - name: Pin it as a release does
+        run: >-
+          emacs -Q --batch -L lisp -l lispm-kernel-program
+          --eval "(setq lispm-kernel-program-prebuilt-url \"file://$PWD/releases\")"
+          -f lispm-kernel-program-batch-pin
+      - name: Download it as LispM does
+        run: |
+          emacs -Q --batch -L lisp -l lispm-kernel-program \
+            --eval "(setq lispm-kernel-program-prebuilt-url \"file://$PWD/releases\")" \
+            -f lispm-kernel-program-batch-download
+          test -x "prebuilt/$VERSION/lispm-kernel-x86_64-unknown-linux-gnu"
+      - name: Publish
+        if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag=kernel-program-$VERSION
+          if gh release view "$tag" >/dev/null 2>&1; then
+            echo "$tag is published already"
+            exit 0
+          fi
+          commit=$(git rev-parse HEAD)
+          gh release create "$tag" releases/"$tag"/* \
+            --target "$commit" --latest=false \
+            --title "Kernel program $VERSION" \
+            --notes "The kernel program, SBCL $SBCL_VERSION's runtime with the kernel's core from $commit, for macOS on Apple silicon and on Intel (11 and later) and for GNU/Linux on x86_64, compressed with gzip, by $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID.
+
+          lispm-kernel downloads the one for its computer, and keeps it only when its SHA-256 is the one its Lisp pins in lisp/lispm-kernel-program-sums.eld, which \`make pin\` writes from this release: nothing here needs to be fetched by hand."

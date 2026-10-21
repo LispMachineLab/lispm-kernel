@@ -1,4 +1,4 @@
-;;; lispm-kernel-desktop-test.el --- Opt-in integration against desktop -*- lexical-binding: t; -*-
+;;; lispm-kernel-desktop-test.el --- The kernel reading LispM Desktop's sessions -*- lexical-binding: t; -*-
 
 ;; Copyright (C) 2026  Ryan.K
 
@@ -22,9 +22,10 @@
 ;; along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 ;;; Commentary:
-;; Integration with a LispM Desktop that has session readers and a frame
-;; clock.  Load after lispm-kernel-test.el, which loads the module and
-;; defines `lispm-kernel-test--finish'.
+
+;; Against a LispM Desktop with session readers and a frame clock, whose
+;; own readers are the reference: what the kernel reads must be what they
+;; read.  Load after lispm-kernel-test.el, which names the program.
 
 ;;; Code:
 
@@ -37,18 +38,22 @@
 ;; replace the fakes, and undoing a fake would then unbind the real ones.
 (require 'lispm-desktop-ai)
 (require 'lispm-desktop-frame)
-(declare-function lispm-kernel-test--finish "lispm-kernel-test" (runtime))
+(defvar lispm-kernel-test-program)
 
 (defvar lispm-kernel-desktop-test--readers nil
   "Readers the faked desktop registry holds, an alist (AGENT . READER).")
+
 (defvar lispm-kernel-desktop-test--arrived 0
   "How often `lispm-desktop-agent-sessions-arrived' was called.")
 
 (defmacro lispm-kernel-desktop-test--with-desktop (&rest body)
-  "Run BODY with the desktop's reader registry recorded, then turn the mode off."
+  "Run BODY with the desktop's reader registry recorded and the program
+under test, then turn the mode off."
   (declare (indent 0))
   `(let ((lispm-kernel-desktop-test--readers nil)
-         (lispm-kernel-desktop-test--arrived 0))
+         (lispm-kernel-desktop-test--arrived 0)
+         (lispm-kernel-desktop-program lispm-kernel-test-program)
+         (lispm-kernel-desktop-last-error nil))
      (cl-letf (((symbol-function 'lispm-desktop-agent-add-session-reader)
                 (lambda (agent reader)
                   (setf (alist-get agent lispm-kernel-desktop-test--readers) reader)))
@@ -66,69 +71,154 @@
 
 (defun lispm-kernel-desktop-test--read-until-known (agent)
   "Call AGENT's reader until it stops answering `pending'; return its sessions."
-  (let ((deadline (+ (float-time) 3)) (sessions 'pending))
+  (let ((deadline (+ (float-time) 10)) (sessions 'pending))
     (while (and (eq sessions 'pending) (< (float-time) deadline))
-      (lispm-kernel-dispatch lispm-kernel-desktop--runtime)
-      (setq sessions (lispm-kernel-desktop-test--read agent))
-      (when (eq sessions 'pending) (sleep-for 0.001)))
+      (accept-process-output nil 0.005)
+      (when (lispm-kernel-live-p lispm-kernel-desktop--runtime)
+        (lispm-kernel-dispatch lispm-kernel-desktop--runtime))
+      (setq sessions (lispm-kernel-desktop-test--read agent)))
     sessions))
 
-(defun lispm-kernel-desktop-test--codex-fixture (directory)
-  "Write one Codex transcript into DIRECTORY."
-  (with-temp-file (expand-file-name "rollout-test.jsonl" directory)
-    (insert "{\"type\":\"session_meta\",\"payload\":{\"id\":\"id\",\"cwd\":\"/test\",\"timestamp\":\"2026-10-21T00:00:00Z\"}}\n"
-            "{\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"same title\"}}\n")))
+(defun lispm-kernel-desktop-test--write (file &rest objects)
+  "Write OBJECTS to FILE as JSON Lines, and FILE's directory."
+  (make-directory (file-name-directory file) t)
+  (let ((coding-system-for-write 'utf-8-unix))
+    (with-temp-file file
+      (dolist (object objects)
+        (insert (if (stringp object) object (decode-coding-string (json-serialize object) 'utf-8))
+                "\n"))))
+  file)
 
-(ert-deftest lispm-kernel-desktop-reader-is-eventually-equivalent-and-reversible ()
-  (let* ((directory (make-temp-file "lispm-desktop-integration-" t))
-         (lispm-desktop-agent-codex-sessions-directory directory)
-         (lispm-desktop-agent-codex-index-file (expand-file-name "missing-index.jsonl" directory))
-         baseline result)
-    (unwind-protect
-        (lispm-kernel-desktop-test--with-desktop
-          (lispm-kernel-desktop-test--codex-fixture directory)
-          (setq baseline (lispm-desktop-agent-codex-sessions))
-          (lispm-kernel-desktop-mode 1)
-          (should (assq 'codex lispm-kernel-desktop-test--readers))
-          (should (assq 'claude lispm-kernel-desktop-test--readers))
-          (should (memq #'lispm-kernel-desktop-invalidate lispm-desktop-agent-reread-sessions-hook))
-          (should (eq (lispm-kernel-desktop-test--read 'codex) 'pending))
-          (setq result (lispm-kernel-desktop-test--read-until-known 'codex))
-          (should (= (length result) 1))
-          (dolist (key '(:agent :id :cwd :title :started :file :time))
-            (should (equal (plist-get (car result) key) (plist-get (car baseline) key))))
-          (should (> lispm-kernel-desktop-test--arrived 0))
-          ;; The desktop's own reader is never advised: the picker reads it as before.
-          (should (equal (lispm-desktop-agent-codex-sessions) baseline))
-          ;; A fresh snapshot does not start another scan.
-          (lispm-kernel-desktop-test--read 'codex)
-          (should-not (lispm-kernel-pending-p lispm-kernel-desktop--runtime))
-          (lispm-kernel-desktop-mode -1)
-          (should-not lispm-kernel-desktop-test--readers)
-          (should-not (memq #'lispm-kernel-desktop-invalidate lispm-desktop-agent-reread-sessions-hook))
-          (should-not lispm-kernel-desktop--runtime))
-      (delete-directory directory t))))
+(defun lispm-kernel-desktop-test--codex-tree (directory)
+  "Write Codex transcripts and an index in DIRECTORY."
+  (let ((day (expand-file-name "2026/10/21/" directory)))
+    (lispm-kernel-desktop-test--write
+     (expand-file-name "rollout-1.jsonl" day)
+     '(:type "session_meta" :payload (:id "one" :cwd "/w/one" :timestamp "2026-10-21T01:00:00.123Z"))
+     '(:type "response_item" :payload (:type "message" :role "user"
+                                       :content [(:type "input_text" :text "<environment_context>")]))
+     '(:type "event_msg" :payload (:type "user_message" :message "# AGENTS.md here"))
+     '(:type "event_msg" :payload (:type "user_message" :message "  Fix the build\nplease")))
+    (lispm-kernel-desktop-test--write
+     (expand-file-name "rollout-1-fork.jsonl" day)
+     '(:type "session_meta" :payload (:id "one" :cwd "/w/one" :timestamp "2026-10-21T02:00:00Z"))
+     '(:type "response_item" :payload (:type "message" :role "user"
+                                       :content [(:type "input_text" :text "forked ")
+                                                 (:type "input_text" :text "prompt")])))
+    (set-file-times (expand-file-name "rollout-1.jsonl" day) (seconds-to-time 1700000000))
+    (lispm-kernel-desktop-test--write
+     (expand-file-name "ROLLOUT-2.JSONL" day)
+     '(:type "session_meta" :payload (:id "two" :cwd "/w/two" :timestamp "not a time")))
+    (lispm-kernel-desktop-test--write
+     (expand-file-name "rollout-3.jsonl" day)
+     "not json"
+     '(:type "session_meta" :payload (:id "three" :cwd "/w/three"))
+     (concat (decode-coding-string
+              (json-serialize '(:type "event_msg" :payload (:type "user_message" :message "big")))
+              'utf-8)
+             (make-string 70000 ?\s)))
+    (lispm-kernel-desktop-test--write
+     (expand-file-name "rollout-4.jsonl" day)
+     '(:type "session_meta" :payload (:id "four" :cwd "/w/four"))
+     (list :type "event_msg" :payload (list :type "user_message"
+                                            :message (concat "Unicode " (string #xe9 #x3bb #x1f600)))))
+    (lispm-kernel-desktop-test--write
+     (expand-file-name "session_index.jsonl" (file-name-directory (directory-file-name directory)))
+     '(:id "two" :thread_name "Named two")
+     '(:id "four" :thread_name "Old name")
+     '(:id "four" :thread_name "New name"))))
 
-(ert-deftest lispm-kernel-desktop-claude-result-matches-current-parser ()
-  (let* ((directory (make-temp-file "lispm-claude-parity-" t))
-         (lispm-desktop-agent-claude-projects-directory directory)
-         baseline result)
-    (unwind-protect
-        (lispm-kernel-desktop-test--with-desktop
-          (make-directory (expand-file-name "project/session" directory) t)
-          (with-temp-file (expand-file-name "project/session.jsonl" directory)
-            (insert "{\"type\":\"user\",\"cwd\":\"/project\",\"isMeta\":true,\"message\":{\"content\":\"ignore me\"}}\n"
-                    "{\"type\":\"user\",\"cwd\":\"/project\",\"message\":{\"content\":[{\"text\":\"hello\"}]}}\n"
-                    "{\"type\":\"summary\",\"summary\":\"summary title\"}\n"))
-          (with-temp-file (expand-file-name "project/session/custom-title.json" directory)
-            (insert "{\"customTitle\":\"overridden title\"}"))
-          (setq baseline (lispm-desktop-agent-claude-sessions))
-          (lispm-kernel-desktop-mode 1)
-          (setq result (lispm-kernel-desktop-test--read-until-known 'claude))
-          (should (= (length result) 1))
-          (dolist (key '(:agent :id :cwd :title :file :time))
-            (should (equal (plist-get (car result) key) (plist-get (car baseline) key)))))
-      (delete-directory directory t))))
+(defun lispm-kernel-desktop-test--claude-tree (directory)
+  "Write Claude Code transcripts in DIRECTORY."
+  (lispm-kernel-desktop-test--write
+   (expand-file-name "project/a.jsonl" directory)
+   '(:type "user" :cwd "/c/a" :isMeta t :message (:content "ignore me"))
+   '(:type "user" :cwd "/c/a" :message (:content [(:text "hello ") (:text "there")])))
+  (apply #'lispm-kernel-desktop-test--write
+         (expand-file-name "project/b.jsonl" directory)
+         '(:type "user" :cwd "/c/b" :message (:content "early"))
+         (append (make-list 900 '(:type "assistant" :x "......................................................................................"))
+                 '((:type "summary" :summary "Late summary"))))
+  (lispm-kernel-desktop-test--write
+   (expand-file-name "project/c.jsonl" directory)
+   '(:type "custom-title" :customTitle "In the transcript")
+   '(:type "user" :cwd "/c/c" :message (:content "third")))
+  (lispm-kernel-desktop-test--write
+   (expand-file-name "project/c/custom-title.json" directory)
+   '(:customTitle "From its file"))
+  (lispm-kernel-desktop-test--write
+   (expand-file-name "project/d.jsonl" directory)
+   '(:type "user" :message (:content "no cwd")))
+  (lispm-kernel-desktop-test--write
+   (expand-file-name ".other/e.jsonl" directory)
+   '(:type "user" :cwd "/c/e" :message (:content "<command-name>"))
+   '(:type "summary" :summary "Only a summary")))
+
+(defun lispm-kernel-desktop-test--sorted (sessions)
+  "Return SESSIONS sorted by file, as the desktop compares them."
+  (sort (copy-sequence sessions) (lambda (a b) (string< (plist-get a :file) (plist-get b :file)))))
+
+(defmacro lispm-kernel-desktop-test--with-trees (&rest body)
+  "Run BODY with the desktop's Codex and Claude roots in a new directory."
+  (declare (indent 0))
+  `(let* ((directory (make-temp-file "lispm-kernel-desktop" t))
+          (lispm-desktop-agent-codex-sessions-directory (expand-file-name "codex/sessions/" directory))
+          (lispm-desktop-agent-codex-index-file (expand-file-name "codex/session_index.jsonl" directory))
+          (lispm-desktop-agent-claude-projects-directory (expand-file-name "claude/projects/" directory)))
+     (unwind-protect
+         (progn
+           (lispm-kernel-desktop-test--codex-tree lispm-desktop-agent-codex-sessions-directory)
+           (lispm-kernel-desktop-test--claude-tree lispm-desktop-agent-claude-projects-directory)
+           ;; Sessions of one time, ordered by where their files are.
+           (dolist (file (list (expand-file-name "2026/10/21/ROLLOUT-2.JSONL" lispm-desktop-agent-codex-sessions-directory)
+                               (expand-file-name "2026/10/21/rollout-4.jsonl" lispm-desktop-agent-codex-sessions-directory)
+                               (expand-file-name "project/a.jsonl" lispm-desktop-agent-claude-projects-directory)
+                               (expand-file-name "project/c.jsonl" lispm-desktop-agent-claude-projects-directory)
+                               (expand-file-name ".other/e.jsonl" lispm-desktop-agent-claude-projects-directory)))
+             (set-file-times file (seconds-to-time 1750000000)))
+           ,@body)
+       (delete-directory directory t))))
+
+(ert-deftest lispm-kernel-desktop-reads-as-the-desktop-does ()
+  (lispm-kernel-desktop-test--with-trees
+    (lispm-kernel-desktop-test--with-desktop
+      (lispm-kernel-desktop-mode 1)
+      (should (assq 'codex lispm-kernel-desktop-test--readers))
+      (should (assq 'claude lispm-kernel-desktop-test--readers))
+      (should (memq #'lispm-kernel-desktop-invalidate lispm-desktop-agent-reread-sessions-hook))
+      (should (eq lispm-kernel-broker--runtime lispm-kernel-desktop--runtime))
+      (dolist (agent '(codex claude))
+        (should (eq (lispm-kernel-desktop-test--read agent) 'pending))
+        (let ((sessions (lispm-kernel-desktop-test--read-until-known agent))
+              (reference (funcall (if (eq agent 'codex)
+                                      #'lispm-desktop-agent-codex-sessions
+                                    #'lispm-desktop-agent-claude-sessions))))
+          ;; As the sidebar draws them, those of one time in one order too.
+          (should (equal (lispm-desktop-agent--sort-sessions sessions)
+                         (lispm-desktop-agent--sort-sessions reference)))
+          (should (= (length sessions) (if (eq agent 'codex) 3 4)))))
+      (should (> lispm-kernel-desktop-test--arrived 0))
+      (should-not lispm-kernel-desktop-last-error))))
+
+(ert-deftest lispm-kernel-desktop-reads-again-when-stale ()
+  (lispm-kernel-desktop-test--with-trees
+    (lispm-kernel-desktop-test--with-desktop
+      (lispm-kernel-desktop-mode 1)
+      (let ((first (lispm-kernel-desktop-test--read-until-known 'claude)))
+        ;; Fresh: no reading starts.
+        (lispm-kernel-desktop-test--read 'claude)
+        (should-not (plist-get (gethash 'claude lispm-kernel-desktop--cache) :request))
+        (lispm-kernel-desktop-test--write
+         (expand-file-name "project/f.jsonl" lispm-desktop-agent-claude-projects-directory)
+         '(:type "user" :cwd "/c/f" :message (:content "new one")))
+        ;; Stale: the old sessions answer while the new are read.
+        (let ((lispm-kernel-desktop-cache-seconds 0))
+          (should (equal (lispm-kernel-desktop-test--read 'claude) first))
+          (should (integerp (plist-get (gethash 'claude lispm-kernel-desktop--cache) :request)))
+          (should (lispm-kernel-test--wait
+                   lispm-kernel-desktop--runtime
+                   (lambda () (null (plist-get (gethash 'claude lispm-kernel-desktop--cache) :request))))))
+        (should (= (length (lispm-kernel-desktop-test--read 'claude)) (1+ (length first))))))))
 
 (ert-deftest lispm-kernel-desktop-reread-supersedes-and-keeps-old-sessions ()
   (lispm-kernel-desktop-test--with-desktop
@@ -143,83 +233,18 @@
       (should (plist-get entry :known))
       (should (equal (plist-get entry :sessions) '((:id "old")))))))
 
-(ert-deftest lispm-kernel-desktop-reenable-retains-runtime ()
+(ert-deftest lispm-kernel-desktop-off-gives-everything-back ()
   (lispm-kernel-desktop-test--with-desktop
     (lispm-kernel-desktop-mode 1)
     (let ((runtime lispm-kernel-desktop--runtime))
       (lispm-kernel-desktop-mode 1)
-      (should (eq runtime lispm-kernel-desktop--runtime)))))
-
-(ert-deftest lispm-kernel-desktop-stays-off-without-a-module ()
-  (lispm-kernel-desktop-test--with-desktop
-    (cl-letf (((symbol-function 'lispm-kernel-try-create) #'ignore))
-      (should-error (lispm-kernel-desktop-mode 1) :type 'user-error))
-    (should-not lispm-kernel-desktop-mode)
-    (should-not lispm-kernel-desktop-test--readers)
-    (should-not lispm-kernel-broker--runtime)))
-
-(defmacro lispm-kernel-desktop-test--without-module (&rest body)
-  "Run BODY as if the module, loaded for the other tests, were not yet."
-  (declare (indent 0))
-  `(let ((featurep (symbol-function 'featurep)))
-     (cl-letf (((symbol-function 'featurep)
-                (lambda (feature &rest subfeatures)
-                  (and (not (eq feature 'lispm-kernel-module)) (apply featurep feature subfeatures)))))
-       ,@body)))
-
-(ert-deftest lispm-kernel-desktop-waits-for-the-module ()
-  "With no module configured or loaded, the mode is on while one is built
-or downloaded, the desktop's own readers answering; the kernel's are
-registered once it is there, and the mode turns off when none can be had."
-  (lispm-kernel-desktop-test--with-desktop
-    (let ((lispm-kernel-desktop-module nil)
-          (lispm-kernel-desktop-last-error nil)
-          (lispm-kernel-library-problem nil)
-          (messages nil)
-          (lispm-kernel-library-obtained-functions nil)
-          (inhibit-message t)
-          (asked 0))
-      (cl-letf (((symbol-function 'lispm-kernel-library-obtain) (lambda () (cl-incf asked) 'pending)))
-        (lispm-kernel-desktop-test--without-module (lispm-kernel-desktop-mode 1))
-        (should lispm-kernel-desktop-mode)
-        (should (= asked 1))
-        (should-not lispm-kernel-desktop--runtime)
-        (should-not lispm-kernel-desktop-test--readers)
-        (run-hook-with-args 'lispm-kernel-library-obtained-functions t)
-        (should lispm-kernel-desktop--runtime)
-        (should (eq lispm-kernel-broker--runtime lispm-kernel-desktop--runtime))
-        (should (assq 'codex lispm-kernel-desktop-test--readers))
-        (should (assq 'claude lispm-kernel-desktop-test--readers))
-        (should-not lispm-kernel-library-obtained-functions)
-        (lispm-kernel-desktop-mode -1)
-        ;; None could be got, and the user is told why.
-        (lispm-kernel-desktop-test--without-module (lispm-kernel-desktop-mode 1))
-        (setq lispm-kernel-library-problem "its SHA-256 differs, so it was refused")
-        (cl-letf (((symbol-function 'message)
-                   (lambda (format &rest args) (push (apply #'format format args) messages))))
-          (run-hook-with-args 'lispm-kernel-library-obtained-functions nil))
-        (should-not lispm-kernel-desktop-mode)
-        (should-not lispm-kernel-desktop-test--readers)
-        (should (equal lispm-kernel-desktop-last-error lispm-kernel-library-problem))
-        (should (seq-some (lambda (text) (string-search "so it was refused" text)) messages))
-        (setq lispm-kernel-library-problem nil)
-        ;; Turned off while waiting, it stays off once the module is there.
-        (lispm-kernel-desktop-test--without-module (lispm-kernel-desktop-mode 1))
-        (lispm-kernel-desktop-mode -1)
-        (should-not lispm-kernel-library-obtained-functions)
-        (should-not lispm-kernel-desktop--runtime))
-      ;; Nothing to be had at all.
-      (cl-letf (((symbol-function 'lispm-kernel-library-obtain) #'ignore))
-        (lispm-kernel-desktop-test--without-module
-          (should-error (lispm-kernel-desktop-mode 1) :type 'user-error)))
-      (should-not lispm-kernel-desktop-mode)
-      (should-not lispm-kernel-library-obtained-functions)
-      ;; A module configured is loaded as it is: nothing is got.
-      (cl-letf (((symbol-function 'lispm-kernel-library-obtain) (lambda () (cl-incf asked) 'pending)))
-        (let ((lispm-kernel-desktop-module "/configured/module.so"))
-          (lispm-kernel-desktop-mode 1))
-        (should (= asked 3))
-        (should lispm-kernel-desktop--runtime)))))
+      (should (eq runtime lispm-kernel-desktop--runtime))
+      (lispm-kernel-desktop-mode -1)
+      (should-not lispm-kernel-desktop-test--readers)
+      (should-not (memq #'lispm-kernel-desktop-invalidate lispm-desktop-agent-reread-sessions-hook))
+      (should-not lispm-kernel-desktop--runtime)
+      (should-not lispm-kernel-broker--runtime)
+      (should-not (process-live-p (lispm-kernel-runtime-process runtime))))))
 
 (ert-deftest lispm-kernel-desktop-remote-root-uses-the-desktop-reader ()
   (let ((lispm-desktop-agent-codex-sessions-directory "/ssh:host:/sessions/") called)
@@ -230,36 +255,105 @@ registered once it is there, and the mode turns off when none can be had."
         (should (equal (lispm-kernel-desktop-test--read 'codex) '((:id "remote"))))
         (should called)))))
 
-(ert-deftest lispm-kernel-desktop-gives-up-a-request-that-never-ends ()
-  (let ((lispm-kernel-desktop-scan-timeout 1))
-    (should (lispm-kernel-desktop--stale-p
-             (list :request 42 :started (- (float-time) 10) :time nil)))
-    (should-not (lispm-kernel-desktop--stale-p
-                 (list :request 42 :started (float-time) :time nil)))))
+(ert-deftest lispm-kernel-desktop-kernel-exits ()
+  (lispm-kernel-desktop-test--with-trees
+    (lispm-kernel-desktop-test--with-desktop
+      (lispm-kernel-desktop-mode 1)
+      (let ((runtime lispm-kernel-desktop--runtime)
+            (reference (lispm-desktop-agent-claude-sessions)))
+        (lispm-kernel-test--wait runtime (lambda () (lispm-kernel-runtime-hello runtime)))
+        (signal-process (lispm-kernel-runtime-process runtime) 'KILL)
+        (lispm-kernel-test--wait runtime (lambda () (not (lispm-kernel-live-p runtime))))
+        ;; Soon after it started: not again; the desktop's reader answers.
+        (should (equal (lispm-kernel-desktop-test--read 'claude) reference))
+        (should (eq runtime lispm-kernel-desktop--runtime))
+        (should (string-match-p "exited" (format "%s" lispm-kernel-desktop-last-error)))
+        ;; Later: started again.
+        (let ((lispm-kernel-desktop-restart-seconds 0))
+          (should (eq (lispm-kernel-desktop-test--read 'claude) 'pending)))
+        (should-not (eq runtime lispm-kernel-desktop--runtime))
+        (should (lispm-kernel-live-p lispm-kernel-desktop--runtime))
+        (should (eq lispm-kernel-broker--runtime lispm-kernel-desktop--runtime))
+        (should (equal (lispm-kernel-desktop-test--sorted (lispm-kernel-desktop-test--read-until-known 'claude))
+                       (lispm-kernel-desktop-test--sorted reference)))))))
 
-(ert-deftest lispm-kernel-desktop-retries-busy-admission-without-blocking ()
-  (let* ((directory (make-temp-file "lispm-busy-" t))
-         (lispm-desktop-agent-codex-sessions-directory directory)
-         (lispm-desktop-agent-codex-index-file (expand-file-name "missing.jsonl" directory))
-         (submit (symbol-function 'lispm-kernel-submit))
-         (attempts 0))
-    (unwind-protect
-        (lispm-kernel-desktop-test--with-desktop
-          (lispm-kernel-desktop-test--codex-fixture directory)
-          (lispm-kernel-desktop-mode 1)
-          (cl-letf (((symbol-function 'lispm-kernel-submit)
-                     (lambda (&rest args)
-                       (setq attempts (1+ attempts))
-                       (if (= attempts 1) 'busy (apply submit args)))))
-            (should (eq (lispm-kernel-desktop-test--read 'codex) 'pending))
-            (should (= attempts 1))
-            (should (eq (plist-get (gethash 'codex lispm-kernel-desktop--cache) :request) 'retry))
-            (should (= (length (lispm-kernel-desktop-test--read-until-known 'codex)) 1))
-            (should (> attempts 1))))
-      (delete-directory directory t))))
+(ert-deftest lispm-kernel-desktop-falls-back-when-the-kernel-cannot-read ()
+  (lispm-kernel-desktop-test--with-trees
+    (lispm-kernel-desktop-test--with-desktop
+      (lispm-kernel-desktop-mode 1)
+      (cl-letf (((symbol-function 'lispm-kernel-scan-sessions)
+                 (lambda (_runtime _agent _root callback &rest options)
+                   (run-at-time 0 nil (lambda ()
+                                        (funcall callback (funcall (plist-get options :fallback))
+                                                 '(:source elisp :native-error (failed "no")))))
+                   7)))
+        (should (equal (lispm-kernel-desktop-test--sorted (lispm-kernel-desktop-test--read-until-known 'claude))
+                       (lispm-kernel-desktop-test--sorted (lispm-desktop-agent-claude-sessions))))
+        (should (equal (plist-get lispm-kernel-desktop-last-error :native-error) '(failed "no")))))))
 
-(ert-deftest lispm-kernel-broker-runs-on-the-frame-clock ()
-  (let ((runtime (lispm-kernel-create)) requests clients)
+(ert-deftest lispm-kernel-desktop-retries-when-the-kernel-is-full ()
+  (lispm-kernel-desktop-test--with-trees
+    (lispm-kernel-desktop-test--with-desktop
+      (lispm-kernel-desktop-mode 1)
+      (let ((scan (symbol-function 'lispm-kernel-scan-sessions))
+            (attempts 0))
+        (cl-letf (((symbol-function 'lispm-kernel-scan-sessions)
+                   (lambda (runtime agent root callback &rest options)
+                     (cl-incf attempts)
+                     (if (= attempts 1)
+                         (progn (run-at-time 0 nil callback nil '(:rejected capacity)) 7)
+                       (apply scan runtime agent root callback options)))))
+          (should (eq (lispm-kernel-desktop-test--read 'claude) 'pending))
+          (should (= (length (lispm-kernel-desktop-test--read-until-known 'claude)) 4))
+          (should (= attempts 2)))))))
+
+(ert-deftest lispm-kernel-desktop-waits-for-the-program ()
+  "With no program named or there, the mode is on while one is built or
+downloaded, the desktop's own readers answering; the kernel's are
+registered once it is there, and the mode turns off when none can be had."
+  (lispm-kernel-desktop-test--with-desktop
+    (let ((lispm-kernel-desktop-program nil)
+          (lispm-kernel-program-problem nil)
+          (lispm-kernel-program-obtained-functions nil)
+          (inhibit-message t)
+          (messages nil)
+          (asked 0))
+      (cl-letf (((symbol-function 'lispm-kernel-program-obtain) (lambda () (cl-incf asked) 'pending))
+                ((symbol-function 'lispm-kernel-program-file) (lambda () lispm-kernel-test-program)))
+        (lispm-kernel-desktop-mode 1)
+        (should lispm-kernel-desktop-mode)
+        (should (= asked 1))
+        (should-not lispm-kernel-desktop--runtime)
+        (should-not lispm-kernel-desktop-test--readers)
+        (run-hook-with-args 'lispm-kernel-program-obtained-functions t)
+        (should (lispm-kernel-live-p lispm-kernel-desktop--runtime))
+        (should (assq 'codex lispm-kernel-desktop-test--readers))
+        (should-not lispm-kernel-program-obtained-functions)
+        (lispm-kernel-desktop-mode -1)
+        ;; None could be got, and the user is told why.
+        (lispm-kernel-desktop-mode 1)
+        (setq lispm-kernel-program-problem "its SHA-256 differs, so it was refused")
+        (cl-letf (((symbol-function 'message)
+                   (lambda (format &rest args) (push (apply #'format format args) messages))))
+          (run-hook-with-args 'lispm-kernel-program-obtained-functions nil))
+        (should-not lispm-kernel-desktop-mode)
+        (should-not lispm-kernel-desktop-test--readers)
+        (should (equal lispm-kernel-desktop-last-error lispm-kernel-program-problem))
+        (should (seq-some (lambda (text) (string-search "so it was refused" text)) messages))
+        ;; Turned off while waiting, it stays off once the program is there.
+        (lispm-kernel-desktop-mode 1)
+        (lispm-kernel-desktop-mode -1)
+        (should-not lispm-kernel-program-obtained-functions)
+        (should-not lispm-kernel-desktop--runtime))
+      ;; Nothing to be had at all.
+      (cl-letf (((symbol-function 'lispm-kernel-program-obtain) #'ignore))
+        (should-error (lispm-kernel-desktop-mode 1) :type 'user-error))
+      (should-not lispm-kernel-desktop-mode)
+      (should-not lispm-kernel-desktop-test--readers)
+      (should-not lispm-kernel-broker--runtime))))
+
+(ert-deftest lispm-kernel-broker-takes-messages-on-the-frame-clock ()
+  (let ((runtime (lispm-kernel-start lispm-kernel-test-program)) requests clients)
     (unwind-protect
         (cl-letf (((symbol-function 'lispm-desktop-frame-request)
                    (lambda (name) (push name requests)))
@@ -271,22 +365,27 @@ registered once it is there, and the mode turns off when none can be had."
           (should (equal (car clients) (list 'lispm-kernel #'lispm-kernel-broker--frame
                                              lispm-kernel-broker-depth)))
           (should (eq lispm-kernel-scheduler #'lispm-kernel-broker--schedule))
-          (lispm-kernel-test--submit runtime "x" #'ignore)
-          (should (memq 'lispm-kernel requests))
-          (should-not (lispm-kernel-runtime-timer runtime))
-          (let (slice)
-            (cl-letf (((symbol-function 'lispm-kernel-dispatch)
-                       (lambda (_) (setq slice lispm-kernel-slice-seconds))))
-              ;; Still waiting for its result: the clock is asked back.
-              (should (lispm-kernel-broker--frame (+ (float-time) 0.005)))
-              (should (< 0.004 slice 0.0051))))
+          (let (heard)
+            (lispm-kernel-submit runtime 'echo "x" :on-result (lambda (kind _) (push kind heard)))
+            ;; What the kernel writes asks the clock for a frame; no timer.
+            (with-timeout (5) (while (not (memq 'lispm-kernel requests)) (accept-process-output nil 0.01)))
+            (should (memq 'lispm-kernel requests))
+            (should-not (lispm-kernel-runtime-timer runtime))
+            (with-timeout (5) (while (< (length (lispm-kernel-runtime-incoming runtime)) 2)
+                                (accept-process-output nil 0.01)))
+            (let (slice)
+              (cl-letf (((symbol-function 'lispm-kernel-dispatch)
+                         (lambda (_) (setq slice lispm-kernel-slice-seconds))))
+                ;; Messages waiting: the clock is asked back.
+                (should (lispm-kernel-broker--frame (+ (float-time) 0.005)))
+                (should (< 0.004 slice 0.0051))))
+            (should-not (lispm-kernel-broker--frame (+ (float-time) 0.005)))
+            (should (equal heard '(success))))
           (lispm-kernel-broker-stop)
           (should-not clients)
-          (should-not lispm-kernel-scheduler)
-          ;; Back on its own timers while a request waits.
-          (should (lispm-kernel-runtime-timer runtime)))
+          (should-not lispm-kernel-scheduler))
       (lispm-kernel-broker-stop)
-      (lispm-kernel-shutdown runtime))))
+      (lispm-kernel-stop runtime))))
 
 (ert-deftest lispm-kernel-desktop-unload-gives-sessions-back ()
   (lispm-kernel-desktop-test--with-desktop
