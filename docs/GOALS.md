@@ -75,6 +75,6 @@ See `docs/session-benchmark.json` and `docs/validation.md`.
 
 ## Baseline
 
-CI tests against LispM Desktop's `kernel-seams` branch (frame clock and session
-readers) until it reaches main. Verified counts: 118 Rust tests, 33 integration ERT
+CI tests against LispM Desktop's main, which has the frame clock and session
+readers since lispm-desktop#64. Verified counts: 118 Rust tests, 33 integration ERT
 tests; the desktop's own suite (451 tests) passes with the seams.

@@ -201,6 +201,11 @@ impl Kernel {
     /// re-register. Returns `Closed` after shutdown and `NotificationIo` where hint
     /// writes cannot be kept from raising `SIGPIPE`.
     pub fn attach_notifications(&self) -> Result<UnixStream, Error> {
+        // Stopping never reverts: after shutdown the answer is Closed, not the
+        // Busy a worker still holding the lock would cause.
+        if self.shared.is_stopping() {
+            return Err(Error::Closed);
+        }
         let (reader, writer) = UnixStream::pair().map_err(|_| Error::NotificationIo)?;
         reader
             .set_nonblocking(true)
@@ -210,6 +215,7 @@ impl Kernel {
             .map_err(|_| Error::NotificationIo)?;
         suppress_sigpipe(&writer).map_err(|_| Error::NotificationIo)?;
         let state = self.state()?;
+        // Checked again under the lock, so shutdown and registration cannot cross.
         if self.shared.is_stopping() {
             return Err(Error::Closed);
         }
