@@ -129,7 +129,7 @@ The in-process module is the chosen prototype packaging, protocol 1, preserving
 existing desktop installation. Native faults remain process-wide. The standalone
 core still supports a future isolated process without coupling to Emacs objects.
 Local packaging verifies binary architecture and records SHA-256; Linux/macOS CI
-is configured, but remote execution/release is pending publication access.
+runs on every push and pull request.
 
 `lispm-kernel-desktop-mode` advises only built-in session providers and manual
 refresh. Third-party providers continue through the existing aggregator. Snapshots

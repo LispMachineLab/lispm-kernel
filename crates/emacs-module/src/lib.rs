@@ -1,3 +1,6 @@
+// Copyright (C) 2026  Ryan.K
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Thin experimental bridge. All Emacs conversion happens on the Emacs thread.
 // Dependency macros generate the FFI boundary; handwritten code uses safe APIs.
 #![deny(unsafe_code)]

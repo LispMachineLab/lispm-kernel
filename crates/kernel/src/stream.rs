@@ -1,3 +1,6 @@
+// Copyright (C) 2026  Ryan.K
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 use super::*;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

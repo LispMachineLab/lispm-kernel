@@ -1,4 +1,26 @@
 ;;; lispm-kernel-test.el --- Real module integration tests -*- lexical-binding: t; -*-
+
+;; Copyright (C) 2026  Ryan.K
+
+;; Author: Ryan.K
+;; URL: https://github.com/LispMachineLab/lispm-kernel
+;; SPDX-License-Identifier: AGPL-3.0-or-later
+
+;; This file is not part of GNU Emacs.
+
+;; This program is free software; you can redistribute it and/or modify
+;; it under the terms of the GNU Affero General Public License as published
+;; by the Free Software Foundation, either version 3 of the License, or
+;; (at your option) any later version.
+
+;; This program is distributed in the hope that it will be useful,
+;; but WITHOUT ANY WARRANTY; without even the implied warranty of
+;; MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+;; GNU Affero General Public License for more details.
+
+;; You should have received a copy of the GNU Affero General Public License
+;; along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
 (require 'ert)
 (require 'cl-lib)
 (module-load (or (getenv "LISPM_KERNEL_MODULE") (error "Set LISPM_KERNEL_MODULE to the built module")))
@@ -23,10 +45,10 @@
   (let ((runtime (lispm-kernel-create)) result)
     (unwind-protect
         (progn
-          (lispm-kernel-test--submit runtime "Lisp 机器 λ" (lambda (event) (setq result event)))
+          (lispm-kernel-test--submit runtime "Lisp Machine λ €" (lambda (event) (setq result event)))
           (lispm-kernel-test--finish runtime)
           (should (eq (aref result 4) 'success))
-          (should (equal (aref result 5) "Lisp 机器 λ"))
+          (should (equal (aref result 5) "Lisp Machine λ €"))
           (should-not (lispm-kernel-runtime-timer runtime)))
       (lispm-kernel-shutdown runtime))))
 
@@ -114,7 +136,7 @@
         (progn
           (with-temp-file (expand-file-name "rollout-test.jsonl" directory)
             (insert "{\"type\":\"session_meta\",\"payload\":{\"id\":\"test-id\",\"cwd\":\"/test\"}}\n"
-                    "{\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"你好 kernel\"}}\n"))
+                    "{\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"Grüße € kernel\"}}\n"))
           (let ((deadline (+ (float-time) 3)))
             (while (and (not (integerp request)) (< (float-time) deadline))
               (setq request (lispm-kernel-submit runtime 'codex-scan directory :owner 8
@@ -127,7 +149,7 @@
           (should (integerp request))
           (lispm-kernel-test--finish runtime)
           (should (= (length rows) 1))
-          (should (equal (plist-get (car rows) :title) "你好 kernel"))
+          (should (equal (plist-get (car rows) :title) "Grüße € kernel"))
           (should (= (plist-get summary :rows) 1))
           (should (= (plist-get summary :errors) 0)))
       (lispm-kernel-shutdown runtime)

@@ -1,3 +1,6 @@
+// Copyright (C) 2026  Ryan.K
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 use lispm_kernel::{Config, Error, Event, Kernel, Outcome, EVENT_OVERHEAD};
 use std::sync::mpsc;
 use std::thread;

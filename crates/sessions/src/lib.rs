@@ -1,3 +1,6 @@
+// Copyright (C) 2026  Ryan.K
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Bounded, cancellable transcript discovery. Never executes transcript content.
 #![forbid(unsafe_code)]
 use lispm_kernel::{Context, JobFailed};
@@ -581,14 +584,14 @@ mod tests {
         let head = vec![
             json!({"type":"user","cwd":"/p", "message":{"content":"<context>ignored"}}),
             json!({"type":"user", "isMeta":true,"message":{"content":"ignored"}}),
-            json!({"type":"user","message":{"content":[{"text":"hello "},{"text":"世界"}]}}),
+            json!({"type":"user","message":{"content":[{"text":"hello "},{"text":"wörld €"}]}}),
             json!({"type":"summary","summary":"old"}),
         ];
         let tail = vec![json!({"customTitle":"new"})];
         let parsed = parse(Agent::Claude, Path::new("session.jsonl"), &head, &tail).unwrap();
         assert_eq!(parsed.title.as_deref(), Some("new"));
         let parsed = parse(Agent::Claude, Path::new("session.jsonl"), &head[..3], &[]).unwrap();
-        assert_eq!(parsed.title.as_deref(), Some("hello 世界"));
+        assert_eq!(parsed.title.as_deref(), Some("hello wörld €"));
         assert!(!human("   # AGENTS.md guidance"));
     }
 

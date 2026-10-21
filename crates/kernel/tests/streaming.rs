@@ -1,3 +1,6 @@
+// Copyright (C) 2026  Ryan.K
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 use lispm_kernel::{
     Config, Context, EmitFailure, Error, JobFailed, JobOptions, Kernel, Outcome, WorkClass,
     EVENT_OVERHEAD,

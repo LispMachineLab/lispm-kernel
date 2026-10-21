@@ -1,3 +1,6 @@
+// Copyright (C) 2026  Ryan.K
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Owned native jobs with bounded admission and retained terminal outcomes.
 #![forbid(unsafe_code)]
 

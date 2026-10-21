@@ -1,3 +1,6 @@
+// Copyright (C) 2026  Ryan.K
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Coalesced nonblocking wake hints. Payloads stay in the bounded state queue.
 use super::*;
 use std::io::{ErrorKind, Write};

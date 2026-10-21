@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# Copyright (C) 2026  Ryan.K
+# SPDX-License-Identifier: AGPL-3.0-or-later
 """Package a previously built module and a reproducible compatibility manifest."""
 import hashlib
 import json
