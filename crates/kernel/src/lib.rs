@@ -549,11 +549,12 @@ impl Kernel {
 
     /// Submit a job, or get job and input back with the reason for a later retry.
     ///
-    /// Never blocks: a held state lock is `Busy`. Admission reserves the input's
-    /// allocation capacity, `max_output_bytes` and `EVENT_OVERHEAD` against the
-    /// global and per-owner limits. Captured closure allocations are trusted adapter
-    /// state, not accounted input. An accepted job wakes at most one idle worker,
-    /// and only of its own class.
+    /// Never blocks: a held state lock is `Busy`, but after shutdown the answer is
+    /// always `Closed`. Admission reserves the input's allocation capacity,
+    /// `max_output_bytes` and `EVENT_OVERHEAD` against the global and per-owner
+    /// limits. Captured closure allocations are trusted adapter state, not
+    /// accounted input. An accepted job wakes at most one idle worker, and only of
+    /// its own class.
     pub fn try_submit_with_options<F>(
         &self,
         owner: Owner,
@@ -566,10 +567,16 @@ impl Kernel {
     where
         F: FnOnce(Context, Vec<u8>) -> Result<Vec<u8>, JobFailed> + Send + 'static,
     {
+        // Stopping never reverts: after shutdown the answer is Closed, not the
+        // Busy a worker still holding the lock would cause.
+        if self.shared.is_stopping() {
+            return Err(Rejected::new(Error::Closed, input, job));
+        }
         let mut state = match self.state() {
             Ok(state) => state,
             Err(error) => return Err(Rejected::new(error, input, job)),
         };
+        // Checked again under the lock, so shutdown and admission cannot cross.
         if self.shared.is_stopping() {
             return Err(Rejected::new(Error::Closed, input, job));
         }
