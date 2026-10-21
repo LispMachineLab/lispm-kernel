@@ -211,8 +211,9 @@ impl Kernel {
         {
             return Err(Error::InvalidConfig);
         }
+        // Never wrap and reuse a runtime epoch.
         let epoch = NEXT_EPOCH
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
             .map_err(|_| Error::EpochExhausted)?;
         let shared = Arc::new(Shared {
             epoch,
