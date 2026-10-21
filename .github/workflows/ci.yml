@@ -1,0 +1,39 @@
+name: Rust
+on: [push, pull_request]
+jobs:
+  core:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - run: cargo test --workspace --locked
+      - run: cargo build --locked -p lispm-kernel-emacs
+      - if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y emacs-nox
+      - if: runner.os == 'macOS'
+        run: brew install emacs
+      - uses: actions/checkout@v4
+        with:
+          repository: LispMachineLab/lispm-desktop
+          ref: e6c4adc24e335522874c009df336e624ba31c733
+          path: .ci/desktop
+      - run: >-
+          emacs -Q --batch -L .ci/desktop/lisp -L lisp
+          --eval '(setq byte-compile-error-on-warn t)'
+          -f batch-byte-compile lisp/*.el
+      - run: python3 scripts/test-emacs.py
+        env:
+          LISPM_DESKTOP_ROOT: ${{ github.workspace }}/.ci/desktop
+      - run: cargo build --release --locked -p lispm-kernel-emacs
+      - run: python3 scripts/package-module.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kernel-${{ runner.os }}-${{ runner.arch }}
+          path: dist/

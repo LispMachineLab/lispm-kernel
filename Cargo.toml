@@ -1,0 +1,10 @@
+[workspace]
+members = ["crates/kernel", "crates/emacs-module", "crates/sessions"]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+license = "AGPL-3.0-or-later"
+
+[profile.release]
+lto = "thin"

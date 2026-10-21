@@ -1,35 +1,62 @@
 # lispm-kernel
 
-Shared Rust runtime for [LispM Desktop](https://github.com/LispMachineLab/lispm-desktop): bounded background jobs, cooperative Elisp dispatch, and responsive UI.
+Rust background runtime and cooperative Emacs frontend for
+[LispM Desktop](https://github.com/LispMachineLab/lispm-desktop).
+Design record: [desktop#48](https://github.com/LispMachineLab/lispm-desktop/issues/48).
 
-Status: design phase. The shared design and acceptance checklist live in [lispm-desktop#48](https://github.com/LispMachineLab/lispm-desktop/issues/48). Implementation follows baseline measurement and design review.
+The native core provides bounded admission, CPU/I/O pools, owner fairness, priority
+aging, cancellation, streaming/backpressure, replaceable state, retained final
+outcomes and Unix wake hints. It has no dependencies and forbids unsafe code.
 
-## Architecture
+The first real client discovers Codex/Claude transcripts off-thread, with bounded
+head/tail reads, bounded caching, incremental JSON delivery, generation filtering
+and an explicit Elisp fallback. An opt-in desktop integration returns cached
+snapshots while refreshing in the background. A shared cooperative broker schedules
+existing terminal drawing before session callbacks within an 8 ms soft budget.
+PTY emulation, status, exit and clipboard handling stay in the existing terminal module.
 
-- Rust owns background computation, I/O, cancellation, scheduling, and retained results.
-- Elisp owns buffers, windows, input, and redisplay, applying incremental results within a soft time budget.
-- Workers operate on owned snapshots; they never retain Emacs values or call Emacs APIs. This runtime cannot preempt arbitrary Elisp or run existing Elisp closures in parallel.
-- Reuse proven terminal mechanisms through client adapters. Validate both terminal workloads and session/transcript discovery before freezing the API.
-- Evaluate the existing in-process module integration against worker-process crash isolation before choosing the final boundary.
+This is an experimental prototype, not a stable API or released package. Timers
+poll while native requests exist; the native UnixStream notifier is not yet wired
+directly into Emacs. GC, redisplay and long callbacks still affect responsiveness.
+See [Goals](docs/GOALS.md), [architecture](docs/architecture.md) and
+[validation](docs/validation.md) for completed checks and remaining acceptance gates.
 
-## Runtime contract
+## Build and test
 
-Provisional operations: capabilities/version, submit, cancel, close-owner, drain, stats, and shutdown. Results carry runtime epoch, request ID, owner, and generation so stale work cannot overwrite newer state.
+```
+cargo test --workspace --locked
+cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo fmt --all -- --check
+cargo build --locked -p lispm-kernel-emacs
+python3 scripts/test-emacs.py
+```
 
-Bound admission and queues by both items and bytes, with per-owner quotas, fairness, cooperative cancellation, and explicit overload responses. Separate CPU work from blocking I/O and long-lived terminal loops. Coalesce replaceable state while preserving completion, error, and exit outcomes.
+For desktop parity/broker tests, set `LISPM_DESKTOP_ROOT=/path/to/lispm-desktop`.
+Build a distributable local module with:
 
-Notifications are hints to drain retained state. Define a lost-wakeup-safe drain/rearm handshake. Submission, locks, conversion, draining, and shutdown must avoid unbounded waits on the Emacs thread.
+```
+cargo build --release --locked -p lispm-kernel-emacs
+python3 scripts/package-module.py
+```
 
-## Delivery sequence
+The bundle contains the native module, four Lisp files, license and a protocol/hash
+manifest. Architecture is read from the binary header, avoiding translated Python
+process architecture mistakes. No download, auto-build or automatic installation occurs.
 
-1. Reproducible workloads and baseline instrumentation: input delay, callback duration, GC/redisplay, CPU/RSS, wakeups, and queue depths.
-2. Review API, packaging, lifecycle, isolation, overload behavior, and numeric acceptance targets.
-3. Implement runtime lifecycle and bounded scheduling in a small auditable PR.
-4. Add incremental cancellable session discovery with Elisp fallback.
-5. Integrate terminals and publish measured before/after results.
+## Opt-in use
 
-Preserve existing terminal behavior and macOS/Linux distribution paths. Test saturation, slow consumers, fairness, cancellation races, stale results, wakeup rearming, worker failures, and shutdown.
+Load the bundle after desktop's Lisp directory is available:
 
-## Collaboration
+```elisp
+(add-to-list 'load-path "/path/to/bundle")
+(require 'lispm-kernel-desktop)
+(setq lispm-kernel-desktop-module "/path/to/bundle/lispm-kernel-module.so")
+(lispm-kernel-desktop-mode 1)
+;; Restore the existing providers and terminal scheduler:
+;; (lispm-kernel-desktop-mode -1)
+```
 
-Claude and Codex share the design record. Claim scoped tasks/files before editing, recheck concurrent changes, preserve other work, and keep implementation PRs small enough to audit.
+Missing/incompatible modules retain the Elisp path. Explicit refresh invalidates
+cached snapshots and cancels older generations. Remote roots use the existing
+provider. Native scan failure invokes the provided Elisp fallback, which retains
+its original main-thread latency. Enabling the mode does not change saved config.
