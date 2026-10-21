@@ -10,7 +10,8 @@ permissions:
 
 env:
   # The LispM Desktop the integration is tested against.  Its frame clock and
-  # session readers are on this branch until they reach main.
+  # session readers are on this branch until LispMachineLab/lispm-desktop#64
+  # merges; then this becomes main.
   DESKTOP_REF: kernel-seams
 
 jobs:
