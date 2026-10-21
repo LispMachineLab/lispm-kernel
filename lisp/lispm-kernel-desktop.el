@@ -30,9 +30,14 @@
 ;; or the sidebar reads sessions anew.  Every other caller, the session picker
 ;; among them, keeps the desktop's own synchronous readers.  Kernel dispatch runs
 ;; on the desktop's frame clock, see lispm-kernel-broker.  Nothing is advised.
+;; The module is the one `lispm-kernel-desktop-module' names, else the one
+;; lispm-kernel-library downloads and checks, or builds when asked to: until
+;; that is there the mode is on and the desktop's own readers answer, and
+;; when it cannot be the mode turns off, saying why.
 ;;; Code:
 (require 'lispm-kernel-sessions)
 (require 'lispm-kernel-broker)
+(require 'lispm-kernel-library)
 (defvar lispm-desktop-agent-codex-sessions-directory)
 (defvar lispm-desktop-agent-claude-projects-directory)
 (defvar lispm-desktop-agent-reread-sessions-hook)
@@ -41,8 +46,13 @@
 (declare-function lispm-desktop-agent-sessions-arrived "ext:lispm-desktop-ai" ())
 
 (defcustom lispm-kernel-desktop-module nil
-  "Explicit path to the built lispm-kernel Emacs module."
-  :type '(choice (const nil) file) :group 'lispm-kernel)
+  "The lispm-kernel module to load, a file, or nil to have one got.
+nil downloads the module of these sources in the background when none
+is there, checked against the SHA-256 pinned with the Lisp, or builds it
+when `lispm-kernel-library-source' says so, see
+`lispm-kernel-library-obtain'; a file is loaded as it is, nothing being
+downloaded or built."
+  :type '(choice (const :tag "Downloaded, checked" nil) file) :group 'lispm-kernel)
 (defcustom lispm-kernel-desktop-cache-seconds 2
   "Maximum snapshot age before a reader schedules a background refresh."
   :type 'number :group 'lispm-kernel)
@@ -188,18 +198,11 @@ This is on `lispm-desktop-agent-reread-sessions-hook'."
                                  :known (plist-get entry :known))
                      lispm-kernel-desktop--cache)))))))
 
-(defun lispm-kernel-desktop--enable ()
-  "Start the runtime and register the session readers; signal when impossible."
-  (require 'lispm-desktop-ai)
-  (require 'lispm-desktop-agent-codex)
-  (require 'lispm-desktop-agent-claude)
-  (unless (and (fboundp 'lispm-desktop-agent-add-session-reader)
-               (lispm-kernel-broker-available-p))
-    (user-error "This LispM Desktop has no session readers or frame clock; update it"))
+(defun lispm-kernel-desktop--start ()
+  "Start the runtime and register the session readers; signal when the
+module makes no runtime."
   (unless lispm-kernel-desktop--runtime
-    (setq lispm-kernel-desktop--runtime
-          (and (or (featurep 'lispm-kernel-module) lispm-kernel-desktop-module)
-               (lispm-kernel-try-create lispm-kernel-desktop-module))))
+    (setq lispm-kernel-desktop--runtime (lispm-kernel-try-create lispm-kernel-desktop-module)))
   (unless lispm-kernel-desktop--runtime
     (setq lispm-kernel-desktop-last-error (or lispm-kernel-module-error 'module-unavailable))
     (user-error "No lispm-kernel module: %S" lispm-kernel-desktop-last-error))
@@ -211,8 +214,45 @@ This is on `lispm-desktop-agent-reread-sessions-hook'."
        agent (lambda () (lispm-kernel-desktop--read agent)))))
   (add-hook 'lispm-desktop-agent-reread-sessions-hook #'lispm-kernel-desktop-invalidate))
 
+(defun lispm-kernel-desktop--unavailable ()
+  "Signal that no module can be had, saying why.
+The reason is `lispm-kernel-library-problem'."
+  (setq lispm-kernel-desktop-last-error (or lispm-kernel-library-problem 'module-unavailable))
+  (user-error "No lispm-kernel module, so the desktop reads sessions itself: %s"
+              (or lispm-kernel-library-problem "none is there")))
+
+(defun lispm-kernel-desktop--obtained (loaded)
+  "Finish turning the mode on now that the module is LOADED, or turn it off.
+This is on `lispm-kernel-library-obtained-functions' while the mode waits
+for the module."
+  (remove-hook 'lispm-kernel-library-obtained-functions #'lispm-kernel-desktop--obtained)
+  (when (and lispm-kernel-desktop-mode (not lispm-kernel-desktop--runtime))
+    (condition-case error
+        (if loaded (lispm-kernel-desktop--start) (lispm-kernel-desktop--unavailable))
+      (error
+       (lispm-kernel-desktop-mode -1)
+       (message "%s" (error-message-string error))))))
+
+(defun lispm-kernel-desktop--enable ()
+  "Start the runtime and register the session readers, now, or once the
+module is built or downloaded; signal when impossible."
+  (require 'lispm-desktop-ai)
+  (require 'lispm-desktop-agent-codex)
+  (require 'lispm-desktop-agent-claude)
+  (unless (and (fboundp 'lispm-desktop-agent-add-session-reader)
+               (lispm-kernel-broker-available-p))
+    (user-error "This LispM Desktop has no session readers or frame clock; update it"))
+  (if (or lispm-kernel-desktop--runtime lispm-kernel-desktop-module (featurep 'lispm-kernel-module))
+      (lispm-kernel-desktop--start)
+    (pcase (lispm-kernel-library-obtain)
+      ('loaded (lispm-kernel-desktop--start))
+      ;; Until it is there, the desktop's own readers answer.
+      ('pending (add-hook 'lispm-kernel-library-obtained-functions #'lispm-kernel-desktop--obtained))
+      (_ (lispm-kernel-desktop--unavailable)))))
+
 (defun lispm-kernel-desktop--disable ()
   "Give the sessions back to the desktop's own readers and close the runtime."
+  (remove-hook 'lispm-kernel-library-obtained-functions #'lispm-kernel-desktop--obtained)
   (when (fboundp 'lispm-desktop-agent-remove-session-reader)
     (dolist (spec lispm-kernel-desktop--agents)
       (lispm-desktop-agent-remove-session-reader (car spec))))
@@ -229,9 +269,13 @@ This is on `lispm-desktop-agent-reread-sessions-hook'."
 
 (define-minor-mode lispm-kernel-desktop-mode
   "Read Codex and Claude sessions for the agents sidebar in the background.
-Needs a built lispm-kernel module (`lispm-kernel-desktop-module') and a LispM
-Desktop with session readers and a frame clock; without them the mode stays
-off and the desktop's own readers stay in use."
+Needs a LispM Desktop with session readers and a frame clock, and the
+kernel's module: the one `lispm-kernel-desktop-module' names, else the one
+downloaded for these sources and checked against the SHA-256 pinned with
+the Lisp, or built with Cargo when `lispm-kernel-library-source' says so,
+in the background, see `lispm-kernel-library-obtain'.  Until that is
+there the desktop's own readers answer; without a desktop or a module to
+be had, the mode turns off, saying why, and they stay in use."
   :global t :group 'lispm-kernel
   (if (not lispm-kernel-desktop-mode)
       (lispm-kernel-desktop--disable)

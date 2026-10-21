@@ -37,7 +37,7 @@ PACKAGE = "lispm-kernel-emacs"
 CRATE = "lispm_kernel_emacs"
 LIBRARY = "lib" + CRATE
 LISP = ("lispm-kernel.el", "lispm-kernel-sessions.el",
-        "lispm-kernel-desktop.el", "lispm-kernel-broker.el")
+        "lispm-kernel-desktop.el", "lispm-kernel-broker.el", "lispm-kernel-library.el")
 # Cargo's profile names: `debug' is only the directory of the dev profile.
 PROFILES = {"debug": "dev"}
 # Machine codes of the binary headers, by the first field of a Rust triple.

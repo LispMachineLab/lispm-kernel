@@ -12,7 +12,8 @@ from kernel_module import ROOT as root, build
 module = build(os.environ.get("LISPM_KERNEL_PROFILE", "dev"))
 env = dict(os.environ, LISPM_KERNEL_MODULE=str(module))
 command = [os.environ.get("EMACS", "emacs"), "-Q", "--batch", "--eval", "(setq native-comp-enable-subr-trampolines nil)", "-L", str(root / "lisp"),
-           "-l", str(root / "test/lispm-kernel-test.el")]
+           "-l", str(root / "test/lispm-kernel-test.el"),
+           "-l", str(root / "test/lispm-kernel-library-test.el")]
 # Desktop tests use LISPM_DESKTOP_ROOT, else a lispm-desktop checkout next to this one.
 desktop_root = os.environ.get("LISPM_DESKTOP_ROOT")
 desktop = Path(desktop_root) if desktop_root else root.parent / "lispm-desktop"

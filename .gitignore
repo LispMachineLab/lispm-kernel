@@ -2,3 +2,4 @@
 /dist/
 *.elc
 __pycache__/
+/prebuilt/
