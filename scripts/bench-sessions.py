@@ -8,18 +8,15 @@ from pathlib import Path
 import subprocess
 import resource
 import sys
-root = Path(__file__).resolve().parents[1]
+
+from kernel_module import ROOT as root, build
+
 if len(sys.argv) > 2:
     sys.exit("Usage: python3 scripts/bench-sessions.py [/path/to/lispm-desktop]")
 desktop = Path(sys.argv[1]).resolve() if len(sys.argv) == 2 else root.parent / "lispm-desktop"
 if not (desktop / "lisp").is_dir():
     sys.exit(f"No lispm-desktop checkout at {desktop}")
-metadata = json.loads(subprocess.check_output(["cargo", "metadata", "--offline", "--no-deps", "--format-version", "1"], cwd=root))
-suffix = ".dylib" if sys.platform == "darwin" else ".so"
-modules = [p for p in Path(metadata["target_directory"]).rglob("liblispm_kernel_emacs" + suffix) if p.parent.name == os.environ.get("LISPM_KERNEL_PROFILE", "debug")]
-if not modules:
-    sys.exit("Build the module first")
-env = dict(os.environ, LISPM_KERNEL_MODULE=str(max(modules, key=lambda p: p.stat().st_mtime)))
+env = dict(os.environ, LISPM_KERNEL_MODULE=str(build(os.environ.get("LISPM_KERNEL_PROFILE", "dev"))))
 before = resource.getrusage(resource.RUSAGE_CHILDREN)
 result = subprocess.run([os.environ.get("EMACS", "emacs"), "-Q", "--batch", "-L", str(desktop / "lisp"), "-L", str(root / "lisp"), "-l", str(root / "bench/session-discovery.el")], env=env, cwd=root, check=True, stdout=subprocess.PIPE, text=True)
 after = resource.getrusage(resource.RUSAGE_CHILDREN)

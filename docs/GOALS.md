@@ -36,33 +36,38 @@ See `docs/session-benchmark.json` and `docs/validation.md`.
 ## G2 — Streaming, scheduling and wake protocol (complete)
 
 - [x] Bounded incremental results, backpressure and independent final capacity.
-- [x] Replaceable state coalescing, owner rotation and priority aging.
+- [x] Replaceable state coalescing (in emission order), cross-owner priority with
+  aging, owner rotation at equal priority, per-owner item and byte quotas.
 - [x] Separate CPU/blocking-I/O pools; long-lived PTY loops remain outside them.
 - [x] Nonblocking UnixStream wake hints; drain/rearm, budget errors, reader teardown.
-- [x] Queue/byte high-water marks, queue/run latency and cancellation counters.
+- [x] Queue/byte high-water marks, queue/run latency, cancellation, failure and panic
+  counters; cancellation frees admission at once; SIGPIPE-free wake hints.
 
 ## G3 — Real client and Emacs bridge (prototype complete)
 
-- [x] Choose in-process protocol-1 module for this prototype; document fault limits.
+- [x] Choose in-process module (protocol 2) for this prototype; document fault limits.
 - [x] Confine Env/Value conversion to Emacs calls with input/conversion caps.
 - [x] Callback registry, stale filtering, monotonic budgets, input yielding and no reentrancy.
 - [x] Codex/Claude discovery, bounded head/tail parsing and traversal.
-- [x] Bounded cache, independent title/index refresh, cancellation and explicit fallback.
+- [x] Stamp-checked cache swept per scan, independent title/index refresh,
+  cancellation, per-entry skips and explicit fallback only for whole-scan errors.
 - [x] Desktop-compatible plists, newest-per-ID collection and collection bounds.
-- [x] Opt-in desktop mode with snapshot caching, invalidation and admission retries.
+- [x] Opt-in desktop mode through the desktop's session readers: snapshot caching,
+  re-read on explicit refresh only, admission retries, timeouts and unload.
 - [x] Cold/warm comparisons against the actual desktop parser on generated fixtures.
 - [ ] Wire native wake hints into Emacs instead of adaptive polling, if profiling
   justifies the extra bridge/transport complexity.
 
 ## G4 — Terminal coordination and delivery
 
-- [x] Share an 8 ms cooperative frontend budget through an opt-in broker, preserving
-  the existing terminal implementation and native event ownership.
+- [x] Run kernel dispatch on the desktop's frame clock after the terminals, within
+  the frame's remaining budget, preserving the terminal implementation, its
+  input policy and native event ownership. No advice on desktop internals.
 - [x] Verify existing terminal visibility, final screen, status, input, sizing and
   lifecycle regression tests with kernel/desktop integration enabled.
-- [x] Test terminal-first ordering, remaining-budget application, input yielding,
-  callback error isolation and overrun deferral.
-- [x] Restore original schedulers/providers and cancel owned timers on disable.
+- [x] Test frame-clock registration, remaining-budget application and return to
+  timers; the desktop tests the clock's ordering, input yielding and error isolation.
+- [x] Give sessions and scheduling back on disable and on `unload-feature`.
 - [x] Build a local release bundle with four Lisp files, protocol/hash manifest and
   binary-derived architecture labeling.
 - [ ] Green Linux/macOS CI on main and a first tagged release.
@@ -70,5 +75,6 @@ See `docs/session-benchmark.json` and `docs/validation.md`.
 
 ## Baseline
 
-Desktop baseline: e6c4adc24e335522874c009df336e624ba31c733, the commit CI checks out.
-Verified counts: 34 Rust tests, 23 integration ERT tests, 24 terminal tests.
+CI tests against LispM Desktop's `kernel-seams` branch (frame clock and session
+readers) until it reaches main. Verified counts: 118 Rust tests, 33 integration ERT
+tests; the desktop's own suite (451 tests) passes with the seams.

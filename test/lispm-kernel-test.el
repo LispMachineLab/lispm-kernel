@@ -26,11 +26,12 @@
 (module-load (or (getenv "LISPM_KERNEL_MODULE") (error "Set LISPM_KERNEL_MODULE to the built module")))
 (require 'lispm-kernel)
 
-(defun lispm-kernel-test--submit (runtime text callback &optional generation)
+(defun lispm-kernel-test--submit (runtime text callback &optional generation timeout)
   (let ((deadline (+ (float-time) 3)) request)
     (while (and (not (integerp request)) (< (float-time) deadline))
       (setq request (lispm-kernel-submit runtime 'echo text :owner 7
-                                        :generation (or generation 0) :on-result callback))
+                                        :generation (or generation 0) :on-result callback
+                                        :timeout (or timeout lispm-kernel-request-timeout)))
       (unless (integerp request) (sleep-for 0.001)))
     (should (integerp request)) request))
 (defun lispm-kernel-test--finish (runtime)
@@ -226,3 +227,120 @@
           (should-not rows)
           (should (eq (plist-get details :error) 'session-limit)))
       (lispm-kernel-shutdown runtime) (delete-directory directory t))))
+
+(ert-deftest lispm-kernel-timeout-ends-request-once ()
+  (let ((runtime (lispm-kernel-create)) kinds)
+    (unwind-protect
+        (progn
+          (lispm-kernel-test--submit runtime "late" (lambda (event) (push (aref event 4) kinds)) 0 -1)
+          (lispm-kernel--expire runtime)
+          (should (equal kinds '(timeout)))
+          (should-not (lispm-kernel-pending-p runtime))
+          ;; The native outcome arriving afterwards finds no callback.
+          (sleep-for 0.05)
+          (lispm-kernel-dispatch runtime)
+          (should (equal kinds '(timeout))))
+      (lispm-kernel-shutdown runtime))))
+
+(ert-deftest lispm-kernel-persistent-drain-error-ends-requests-as-lost ()
+  (let ((runtime (lispm-kernel-create)) kinds)
+    (unwind-protect
+        (progn
+          (lispm-kernel-test--submit runtime "x" (lambda (event) (push (aref event 4) kinds)))
+          (cl-letf (((symbol-function 'lispm-kernel-module-drain) (lambda (&rest _) 'kernel-error)))
+            (lispm-kernel-dispatch runtime))
+          (should (equal kinds '(lost)))
+          (should-not (lispm-kernel-pending-p runtime))
+          (should-not (lispm-kernel-runtime-timer runtime))
+          (should (eq (lispm-kernel-runtime-last-error runtime) 'kernel-error)))
+      (lispm-kernel-shutdown runtime))))
+
+(ert-deftest lispm-kernel-busy-drain-keeps-waiting ()
+  (let ((runtime (lispm-kernel-create)) kinds)
+    (unwind-protect
+        (progn
+          (lispm-kernel-test--submit runtime "x" (lambda (event) (push (aref event 4) kinds)))
+          (cl-letf (((symbol-function 'lispm-kernel-module-drain) (lambda (&rest _) 'busy)))
+            (lispm-kernel-dispatch runtime))
+          (should-not kinds)
+          (should (lispm-kernel-pending-p runtime))
+          (should (lispm-kernel-runtime-timer runtime))
+          (lispm-kernel-test--finish runtime)
+          (should (equal kinds '(success))))
+      (lispm-kernel-shutdown runtime))))
+
+(ert-deftest lispm-kernel-scheduler-can-take-a-runtime ()
+  (let* ((taken nil)
+         (lispm-kernel-scheduler (lambda (runtime _) (push runtime taken) t))
+         (runtime (lispm-kernel-create)))
+    (unwind-protect
+        (progn
+          (lispm-kernel-test--submit runtime "x" #'ignore)
+          (should (memq runtime taken))
+          (should-not (lispm-kernel-runtime-timer runtime))
+          (lispm-kernel-test--finish runtime))
+      (lispm-kernel-shutdown runtime))))
+
+(ert-deftest lispm-kernel-unload-function-closes-runtimes ()
+  (let ((runtime (lispm-kernel-create)))
+    (should (memq runtime lispm-kernel--runtimes))
+    (lispm-kernel-unload-function)
+    (should (lispm-kernel-runtime-closed runtime))
+    (should-not (memq runtime lispm-kernel--runtimes))))
+
+(defvar lispm-kernel-test--on-result nil
+  "The ON-RESULT callback the faked `lispm-kernel-submit' received.")
+
+(defun lispm-kernel-test--scan-with (events &rest keys)
+  "Feed EVENTS to a session scan on a fake runtime; return (ROWS SUMMARY).
+KEYS are passed to `lispm-kernel-scan-sessions'."
+  (let ((runtime (lispm-kernel--runtime :handle nil :epoch 1)) result)
+    (cl-letf (((symbol-function 'lispm-kernel-submit)
+               (cl-function (lambda (_runtime _kind _root &key on-result &allow-other-keys)
+                              (setq lispm-kernel-test--on-result on-result)
+                              42)))
+              ((symbol-function 'lispm-kernel-cancel) #'ignore))
+      (apply #'lispm-kernel-scan-sessions runtime 'codex "/unused"
+             (lambda (rows summary) (setq result (list rows summary))) keys)
+      (dolist (event events) (funcall lispm-kernel-test--on-result event))
+      ;; A fallback runs from a timer.
+      (let ((deadline (+ (float-time) 1)))
+        (while (and (null result) (< (float-time) deadline)) (sleep-for 0.001)))
+      result)))
+
+(defconst lispm-kernel-test--row
+  "{\"agent\":\"codex\",\"id\":\"a\",\"cwd\":\"/p\",\"file\":\"/p/a.jsonl\",\"title\":\"t\",\"time\":1.0,\"started\":null}")
+
+(ert-deftest lispm-kernel-session-skipped-files-do-not-fail-a-scan ()
+  (pcase-let ((`(,rows ,summary)
+               (lispm-kernel-test--scan-with
+                (list (vector 1 42 0 0 'chunk lispm-kernel-test--row nil)
+                      (vector 1 42 0 0 'success
+                              "{\"rows\":1,\"errors\":0,\"skipped\":2,\"truncated\":false,\"cached\":0}" nil))
+                :fallback (lambda () '((:id "fallback"))))))
+    (should (equal (mapcar (lambda (row) (plist-get row :id)) rows) '("a")))
+    (should (= (plist-get summary :skipped) 2))))
+
+(ert-deftest lispm-kernel-session-fatal-errors-use-the-fallback ()
+  (pcase-let ((`(,rows ,summary)
+               (lispm-kernel-test--scan-with
+                (list (vector 1 42 0 0 'chunk lispm-kernel-test--row nil)
+                      (vector 1 42 0 0 'success "{\"rows\":1,\"errors\":1,\"skipped\":0}" nil))
+                :fallback (lambda () '((:id "fallback"))))))
+    (should (equal rows '((:id "fallback"))))
+    (should (eq (plist-get summary :source) 'elisp))))
+
+(ert-deftest lispm-kernel-session-malformed-summary-uses-the-fallback ()
+  (pcase-let ((`(,rows ,_)
+               (lispm-kernel-test--scan-with
+                (list (vector 1 42 0 0 'success "not json" nil))
+                :fallback (lambda () '((:id "fallback"))))))
+    (should (equal rows '((:id "fallback"))))))
+
+(ert-deftest lispm-kernel-session-timeout-uses-the-fallback ()
+  (pcase-let ((`(,rows ,summary)
+               (lispm-kernel-test--scan-with
+                (list (vector 1 42 0 0 'timeout "" nil))
+                :fallback (lambda () '((:id "fallback"))))))
+    (should (equal rows '((:id "fallback"))))
+    (should (eq (plist-get summary :native-error) 'timeout))))

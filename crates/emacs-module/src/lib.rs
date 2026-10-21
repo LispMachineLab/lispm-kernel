@@ -21,7 +21,7 @@ use std::path::Path;
 use std::sync::OnceLock;
 
 /// The protocol `lispm-kernel.el` checks before using the module.
-const PROTOCOL_VERSION: u64 = 1;
+const PROTOCOL_VERSION: u64 = 2;
 /// Largest echo payload, checked in Emacs before copying into Rust.
 const MAX_ECHO_BYTES: usize = 60 * 1024;
 /// Largest scan root, in bytes.

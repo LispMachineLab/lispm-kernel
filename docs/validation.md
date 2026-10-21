@@ -10,10 +10,23 @@ or establish a performance improvement over desktop.
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo test --workspace --locked
-cargo build --locked -p lispm-kernel-emacs
 python3 scripts/test-emacs.py
 cargo run --release --locked -p lispm-kernel --example mixed
 ```
+
+## Review-fix checkpoint
+
+After the review of the first implementation (1e30683): 118 Rust tests, kernel 71
+(with a child-process SIGPIPE test, a 24-schedule model check that audits every
+invariant after each step, and a threaded submit/cancel/close/supersede/drain race),
+sessions 43 (with a 1,500-transcript cache test and listing parity with the
+desktop's Elisp), bridge 4. 33 ERT tests against LispM Desktop's `kernel-seams`
+branch (frame clock and session readers). Three runs of each without a failure;
+clippy `-D warnings` clean on rustc 1.97 and nightly 1.98; the desktop's own suite,
+451 tests, passes on that branch. The measurements below predate these changes and
+were not run again.
+
+## First checkpoint
 
 34 Rust tests cover admission, allocation capacity accounting, worker concurrency,
 owner rotation/priority aging, cancellation, stale epochs, shutdown, slow consumers,
@@ -41,11 +54,11 @@ The checked-in example asserts counts and bounds; its absolute timings are infor
 
 G0 still needs representative desktop workloads and before/after evidence. G3 now has real session discovery, cache correctness and Elisp fallback. Adaptive
 polling is used at the Emacs boundary; direct notification wiring remains optional.
-The shared broker preserves the existing terminal implementation.
+Kernel dispatch runs on the desktop's frame clock, after the terminals.
 
 ## Real session client and broker checkpoint
 
-The current suite includes 34 Rust tests and 23 real-module/desktop ERT tests.
+At the first checkpoint the suite had 34 Rust tests and 23 real-module/desktop ERT tests.
 `python3 scripts/test-emacs.py` runs the desktop tests against a lispm-desktop
 checkout next to this one (`../lispm-desktop`), or against `LISPM_DESKTOP_ROOT`.
 They include parser parity, reversible desktop integration, bounded admission retries,
