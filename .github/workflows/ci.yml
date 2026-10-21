@@ -9,10 +9,9 @@ permissions:
   contents: read
 
 env:
-  # The LispM Desktop the integration is tested against.  Its frame clock and
-  # session readers are on this branch until LispMachineLab/lispm-desktop#64
-  # merges; then this becomes main.
-  DESKTOP_REF: kernel-seams
+  # The LispM Desktop the integration is tested against: its main, which has
+  # the frame clock and session readers since LispMachineLab/lispm-desktop#64.
+  DESKTOP_REF: main
 
 jobs:
   rust:
