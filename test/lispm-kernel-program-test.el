@@ -201,6 +201,59 @@ SHA-256 of what is published."
       (lispm-kernel-program-test--wait)
       (should (string-match-p "could not be downloaded" lispm-kernel-program-problem)))))
 
+(defun lispm-kernel-program-test--fake-curl (directory script)
+  "Put a curl running SCRIPT, a shell script's body, first in DIRECTORY; the
+real curl is $CURL there."
+  (let ((curl (expand-file-name "curl" directory)))
+    (lispm-kernel-program-test--file
+     curl (format "#!/bin/sh\nCURL=%s\n%s" (shell-quote-argument (executable-find "curl")) script))
+    (set-file-modes curl #o755)
+    directory))
+
+(ert-deftest lispm-kernel-program-download-progress ()
+  "How far the download is goes to the progress functions as curl's bar
+says it; the bar's frames stay out of the download's buffer."
+  (lispm-kernel-program-test--with-sources
+    (let* ((releases (expand-file-name "releases" root))
+           (version (lispm-kernel-program-source-version))
+           (lispm-kernel-program-prebuilt-url (concat "file://" releases))
+           (bin (lispm-kernel-program-test--fake-curl
+                 (expand-file-name "bin" root)
+                 (concat "printf '#=#=#        \\r##O#-#       \\r' >&2\n"
+                         "printf '\\r###           25.0%%' >&2\n"
+                         "printf '\\r######        50,0%%' >&2\n"
+                         "printf '\\r############ 100.0%%\\n' >&2\n"
+                         "exec \"$CURL\" --silent \"$@\"\n")))
+           (exec-path (cons bin exec-path))
+           (fractions nil)
+           (lispm-kernel-program-progress-functions (list (lambda (fraction) (push fraction fractions)))))
+      (lispm-kernel-program-test--pin
+       (lispm-kernel-program-test--release
+        releases version `(("aarch64-apple-darwin" . ,lispm-kernel-program-test--hello))))
+      (should (eq (lispm-kernel-program-obtain) 'pending))
+      (lispm-kernel-program-test--wait)
+      (should (equal lispm-kernel-program-test--obtained '(t)))
+      (should (equal (reverse fractions) '(0.25 0.5 1.0)))
+      (should-not lispm-kernel-program-progress)
+      (should-not (string-match-p "#" (with-current-buffer "*lispm-kernel download*" (buffer-string))))
+      (should (lispm-kernel-program-file)))))
+
+(ert-deftest lispm-kernel-program-download-stopped ()
+  "A download stopped ends at once: nothing is kept, and those waiting hear
+it is not there."
+  (lispm-kernel-program-test--with-sources
+    (let* ((bin (lispm-kernel-program-test--fake-curl (expand-file-name "bin" root) "sleep 30\n"))
+           (exec-path (cons bin exec-path)))
+      (lispm-kernel-program-test--pin `(("aarch64-apple-darwin" . ,(make-string 64 ?b))))
+      (should (eq (lispm-kernel-program-obtain) 'pending))
+      (should (lispm-kernel-program--busy-p))
+      (lispm-kernel-program-stop)
+      (should-not (lispm-kernel-program--busy-p))
+      (should (equal lispm-kernel-program-test--obtained '(nil)))
+      (should (string-match-p "stopped" lispm-kernel-program-problem))
+      (should-not lispm-kernel-program--stopped)
+      (should-not (lispm-kernel-program-file)))))
+
 (ert-deftest lispm-kernel-program-nothing-to-download ()
   (lispm-kernel-program-test--with-sources
     (should-not (lispm-kernel-program--plan))
