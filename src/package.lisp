@@ -24,7 +24,7 @@
 ;;;   wire      the S-expressions both sides read and print
 ;;;   json      JSON, as agents write their transcripts
 ;;;   files     stat with nanoseconds, directories, byte ranges
-;;;   kernel    requests, worker pools, the outbox, the protocol
+;;;   kernel    requests, worker pools, the outbox, the protocol, downloads
 ;;;   sessions  the agents' sessions, read from their transcripts
 
 (defpackage #:lispm-kernel/wire

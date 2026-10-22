@@ -131,6 +131,25 @@ exits is started again when a reader is next asked, unless it ran shorter
 than `lispm-kernel-desktop-restart-seconds`; then it is not started again
 until the mode is turned on anew.
 
+## Downloads
+
+`src/fetch.lisp` downloads a URL into a file Emacs names, with curl, which
+the kernel runs; SBCL speaks no TLS of its own. Only http and https are
+fetched, redirections included. Emacs says which proxy to use, the one
+url.el would use for the URL, or none, and curl then uses no proxy of the
+environment either. A download that fails fails its request with what curl
+said, and one that is cancelled stops curl. Either removes the file.
+
+`lisp/lispm-kernel-package.el` advises `package--with-response-buffer-1`,
+through which package.el makes every download. A download package.el makes
+in the background, from http or https, goes to the desktop's kernel when it
+runs and knows the job. Its body then runs on what the kernel wrote, in a
+unibyte buffer, as package.el runs it on url.el's response, and package.el
+checks the signatures and keeps the archives as always. The others go to
+url.el: downloads package.el waits for, files, URLs url.el would reach
+through SOCKS or a gateway of its own, and every download while no such
+kernel runs.
+
 ## The program
 
 `scripts/build.lisp` compiles the system afresh, failing on any warning,
