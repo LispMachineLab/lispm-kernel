@@ -1,4 +1,4 @@
-;;; lispm-kernel-sessions.el --- Incremental session discovery -*- lexical-binding: t; -*-
+;;; lispm-kernel-sessions.el --- The agents' sessions, read by the kernel -*- lexical-binding: t; -*-
 
 ;; Copyright (C) 2026  Ryan.K
 
@@ -22,117 +22,101 @@
 ;; along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 ;;; Commentary:
-;; Opt-in API returning desktop-compatible plists. Native rows accumulate by ID;
-;; completion returns newest-first sessions. Explicit caller-provided Elisp fallback
-;; retains availability if the module is missing or a scan fails. It can still block
-;; Emacs like the existing path; idle scheduling is not parallel execution.
-;; Files the native scan has to skip (vanished, changing, unreadable) are counted
-;; in the summary's :skipped and do not fail the scan; only :errors do.
+
+;; `lispm-kernel-scan-sessions' has the kernel read the Codex or Claude
+;; Code sessions below a directory, as LispM Desktop's own readers do, see
+;; src/sessions.lisp, and gives them back as those readers do:
+;;
+;;   (:agent codex :id ID :cwd CWD :title TITLE :started FLOAT :file FILE :time FLOAT)
+;;   (:agent claude :id ID :cwd CWD :title TITLE :file FILE :time FLOAT)
+;;
+;; newest first.  When the kernel cannot read them, the caller's own
+;; reader, its FALLBACK, does, later, on Emacs's thread.
+
 ;;; Code:
+
 (require 'lispm-kernel)
 (require 'parse-time)
-(require 'seq)
-(declare-function lispm-kernel-module-clear-session-cache "ext:lispm-kernel-module" ())
-(defvar lispm-kernel-module-error nil "Last module loading failure, if any.")
 
-(defun lispm-kernel-try-create (module)
-  "Load MODULE and create a runtime, or return nil and record the failure."
-  (condition-case error
-      (progn
-        (unless (featurep 'lispm-kernel-module) (module-load module))
-        (prog1 (lispm-kernel-create) (setq lispm-kernel-module-error nil)))
-    (error (setq lispm-kernel-module-error error) nil)))
-
-(defun lispm-kernel-clear-session-cache ()
-  "Free the module's cache of transcript heads, when the module is loaded."
-  (when (fboundp 'lispm-kernel-module-clear-session-cache)
-    (lispm-kernel-module-clear-session-cache)))
-
-(defun lispm-kernel-sessions--row (text)
-  "Convert bounded JSON TEXT into a desktop-compatible session plist."
-  (let* ((row (json-parse-string text :object-type 'plist :null-object nil :false-object nil))
-         (agent (pcase (plist-get row :agent) ("codex" 'codex) ("claude" 'claude)
-                       (_ (error "Unknown session agent"))))
-         (stamp (plist-get row :started)))
-    (unless (and (stringp (plist-get row :id)) (stringp (plist-get row :cwd))
-                 (stringp (plist-get row :file)) (stringp (plist-get row :title))
-                 (numberp (plist-get row :time)))
-      (error "Malformed native session row"))
-    (plist-put row :agent agent)
-    (plist-put row :started (when stamp (ignore-errors (float-time (parse-iso8601-time-string stamp)))))
-    row))
+(defun lispm-kernel-sessions--session (agent row)
+  "Return the session of AGENT the kernel sent as ROW, or nil when ROW is
+not one."
+  (let ((id (plist-get row :id))
+        (cwd (plist-get row :cwd))
+        (title (plist-get row :title))
+        (file (plist-get row :file))
+        (mtime (plist-get row :mtime)))
+    (when (and (stringp id) (stringp cwd) (stringp title) (stringp file) (natnump mtime))
+      (let ((time (float-time (cons mtime 1000000000))))
+        (if (eq agent 'codex)
+            (list :agent 'codex :id id :cwd cwd :title title
+                  :started (when-let* ((stamp (plist-get row :started)))
+                             (ignore-errors (float-time (parse-iso8601-time-string stamp))))
+                  :file file :time time)
+          (list :agent 'claude :id id :cwd cwd :title title :file file :time time))))))
 
 (cl-defun lispm-kernel-scan-sessions (runtime agent root callback
-                                              &key (owner 0) (generation 0) fallback (max-sessions 200000)
+                                              &key (owner 0) (generation 0) index fallback
                                               (timeout lispm-kernel-request-timeout))
-  "Scan local ROOT for AGENT, calling CALLBACK with (SESSIONS SUMMARY).
-RUNTIME may be nil when the module is unavailable. FALLBACK is a zero-argument
-function returning sessions via the current Elisp path. It runs asynchronously
-on the Emacs thread, so it retains the old path's latency limits.
-Native admission busy/capacity is returned for caller retry, without fallback.
-Superseded generations receive no callbacks. Cancellation returns :cancelled t.
-The final session collection is capped by MAX-SESSIONS, separate from native
-queue/cache limits. A scan that takes longer than TIMEOUT seconds is cancelled
-and fails.  Native scan errors do not publish an incomplete final list.
-CALLBACK is called at most once."
-  (unless (memq agent '(codex claude)) (error "Unsupported session agent"))
-  (unless (and (integerp max-sessions) (> max-sessions 0)) (error "Invalid session limit"))
-  (let ((runtime (and runtime (not (lispm-kernel-runtime-closed runtime)) runtime))
-        (sessions (make-hash-table :test #'equal)) request finished limit-hit)
+  "Have RUNTIME's kernel read AGENT's sessions below ROOT, a local directory.
+AGENT is `codex' or `claude'; INDEX is Codex's session index, whose
+thread names title its sessions.  CALLBACK is called once, later, with
+SESSIONS, newest first, and SUMMARY, a plist: the kernel's counts
+\(:files :rows :empty :skipped :cached :truncated), or :cancelled t, or
+:rejected and why, the caller retrying a scan rejected for `capacity'.
+When the kernel fails to read them, or is not running, FALLBACK, a
+function returning the sessions as the caller reads them itself, is
+called on Emacs's thread instead, and SUMMARY says :source elisp and
+:native-error why; without FALLBACK, SESSIONS is nil and SUMMARY says
+:error why.  Superseding OWNER's GENERATION leaves CALLBACK uncalled.
+Return the request's id, or nil when the kernel is not running."
+  (unless (memq agent '(codex claude))
+    (error "There is no agent %S to read sessions of" agent))
+  (let ((rows nil)
+        (finished nil))
     (cl-labels
-        ((active ()
-           (or (null runtime)
-               (and (not (lispm-kernel-runtime-closed runtime))
-                    (= generation (gethash owner (lispm-kernel-runtime-generations runtime) 0)))))
-         (finish (rows summary)
+        ((current-p ()
+           (or (not runtime)
+               (eql generation (gethash owner (lispm-kernel-runtime-generations runtime) 0))))
+         (finish (sessions summary)
            (unless finished
              (setq finished t)
-             (when (active) (funcall callback rows summary))))
+             (when (current-p)
+               (funcall callback sessions summary))))
          (fail (reason)
            (if fallback
                (run-at-time 0 nil
                             (lambda ()
-                              (when (active)
+                              (when (and (not finished) (current-p))
                                 (condition-case error
                                     (finish (funcall fallback) (list :source 'elisp :native-error reason))
                                   (error (finish nil (list :error error :native-error reason)))))))
              (finish nil (list :error reason))))
-         (chunk (text)
-           (unless limit-hit
-             (condition-case error
-                 (let* ((row (lispm-kernel-sessions--row text))
-                        (key (cons (plist-get row :agent) (plist-get row :id)))
-                        (old (gethash key sessions)))
-                   (if (and (not old) (>= (hash-table-count sessions) max-sessions))
-                       (progn (setq limit-hit 'session-limit)
-                              (lispm-kernel-cancel runtime request))
-                     (when (or (not old) (> (plist-get row :time) (plist-get old :time)))
-                       (puthash key row sessions))))
-               (error (setq limit-hit error)
-                      (lispm-kernel-cancel runtime request)))))
-         (success (text)
-           (let ((summary (condition-case error
-                              (json-parse-string text :object-type 'plist)
-                            (error (list :errors 1 :malformed error)))))
-             (if (or limit-hit (> (or (plist-get summary :errors) 0) 0))
-                 (fail (or limit-hit summary))
-               (finish (sort (hash-table-values sessions)
-                             (lambda (a b) (> (plist-get a :time) (plist-get b :time))))
-                       summary)))))
-      (if (or (null runtime) (lispm-kernel-runtime-closed runtime))
-          (progn (fail 'module-unavailable) nil)
-        (setq request
-              (lispm-kernel-submit runtime (if (eq agent 'codex) 'codex-scan 'claude-scan) root
-                                   :owner owner :generation generation :timeout timeout
-                                   :on-result
-                                   (lambda (event)
-                                     (unless finished
-                                       (pcase (aref event 4)
-                                         ('chunk (chunk (aref event 5)))
-                                         ('success (success (aref event 5)))
-                                         ('cancelled (if limit-hit (fail limit-hit) (finish nil '(:cancelled t))))
-                                         (kind (fail kind)))))))
-        request))))
+         (result (kind value)
+           (pcase kind
+             ('chunk
+              (dolist (row value)
+                (when-let* ((session (lispm-kernel-sessions--session agent row)))
+                  (push session rows))))
+             ('success
+              ;; Sorted as the desktop sorts, those of one time in the
+              ;; order the kernel sent them, which is the desktop's.
+              (finish (sort (nreverse rows) (lambda (a b) (> (plist-get a :time) (plist-get b :time))))
+                      value))
+             ('cancelled (finish nil '(:cancelled t)))
+             ('rejected (finish nil (list :rejected value)))
+             (_ (fail (list kind value))))))
+      (if (not (lispm-kernel-live-p runtime))
+          (progn (fail 'kernel-not-running) nil)
+        (condition-case error
+            (lispm-kernel-submit runtime 'scan-sessions
+                                 `(:agent ,agent :root ,(expand-file-name root)
+                                          ,@(and index (list :index (expand-file-name index))))
+                                 :owner owner :generation generation :timeout timeout
+                                 :on-result #'result)
+          ;; The kernel went away between asking whether it runs and asking it.
+          (error (fail (list 'kernel-not-running (error-message-string error)))
+                 nil))))))
 
 (provide 'lispm-kernel-sessions)
 ;;; lispm-kernel-sessions.el ends here

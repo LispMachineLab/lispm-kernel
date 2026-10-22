@@ -1,5 +1,4 @@
-/target/
-/dist/
-*.elc
-__pycache__/
+/build/
 /prebuilt/
+*.elc
+*.fasl
