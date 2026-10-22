@@ -142,6 +142,16 @@ Its standard error goes to the buffer \" *lispm-kernel*\"."
        (process-live-p (lispm-kernel-runtime-process runtime))
        t))
 
+(defun lispm-kernel-why-not-running (runtime)
+  "Return why RUNTIME's kernel does not run, a sentence, or nil while it does.
+A kernel whose exit Emacs has not heard of yet says so from its process."
+  (unless (lispm-kernel-live-p runtime)
+    (or (lispm-kernel-runtime-last-error runtime)
+        (lispm-kernel-runtime-exited runtime)
+        (and (lispm-kernel-runtime-closed runtime) "the kernel was stopped")
+        (let ((process (lispm-kernel-runtime-process runtime)))
+          (format "the kernel exited (%s %s)" (process-status process) (process-exit-status process))))))
+
 (defun lispm-kernel-pending-p (runtime)
   "Return non-nil while RUNTIME has requests waiting or messages to take in."
   (and (not (lispm-kernel-runtime-closed runtime))

@@ -294,6 +294,8 @@ under test, then turn the mode off."
         (lispm-kernel-test--wait runtime (lambda () (lispm-kernel-runtime-hello runtime)))
         (signal-process (lispm-kernel-runtime-process runtime) 'KILL)
         (lispm-kernel-test--wait runtime (lambda () (not (lispm-kernel-live-p runtime))))
+        (should (string-match-p "exited" (lispm-kernel-why-not-running runtime)))
+        (lispm-kernel-test--wait runtime (lambda () (lispm-kernel-runtime-exited runtime)))
         ;; Soon after it started: not again; the desktop's reader answers.
         (should (equal (lispm-kernel-desktop-test--read 'claude) reference))
         (should (eq runtime lispm-kernel-desktop--runtime))

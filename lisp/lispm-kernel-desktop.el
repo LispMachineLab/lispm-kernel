@@ -129,11 +129,11 @@ unless it ran shorter than `lispm-kernel-desktop-restart-seconds'; else nil."
                  (lispm-kernel-runtime-started runtime))
               lispm-kernel-desktop-restart-seconds)
            (setq lispm-kernel-desktop-last-error
-                 (or (lispm-kernel-runtime-last-error runtime) (lispm-kernel-runtime-exited runtime)))
+                 (lispm-kernel-why-not-running runtime))
            nil)
           (t
            (setq lispm-kernel-desktop-last-error
-                 (or (lispm-kernel-runtime-last-error runtime) (lispm-kernel-runtime-exited runtime)))
+                 (lispm-kernel-why-not-running runtime))
            (lispm-kernel-broker-stop)
            (lispm-kernel-stop runtime)
            (condition-case error
