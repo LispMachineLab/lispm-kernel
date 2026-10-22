@@ -37,10 +37,13 @@
 ;; one lispm-kernel-program.el downloads and checks, or builds when asked
 ;; to: until it is there the mode is on and the desktop's own readers
 ;; answer, and when it cannot be, the mode turns off, saying why.  A
-;; kernel that exits is started again when a reader is next asked, unless
-;; it ran shorter than `lispm-kernel-desktop-restart-seconds', and then
-;; not until the mode is turned on anew; the desktop's own readers answer
-;; meanwhile.
+;; kernel that exits is started again when a reader is next asked; one
+;; that ran shorter than `lispm-kernel-desktop-restart-seconds' only after
+;; a while, longer each time it does so again, see
+;; `lispm-kernel-desktop-restart-limit', and the desktop's own readers
+;; answer meanwhile.  `lispm-kernel-desktop-restart' starts it again at
+;; once, and `lispm-kernel-desktop-status' says how it stands, for a
+;; control panel.
 
 ;;; Code:
 
@@ -73,8 +76,15 @@ downloaded or built."
   :type 'number :group 'lispm-kernel)
 
 (defcustom lispm-kernel-desktop-restart-seconds 10
-  "A kernel that ran shorter than this before it exited is not started
-again, until the mode is turned on anew."
+  "A kernel that ran shorter than this before it exited is started again
+only after a while: this many seconds after it exited, twice as many if
+the next does so too, and so on up to `lispm-kernel-desktop-restart-limit'.
+One that ran longer is started again when a reader next asks."
+  :type 'number :group 'lispm-kernel)
+
+(defcustom lispm-kernel-desktop-restart-limit 600
+  "The most seconds a kernel that keeps exiting soon after it started
+waits to be started again, see `lispm-kernel-desktop-restart-seconds'."
   :type 'number :group 'lispm-kernel)
 
 (defconst lispm-kernel-desktop--agents
@@ -95,6 +105,14 @@ is when, nil when they must be read anew.")
 
 (defvar lispm-kernel-desktop-last-error nil
   "Why the kernel could not read sessions last, or nil.")
+
+(defvar lispm-kernel-desktop--early-exits 0
+  "How many kernels in a row exited sooner than
+`lispm-kernel-desktop-restart-seconds' after they started.")
+
+(defvar lispm-kernel-desktop--restart-at nil
+  "When the kernel that exited is started again, a `float-time', or nil
+while it runs or its exit was not seen yet.")
 
 (defvar lispm-kernel-desktop-mode nil)
 
@@ -119,34 +137,102 @@ lispm-kernel-program.el has."
   (setq lispm-kernel-desktop--runtime (lispm-kernel-start program))
   (lispm-kernel-broker-start lispm-kernel-desktop--runtime))
 
+(defun lispm-kernel-desktop--restart-delay ()
+  "Return how many seconds after its exit a kernel that exited soon after
+it started waits to be started again, as many such exits in a row as
+`lispm-kernel-desktop--early-exits' counts."
+  (min lispm-kernel-desktop-restart-limit
+       (* lispm-kernel-desktop-restart-seconds
+          (expt 2 (min 30 (max 0 (1- lispm-kernel-desktop--early-exits)))))))
+
+(defun lispm-kernel-desktop--start-again ()
+  "Stop the desktop's kernel, if it runs, and start it again, everything
+read anew; return it, or nil when it could not be started, saying why in
+`lispm-kernel-desktop-last-error' and trying again after a while."
+  (when lispm-kernel-desktop--runtime
+    (lispm-kernel-broker-stop)
+    (lispm-kernel-stop lispm-kernel-desktop--runtime))
+  (condition-case error
+      (progn
+        ;; What the old one read is gone with it: read everything anew.
+        (maphash (lambda (_ entry)
+                   (lispm-kernel-desktop--forget-timer entry))
+                 lispm-kernel-desktop--cache)
+        (clrhash lispm-kernel-desktop--cache)
+        (lispm-kernel-desktop--start-runtime
+         (or (lispm-kernel-desktop--program) (error "No lispm-kernel program is there")))
+        (setq lispm-kernel-desktop--restart-at nil)
+        lispm-kernel-desktop--runtime)
+    (error (setq lispm-kernel-desktop-last-error error
+                 lispm-kernel-desktop--restart-at (+ (float-time) lispm-kernel-desktop-restart-seconds))
+           nil)))
+
 (defun lispm-kernel-desktop--runtime ()
-  "Return the desktop's kernel when it runs, starting it again once it exited,
-unless it ran shorter than `lispm-kernel-desktop-restart-seconds'; else nil."
+  "Return the desktop's kernel when it runs, starting it again once it
+exited; else nil.  A kernel that ran shorter than
+`lispm-kernel-desktop-restart-seconds' is started again only after a
+while, see `lispm-kernel-desktop--restart-delay'."
   (let ((runtime lispm-kernel-desktop--runtime))
     (cond ((null runtime) nil)
           ((lispm-kernel-live-p runtime) runtime)
-          ((< (- (or (lispm-kernel-runtime-exited-at runtime) (float-time))
-                 (lispm-kernel-runtime-started runtime))
-              lispm-kernel-desktop-restart-seconds)
-           (setq lispm-kernel-desktop-last-error
-                 (lispm-kernel-why-not-running runtime))
-           nil)
           (t
-           (setq lispm-kernel-desktop-last-error
-                 (lispm-kernel-why-not-running runtime))
-           (lispm-kernel-broker-stop)
-           (lispm-kernel-stop runtime)
-           (condition-case error
-               (progn
-                 ;; What the old one read is gone with it: read everything anew.
-                 (maphash (lambda (_ entry)
-                            (lispm-kernel-desktop--forget-timer entry))
-                          lispm-kernel-desktop--cache)
-                 (clrhash lispm-kernel-desktop--cache)
-                 (lispm-kernel-desktop--start-runtime (lispm-kernel-desktop--program))
-                 lispm-kernel-desktop--runtime)
-             (error (setq lispm-kernel-desktop-last-error error)
-                    nil))))))
+           (unless lispm-kernel-desktop--restart-at
+             ;; Its exit, seen for the first time.
+             (let* ((exited (or (lispm-kernel-runtime-exited-at runtime) (float-time)))
+                    (early (< (- exited (lispm-kernel-runtime-started runtime))
+                              lispm-kernel-desktop-restart-seconds)))
+               (setq lispm-kernel-desktop-last-error (lispm-kernel-why-not-running runtime)
+                     lispm-kernel-desktop--early-exits (if early (1+ lispm-kernel-desktop--early-exits) 0)
+                     lispm-kernel-desktop--restart-at
+                     (if early (+ exited (lispm-kernel-desktop--restart-delay)) exited))))
+           (when (>= (float-time) lispm-kernel-desktop--restart-at)
+             (lispm-kernel-desktop--start-again))))))
+
+(defun lispm-kernel-desktop-restart ()
+  "Start the desktop's kernel again at once, its program as it is now.
+A kernel that keeps exiting is tried again; while the program is being
+downloaded or built, it starts once that is done."
+  (interactive)
+  (unless lispm-kernel-desktop-mode
+    (user-error "lispm-kernel-desktop-mode is off"))
+  (setq lispm-kernel-desktop--early-exits 0)
+  (cond (lispm-kernel-desktop--runtime
+         (unless (lispm-kernel-desktop--start-again)
+           (user-error "lispm-kernel could not be started: %s"
+                       (lispm-kernel-desktop--why lispm-kernel-desktop-last-error))))
+        ((lispm-kernel-program--busy-p)
+         (message "lispm-kernel starts once its program is there"))
+        (t (lispm-kernel-desktop--enable))))
+
+(defun lispm-kernel-desktop--why (error)
+  "Return ERROR, a sentence, an error or a summary, as a sentence."
+  (cond ((stringp error) error)
+        ((and (consp error) (symbolp (car error)) (get (car error) 'error-conditions))
+         (error-message-string error))
+        (t (format "%s" error))))
+
+(defun lispm-kernel-desktop-status ()
+  "Return how the desktop's kernel stands, for a control panel to say:
+  (off)                       the mode is off
+  (getting FRACTION)          its program is downloaded, FRACTION of it
+                              there, or nil while that is not known, or
+                              built
+  (running PROCESS SINCE)     it runs as PROCESS since SINCE, a `float-time'
+  (exited WHY AT)             it exited, WHY says why, and starts again
+                              at AT, a `float-time', when a reader asks"
+  (let ((runtime lispm-kernel-desktop--runtime))
+    (cond ((not lispm-kernel-desktop-mode) '(off))
+          ((and runtime (lispm-kernel-live-p runtime))
+           (list 'running (lispm-kernel-runtime-process runtime) (lispm-kernel-runtime-started runtime)))
+          (runtime
+           ;; Seen as a reader would see it.
+           (unless lispm-kernel-desktop--restart-at
+             (lispm-kernel-desktop--runtime))
+           (if (and lispm-kernel-desktop--runtime (lispm-kernel-live-p lispm-kernel-desktop--runtime))
+               (lispm-kernel-desktop-status)
+             (list 'exited (lispm-kernel-desktop--why lispm-kernel-desktop-last-error)
+                   (or lispm-kernel-desktop--restart-at (float-time)))))
+          (t (list 'getting (and (lispm-kernel-program--busy-p) lispm-kernel-program-progress))))))
 
 (defun lispm-kernel-desktop-runtime ()
   "Return the desktop's kernel while the mode runs it, else nil.
@@ -275,6 +361,8 @@ This is on `lispm-agents-reread-sessions-hook'."
 (defun lispm-kernel-desktop--start ()
   "Start the kernel and register the session readers."
   (unless lispm-kernel-desktop--runtime
+    (setq lispm-kernel-desktop--early-exits 0
+          lispm-kernel-desktop--restart-at nil)
     (lispm-kernel-desktop--start-runtime (lispm-kernel-desktop--program)))
   (dolist (spec lispm-kernel-desktop--agents)
     (let ((agent (car spec)))
@@ -327,7 +415,8 @@ program is built or downloaded; signal when impossible."
   (lispm-kernel-broker-stop)
   (when lispm-kernel-desktop--runtime
     (lispm-kernel-stop lispm-kernel-desktop--runtime))
-  (setq lispm-kernel-desktop--runtime nil)
+  (setq lispm-kernel-desktop--runtime nil
+        lispm-kernel-desktop--restart-at nil)
   (maphash (lambda (_ entry) (lispm-kernel-desktop--forget-timer entry))
            lispm-kernel-desktop--cache)
   (clrhash lispm-kernel-desktop--cache)

@@ -32,8 +32,10 @@ always. See [architecture](docs/architecture.md).
 
 ## Use
 
-In LispM Desktop, `lispm-desktop-kernel` turns both modes on. Elsewhere,
-load `lisp/` of a checkout after the desktop's Lisp:
+In LispM Desktop, `lispm-desktop-kernel` turns both modes on: Use LispM Kernel
+in Control Panels › Kernel, or `setopt`, takes effect at once, and the
+Installer gets what is missing. Elsewhere, load `lisp/` of a checkout after
+the desktop's Lisp:
 
 ```elisp
 (add-to-list 'load-path "/path/to/lispm-kernel/lisp")
@@ -49,7 +51,15 @@ background. It keeps it only when its SHA-256 is the one pinned in
 Those checksums come with the Lisp, from this repository's signed history,
 not from the release beside the programs. Until the program is there, and
 wherever it cannot be, the desktop reads sessions itself, and the mode says
-why. Setting `lispm-kernel-desktop-program` to a file runs that one as it is.
+why. `lispm-kernel-program-progress-functions` hear how far the download is,
+and `lispm-kernel-program-stop` stops it. Setting `lispm-kernel-desktop-program`
+to a file runs that one as it is.
+
+A kernel that exits is started again when the sidebar next reads sessions.
+One that exits within `lispm-kernel-desktop-restart-seconds` of its start is
+started again after that many seconds, twice as many each time it does so
+again, up to `lispm-kernel-desktop-restart-limit`; `M-x lispm-kernel-desktop-restart`
+starts it again at once. `lispm-kernel-desktop-status` says how it stands.
 
 To build it from the sources there are instead, which needs SBCL, run
 `(setopt lispm-kernel-program-source 'build)`.

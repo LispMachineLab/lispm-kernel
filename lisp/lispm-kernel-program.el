@@ -39,6 +39,9 @@
 ;; background: `lispm-kernel-program-obtain' answers at once,
 ;; `lispm-kernel-program-obtained-functions' hears when the program is
 ;; there, and `lispm-kernel-program-problem' says why it is not.
+;; `lispm-kernel-program-progress-functions' hear how far a download
+;; is, for an installer's window, and `lispm-kernel-program-stop' stops
+;; either.
 ;;
 ;;   download   prebuilt/VERSION/lispm-kernel-TARGET   the default
 ;;   build      build/lispm-kernel                     SBCL's
@@ -84,6 +87,14 @@ Each gets one argument, non-nil when the program is then there.")
 (defvar lispm-kernel-program-problem nil
   "Why the program could not be had, a sentence, or nil.")
 
+(defvar lispm-kernel-program-progress-functions nil
+  "Functions called as the program downloads, each with how much of it
+is there, a fraction from 0 to 1, as curl counts it.")
+
+(defvar lispm-kernel-program-progress nil
+  "How much of the program downloading is there, a fraction from 0 to 1,
+or nil while curl has not said, and when nothing downloads.")
+
 (defconst lispm-kernel-program-lisp-directory
   (file-name-directory (or load-file-name buffer-file-name))
   "Directory of the kernel's Emacs Lisp.")
@@ -101,6 +112,10 @@ Each gets one argument, non-nil when the program is then there.")
 
 (defvar lispm-kernel-program--downloading nil
   "The process downloading or unpacking the program, until its sentinel has run.")
+
+(defvar lispm-kernel-program--stopped nil
+  "Non-nil once `lispm-kernel-program-stop' stopped the build or download
+under way, until its sentinel has run.")
 
 ;;;; Sources and their version
 
@@ -305,6 +320,7 @@ is got when `lispm-kernel-program-source' is `build'."
       (with-current-buffer buffer (erase-buffer))
       (message "Building lispm-kernel's program…")
       (setq lispm-kernel-program-problem nil
+            lispm-kernel-program--stopped nil
             lispm-kernel-program--building
             (make-process
              :name "lispm-kernel build" :buffer buffer :noquery t
@@ -314,11 +330,15 @@ is got when `lispm-kernel-program-source' is `build'."
              (lambda (process _event)
                (unless (process-live-p process)
                  (setq lispm-kernel-program--building nil)
-                 (if (and (= (process-exit-status process) 0) (lispm-kernel-program--built-p))
-                     (lispm-kernel-program--finish "built")
-                   (setq lispm-kernel-program-problem "SBCL could not build it: see *lispm-kernel build*")
-                   (message "lispm-kernel's program could not be built: see %s" "*lispm-kernel build*")
-                   (lispm-kernel-program--finish nil)))))))))
+                 (cond ((lispm-kernel-program--stopped-p)
+                        (setq lispm-kernel-program-problem "building it was stopped")
+                        (lispm-kernel-program--finish nil))
+                       ((and (= (process-exit-status process) 0) (lispm-kernel-program--built-p))
+                        (lispm-kernel-program--finish "built"))
+                       (t
+                        (setq lispm-kernel-program-problem "SBCL could not build it: see *lispm-kernel build*")
+                        (message "lispm-kernel's program could not be built: see %s" "*lispm-kernel build*")
+                        (lispm-kernel-program--finish nil))))))))))
 
 ;;;; Downloading, checked
 
@@ -336,14 +356,67 @@ kept for other versions; return FILE."
         (delete-directory old t)))
     file))
 
-(defun lispm-kernel-program--run (name buffer command then)
+(defun lispm-kernel-program--run (name buffer command then &optional filter)
   "Run COMMAND as the process NAME, its output in BUFFER, in the background;
-call THEN with whether it exited with 0.  Return the process."
+call THEN with whether it exited with 0.  FILTER, when given, takes the
+output instead.  Return the process."
   (make-process
-   :name name :buffer buffer :noquery t :command command
+   :name name :buffer buffer :noquery t :command command :filter filter
    :sentinel (lambda (process _event)
                (unless (process-live-p process)
                  (funcall then (= (process-exit-status process) 0))))))
+
+(defun lispm-kernel-program--progress (fraction)
+  "Say that FRACTION of the program is there, a number from 0 to 1, or
+nil when nothing downloads."
+  (unless (equal fraction lispm-kernel-program-progress)
+    (setq lispm-kernel-program-progress fraction)
+    (when fraction
+      (run-hook-with-args 'lispm-kernel-program-progress-functions fraction))))
+
+(defconst lispm-kernel-program--bar-regexp
+  "\\`[-#=O ]*?\\([0-9]+\\(?:[.,][0-9]+\\)?\\)%\\'"
+  "What curl's progress bar says once it knows the size: hashes, then the
+percentage.")
+
+(defun lispm-kernel-program--curl-filter (buffer)
+  "Return the filter of a curl drawing its progress bar: the percentages go
+to `lispm-kernel-program--progress', the bar's other frames nowhere, and
+the rest, as curl's errors, into BUFFER."
+  (let ((partial ""))
+    (lambda (_process output)
+      (let* ((pieces (split-string (concat partial output) "[\r\n]"))
+             (last (car (last pieces))))
+        (setq partial last)
+        (dolist (piece (append (butlast pieces)
+                               ;; A frame of the bar is whole before the next \r.
+                               (and (string-match-p lispm-kernel-program--bar-regexp last) (list last))))
+          (let ((piece (string-trim piece)))
+            (cond ((string-match lispm-kernel-program--bar-regexp piece)
+                   (lispm-kernel-program--progress
+                    (min 1.0 (/ (string-to-number (string-replace "," "." (match-string 1 piece))) 100.0))))
+                  ((string-match-p "\\`[-#=O ]*\\'" piece))
+                  ((buffer-live-p buffer)
+                   (with-current-buffer buffer
+                     (goto-char (point-max))
+                     (insert piece "\n"))))))))))
+
+(defun lispm-kernel-program--stopped-p ()
+  "Return non-nil, once, when `lispm-kernel-program-stop' stopped the
+build or download whose sentinel asks."
+  (prog1 lispm-kernel-program--stopped
+    (setq lispm-kernel-program--stopped nil)))
+
+(defun lispm-kernel-program-stop ()
+  "Stop building or downloading the program; nothing of it is kept.
+Those waiting for it hear that it is not there, and
+`lispm-kernel-program-problem' says it was stopped."
+  (interactive)
+  (dolist (process (list lispm-kernel-program--building lispm-kernel-program--downloading))
+    (when (process-live-p process)
+      (setq lispm-kernel-program--stopped t)
+      ;; Its sentinel runs now, and ends it.
+      (delete-process process))))
 
 (defun lispm-kernel-program-download ()
   "Download the program built for this computer from the sources there
@@ -366,10 +439,13 @@ wrong, if anything, is in `lispm-kernel-program-problem' and the
              (buffer (get-buffer-create "*lispm-kernel download*")))
         (with-current-buffer buffer (erase-buffer))
         (message "Downloading lispm-kernel's program…")
-        (setq lispm-kernel-program-problem nil)
+        (setq lispm-kernel-program-problem nil
+              lispm-kernel-program--stopped nil
+              lispm-kernel-program-progress nil)
         (cl-labels
             ((done (problem)
-               (setq lispm-kernel-program--downloading nil)
+               (setq lispm-kernel-program--downloading nil
+                     lispm-kernel-program-progress nil)
                (delete-directory directory t)
                (when problem
                  (setq lispm-kernel-program-problem problem)
@@ -379,13 +455,17 @@ wrong, if anything, is in `lispm-kernel-program-problem' and the
                (lispm-kernel-program--finish (and (not problem) "downloaded")))
              (unpacked (ok)
                (condition-case error
-                   (if (not ok)
-                       (done "it could not be unpacked: see *lispm-kernel download*")
+                   (cond
+                    ((lispm-kernel-program--stopped-p) (done "downloading it was stopped"))
+                    ((not ok)
+                     (done "it could not be unpacked: see *lispm-kernel download*"))
+                    (t
                      (lispm-kernel-program--install (file-name-sans-extension compressed) file)
-                     (done nil))
+                     (done nil)))
                  (error (done (error-message-string error)))))
              (downloaded (ok)
-               (cond ((not ok)
+               (cond ((lispm-kernel-program--stopped-p) (done "downloading it was stopped"))
+                     ((not ok)
                       (done (format "it could not be downloaded from %s: %s" url
                                     (if (buffer-live-p buffer)
                                         (with-current-buffer buffer (string-trim (buffer-string)))
@@ -400,9 +480,9 @@ wrong, if anything, is in `lispm-kernel-program-problem' and the
                                                        #'unpacked))))))
           (setq lispm-kernel-program--downloading
                 (lispm-kernel-program--run "lispm-kernel download" buffer
-                                           (list "curl" "--fail" "--silent" "--show-error" "--location"
+                                           (list "curl" "--fail" "--progress-bar" "--show-error" "--location"
                                                  "--retry" "2" "--output" compressed url)
-                                           #'downloaded)))))))
+                                           #'downloaded (lispm-kernel-program--curl-filter buffer))))))))
 
 ;;;; Getting it
 

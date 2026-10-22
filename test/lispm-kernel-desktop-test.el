@@ -263,27 +263,79 @@ under test, then turn the mode off."
         (should (equal (lispm-kernel-desktop-test--read 'codex) '((:id "remote"))))
         (should called)))))
 
-(ert-deftest lispm-kernel-desktop-no-restart-for-a-kernel-that-dies-at-once ()
+(ert-deftest lispm-kernel-desktop-restarts-a-kernel-that-dies-at-once-after-a-while ()
+  "A kernel that exits soon after it started is started again only after a
+while, twice as long each time in a row, up to the limit; restarting it
+by hand tries it at once."
   (let ((program (make-temp-file "lispm-kernel-dies" nil nil "#!/bin/sh\nexit 3\n"))
         (starts 0))
     (set-file-modes program #o755)
     (unwind-protect
         (lispm-kernel-test--with-trees-and-desktop program
           (let ((start (symbol-function 'lispm-kernel-start))
-                (lispm-kernel-desktop-restart-seconds 0.5))
+                (lispm-kernel-desktop-restart-seconds 0.5)
+                (lispm-kernel-desktop-restart-limit 1.5)
+                (died (lambda ()
+                        (lispm-kernel-test--wait lispm-kernel-desktop--runtime
+                                                 (lambda () (lispm-kernel-runtime-exited lispm-kernel-desktop--runtime)))))
+                (read (lambda ()
+                        (should (equal (lispm-kernel-desktop-test--sorted (lispm-kernel-desktop-test--read 'claude))
+                                       (lispm-kernel-desktop-test--sorted (lispm-agents-claude-sessions)))))))
             (cl-letf (((symbol-function 'lispm-kernel-start)
                        (lambda (file) (cl-incf starts) (funcall start file))))
               (lispm-kernel-desktop-mode 1)
-              (lispm-kernel-test--wait lispm-kernel-desktop--runtime
-                                       (lambda () (not (lispm-kernel-live-p lispm-kernel-desktop--runtime))))
-              ;; Long after it started, it is still not started again: it ran
-              ;; shorter than the restart seconds.
-              (sleep-for 0.6)
-              (dotimes (_ 3)
-                (should (equal (lispm-kernel-desktop-test--sorted (lispm-kernel-desktop-test--read 'claude))
-                               (lispm-kernel-desktop-test--sorted (lispm-agents-claude-sessions)))))
-              (should (= starts 1)))))
+              (funcall died)
+              ;; The desktop's reader answers meanwhile, and it is not
+              ;; started again at once.
+              (funcall read)
+              (should (= starts 1))
+              (should (eq (car (lispm-kernel-desktop-status)) 'exited))
+              (should (string-match-p "exited" (cadr (lispm-kernel-desktop-status))))
+              (should (= lispm-kernel-desktop--early-exits 1))
+              ;; After the restart seconds it is.
+              (setq lispm-kernel-desktop--restart-at (- (float-time) 0.01))
+              (lispm-kernel-desktop-test--read 'claude)
+              (should (= starts 2))
+              (funcall died)
+              (funcall read)
+              ;; The second time in a row it waits twice as long, then no
+              ;; longer than the limit.
+              (should (= lispm-kernel-desktop--early-exits 2))
+              (should (= (lispm-kernel-desktop--restart-delay) 1.0))
+              (setq lispm-kernel-desktop--early-exits 5)
+              (should (= (lispm-kernel-desktop--restart-delay) 1.5))
+              (setq lispm-kernel-desktop--early-exits 2)
+              (should (= starts 2))
+              ;; Restarted by hand, it is tried at once.
+              (lispm-kernel-desktop-restart)
+              (should (= starts 3))
+              (should (= lispm-kernel-desktop--early-exits 0))
+              (funcall died)
+              (funcall read)
+              (should (= starts 3))
+              (should (= lispm-kernel-desktop--early-exits 1)))))
       (delete-file program))))
+
+(ert-deftest lispm-kernel-desktop-status-and-restart ()
+  "The status says the mode is off, the kernel runs, or it exited; the
+restart command starts a running kernel anew."
+  (lispm-kernel-desktop-test--with-trees
+    (lispm-kernel-desktop-test--with-desktop
+      (should (equal (lispm-kernel-desktop-status) '(off)))
+      (should-error (lispm-kernel-desktop-restart) :type 'user-error)
+      (lispm-kernel-desktop-mode 1)
+      (let ((runtime lispm-kernel-desktop--runtime))
+        (pcase (lispm-kernel-desktop-status)
+          (`(running ,process ,since)
+           (should (eq process (lispm-kernel-runtime-process runtime)))
+           (should (numberp since)))
+          (status (ert-fail (list "not running" status))))
+        (lispm-kernel-desktop-restart)
+        (should-not (eq runtime lispm-kernel-desktop--runtime))
+        (should-not (lispm-kernel-live-p runtime))
+        (should (lispm-kernel-live-p lispm-kernel-desktop--runtime))
+        (should (eq lispm-kernel-broker--runtime lispm-kernel-desktop--runtime))
+        (should (eq (car (lispm-kernel-desktop-status)) 'running))))))
 
 (ert-deftest lispm-kernel-desktop-kernel-exits ()
   (lispm-kernel-desktop-test--with-trees
@@ -301,8 +353,8 @@ under test, then turn the mode off."
         (should (eq runtime lispm-kernel-desktop--runtime))
         (should (string-match-p "exited" (format "%s" lispm-kernel-desktop-last-error)))
         ;; Later: started again.
-        (let ((lispm-kernel-desktop-restart-seconds 0))
-          (should (eq (lispm-kernel-desktop-test--read 'claude) 'pending)))
+        (setq lispm-kernel-desktop--restart-at (- (float-time) 0.01))
+        (should (eq (lispm-kernel-desktop-test--read 'claude) 'pending))
         (should-not (eq runtime lispm-kernel-desktop--runtime))
         (should (lispm-kernel-live-p lispm-kernel-desktop--runtime))
         (should (eq lispm-kernel-broker--runtime lispm-kernel-desktop--runtime))
