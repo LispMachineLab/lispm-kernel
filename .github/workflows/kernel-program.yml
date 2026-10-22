@@ -46,9 +46,12 @@ env:
   # signed list, sbcl-2.6.9-crhodes.asc, names.
   SBCL_VERSION: 2.6.9
   SBCL_SHA256: c6fd1d735570eb4ff34caf9609988ca77ed0bd12b55d09a4fed075be890da513
-  # SBCL's own binary for GNU/Linux on x86_64, which builds it there: Ubuntu
-  # 22.04's SBCL is too old to.  Its tar is the one the same list names.
-  SBCL_LINUX_HOST_SHA256: 39fac28407405841003e4c2abfbe0d96abd93b7701e8b61cdd35e713943b46d6
+  # SBCL's own binary for GNU/Linux on x86_64, which builds it there:
+  # Ubuntu 22.04's SBCL 2.1.11 is too old to, and SBCL 2.6.9's binary needs
+  # glibc 2.38, which 22.04 lacks; 2.5.0's needs 2.34.  Its tar is the one
+  # SBCL's signed list, sbcl-2.5.0-crhodes.asc, names.
+  SBCL_LINUX_HOST_VERSION: 2.5.0
+  SBCL_LINUX_HOST_SHA256: ac430fe7cf6b4a8d4dc8e0a2371265b6c6605dba06874a9c93521222292769a2
 
 jobs:
   version:
@@ -124,10 +127,10 @@ jobs:
           else
             host=$(mktemp -d)
             curl --fail --silent --show-error --location --retry 3 --output "$host/sbcl.tar.bz2" \
-              "https://downloads.sourceforge.net/project/sbcl/sbcl/$SBCL_VERSION/sbcl-$SBCL_VERSION-x86-64-linux-binary.tar.bz2"
+              "https://downloads.sourceforge.net/project/sbcl/sbcl/$SBCL_LINUX_HOST_VERSION/sbcl-$SBCL_LINUX_HOST_VERSION-x86-64-linux-binary.tar.bz2"
             echo "$SBCL_LINUX_HOST_SHA256  $host/sbcl.tar.bz2" | sha256sum -c -
             tar -xjf "$host/sbcl.tar.bz2" -C "$host"
-            (cd "$host/sbcl-$SBCL_VERSION-x86-64-linux" && INSTALL_ROOT="$host/install" sh install.sh)
+            (cd "$host/sbcl-$SBCL_LINUX_HOST_VERSION-x86-64-linux" && INSTALL_ROOT="$host/install" sh install.sh)
             export PATH="$host/install/bin:$PATH" SBCL_HOME="$host/install/lib/sbcl"
           fi
           sbcl --version
