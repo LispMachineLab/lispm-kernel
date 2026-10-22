@@ -35,4 +35,6 @@ fi
 tar -xjf "$work/sbcl.tar.bz2" -C "$work"
 cd "$work/sbcl-$version"
 sh make.sh --prefix="$prefix" --with-sb-thread --without-sb-core-compression
+# The SBCL that built it may have been told where its own home is.
+unset SBCL_HOME
 sh install.sh
