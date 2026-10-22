@@ -148,6 +148,11 @@ unless it ran shorter than `lispm-kernel-desktop-restart-seconds'; else nil."
              (error (setq lispm-kernel-desktop-last-error error)
                     nil))))))
 
+(defun lispm-kernel-desktop-runtime ()
+  "Return the desktop's kernel while the mode runs it, else nil.
+One that exited is started again, as the session readers have it."
+  (and lispm-kernel-desktop-mode (lispm-kernel-desktop--runtime)))
+
 ;;;; Reading
 
 (defun lispm-kernel-desktop--forget-timer (entry)

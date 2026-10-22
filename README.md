@@ -20,18 +20,26 @@ kernel that crashes takes none of Emacs with it.
 Its first job reads the Codex and Claude Code sessions for the desktop's
 agents sidebar. It reads them as the desktop's own readers do, to the
 nanosecond of each transcript's time, on several threads at once. It keeps
-what it read, so the next scan reads only transcripts that changed. See
-[architecture](docs/architecture.md).
+what it read, so the next scan reads only transcripts that changed.
+
+Its second job downloads for package.el. Even in the background, url.el
+negotiates TLS on Emacs's thread, and through a proxy it waits for each
+handshake, which freezes Emacs for most of a second at a time.
+`lispm-kernel-package-mode` hands package.el's background downloads, as an
+archive refresh makes them, to the kernel. The kernel fetches them with curl
+on a thread of its own, and package.el checks and keeps what it got as
+always. See [architecture](docs/architecture.md).
 
 ## Use
 
-In LispM Desktop, set `lispm-desktop-kernel` to t. Elsewhere, load `lisp/`
-of a checkout after the desktop's Lisp:
+In LispM Desktop, `lispm-desktop-kernel` turns both modes on. Elsewhere,
+load `lisp/` of a checkout after the desktop's Lisp:
 
 ```elisp
 (add-to-list 'load-path "/path/to/lispm-kernel/lisp")
 (require 'lispm-kernel-desktop)
 (lispm-kernel-desktop-mode 1)
+(lispm-kernel-package-mode 1)
 ```
 
 Nobody has to build the program or say where it is. `lisp/lispm-kernel-program.el`
