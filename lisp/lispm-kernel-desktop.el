@@ -25,7 +25,7 @@
 
 ;; Give LispM Desktop's agents sidebar the Codex and Claude sessions
 ;; without Emacs waiting for them.  `lispm-kernel-desktop-mode' registers
-;; session readers with the desktop (`lispm-desktop-agent-add-session-reader'):
+;; session readers with the desktop (`lispm-agents-add-session-reader'):
 ;; they answer with what the kernel read last, or `pending' before that,
 ;; and have it read again in the background once that is older than
 ;; `lispm-kernel-desktop-cache-seconds' or the sidebar reads sessions
@@ -47,13 +47,13 @@
 (require 'lispm-kernel-sessions)
 (require 'lispm-kernel-broker)
 (require 'lispm-kernel-program)
-(defvar lispm-desktop-agent-codex-sessions-directory)
-(defvar lispm-desktop-agent-codex-index-file)
-(defvar lispm-desktop-agent-claude-projects-directory)
-(defvar lispm-desktop-agent-reread-sessions-hook)
-(declare-function lispm-desktop-agent-add-session-reader "ext:lispm-desktop-ai" (agent reader))
-(declare-function lispm-desktop-agent-remove-session-reader "ext:lispm-desktop-ai" (agent))
-(declare-function lispm-desktop-agent-sessions-arrived "ext:lispm-desktop-ai" ())
+(defvar lispm-agents-codex-sessions-directory)
+(defvar lispm-agents-codex-index-file)
+(defvar lispm-agents-claude-projects-directory)
+(defvar lispm-agents-reread-sessions-hook)
+(declare-function lispm-agents-add-session-reader "ext:lispm-agents" (agent reader))
+(declare-function lispm-agents-remove-session-reader "ext:lispm-agents" (agent))
+(declare-function lispm-agents-sessions-arrived "ext:lispm-agents" ())
 
 (defcustom lispm-kernel-desktop-program nil
   "The kernel program to run, a file, or nil to have one got.
@@ -78,11 +78,11 @@ again, until the mode is turned on anew."
   :type 'number :group 'lispm-kernel)
 
 (defconst lispm-kernel-desktop--agents
-  '((codex :owner 1 :root lispm-desktop-agent-codex-sessions-directory
-           :index lispm-desktop-agent-codex-index-file
-           :read lispm-desktop-agent-codex-sessions)
-    (claude :owner 2 :root lispm-desktop-agent-claude-projects-directory
-            :read lispm-desktop-agent-claude-sessions))
+  '((codex :owner 1 :root lispm-agents-codex-sessions-directory
+           :index lispm-agents-codex-index-file
+           :read lispm-agents-codex-sessions)
+    (claude :owner 2 :root lispm-agents-claude-projects-directory
+            :read lispm-agents-claude-sessions))
   "The agents read by the kernel: their owner, the variables naming their
 root and index, and their own reader.")
 
@@ -197,7 +197,7 @@ Return the entry, or nil when its generation has moved on."
           (lispm-kernel-desktop--update
            agent generation :request nil :time (float-time) :known t
            :sessions (if (plist-get summary :error) (plist-get entry :sessions) sessions))
-          (lispm-desktop-agent-sessions-arrived)))))))
+          (lispm-agents-sessions-arrived)))))))
 
 (defun lispm-kernel-desktop--scan (runtime agent)
   "Have RUNTIME's kernel read AGENT's sessions in the background."
@@ -251,7 +251,7 @@ missing root, or no kernel running, is read the desktop's own way."
 
 (defun lispm-kernel-desktop-invalidate ()
   "Read the sessions anew: supersede readings under way, keep showing the old.
-This is on `lispm-desktop-agent-reread-sessions-hook'."
+This is on `lispm-agents-reread-sessions-hook'."
   (when-let* ((runtime lispm-kernel-desktop--runtime))
     (dolist (spec lispm-kernel-desktop--agents)
       (let* ((agent (car spec))
@@ -273,9 +273,9 @@ This is on `lispm-desktop-agent-reread-sessions-hook'."
     (lispm-kernel-desktop--start-runtime (lispm-kernel-desktop--program)))
   (dolist (spec lispm-kernel-desktop--agents)
     (let ((agent (car spec)))
-      (lispm-desktop-agent-add-session-reader
+      (lispm-agents-add-session-reader
        agent (lambda () (lispm-kernel-desktop--read agent)))))
-  (add-hook 'lispm-desktop-agent-reread-sessions-hook #'lispm-kernel-desktop-invalidate))
+  (add-hook 'lispm-agents-reread-sessions-hook #'lispm-kernel-desktop-invalidate))
 
 (defun lispm-kernel-desktop--unavailable ()
   "Signal that no program can be had, saying why."
@@ -298,10 +298,10 @@ for the program."
 (defun lispm-kernel-desktop--enable ()
   "Start the kernel and register the session readers, now, or once the
 program is built or downloaded; signal when impossible."
-  (require 'lispm-desktop-ai)
-  (require 'lispm-desktop-agent-codex)
-  (require 'lispm-desktop-agent-claude)
-  (unless (and (fboundp 'lispm-desktop-agent-add-session-reader)
+  (require 'lispm-agents)
+  (require 'lispm-agents-codex)
+  (require 'lispm-agents-claude)
+  (unless (and (fboundp 'lispm-agents-add-session-reader)
                (lispm-kernel-broker-available-p))
     (user-error "This LispM Desktop has no session readers or frame clock; update it"))
   (if (or lispm-kernel-desktop--runtime lispm-kernel-desktop-program)
@@ -315,10 +315,10 @@ program is built or downloaded; signal when impossible."
 (defun lispm-kernel-desktop--disable ()
   "Give the sessions back to the desktop's own readers and stop the kernel."
   (remove-hook 'lispm-kernel-program-obtained-functions #'lispm-kernel-desktop--obtained)
-  (when (fboundp 'lispm-desktop-agent-remove-session-reader)
+  (when (fboundp 'lispm-agents-remove-session-reader)
     (dolist (spec lispm-kernel-desktop--agents)
-      (lispm-desktop-agent-remove-session-reader (car spec))))
-  (remove-hook 'lispm-desktop-agent-reread-sessions-hook #'lispm-kernel-desktop-invalidate)
+      (lispm-agents-remove-session-reader (car spec))))
+  (remove-hook 'lispm-agents-reread-sessions-hook #'lispm-kernel-desktop-invalidate)
   (lispm-kernel-broker-stop)
   (when lispm-kernel-desktop--runtime
     (lispm-kernel-stop lispm-kernel-desktop--runtime))
@@ -326,8 +326,8 @@ program is built or downloaded; signal when impossible."
   (maphash (lambda (_ entry) (lispm-kernel-desktop--forget-timer entry))
            lispm-kernel-desktop--cache)
   (clrhash lispm-kernel-desktop--cache)
-  (when (fboundp 'lispm-desktop-agent-sessions-arrived)
-    (lispm-desktop-agent-sessions-arrived)))
+  (when (fboundp 'lispm-agents-sessions-arrived)
+    (lispm-agents-sessions-arrived)))
 
 (define-minor-mode lispm-kernel-desktop-mode
   "Read Codex and Claude sessions for the agents sidebar in the background.
