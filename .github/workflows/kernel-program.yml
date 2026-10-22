@@ -46,6 +46,9 @@ env:
   # signed list, sbcl-2.6.9-crhodes.asc, names.
   SBCL_VERSION: 2.6.9
   SBCL_SHA256: c6fd1d735570eb4ff34caf9609988ca77ed0bd12b55d09a4fed075be890da513
+  # SBCL's own binary for GNU/Linux on x86_64, which builds it there: Ubuntu
+  # 22.04's SBCL is too old to.  Its tar is the one the same list names.
+  SBCL_LINUX_HOST_SHA256: 39fac28407405841003e4c2abfbe0d96abd93b7701e8b61cdd35e713943b46d6
 
 jobs:
   version:
@@ -97,8 +100,10 @@ jobs:
           - os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
     env:
-      # The macOS LispM's installer and Emacs's builds support.
+      # The macOS LispM's installer and Emacs's builds support; SBCL's
+      # runtime on Intel takes it from SBCL_MACOSX_VERSION_MIN.
       MACOSX_DEPLOYMENT_TARGET: '11.0'
+      SBCL_MACOSX_VERSION_MIN: '11.0'
       ASSET: lispm-kernel-${{ matrix.target }}.gz
     steps:
       - uses: actions/checkout@v7
@@ -109,12 +114,23 @@ jobs:
         with:
           path: ~/sbcl
           key: sbcl-${{ env.SBCL_VERSION }}-${{ env.SBCL_SHA256 }}-${{ matrix.target }}-macos11
-      # Built from source by an SBCL of the system's, which the program
-      # does not use.
+      # Built from source by another SBCL, which the program does not use:
+      # Homebrew's on macOS, SBCL's own binary on GNU/Linux.
       - name: Build SBCL
         if: steps.sbcl.outputs.cache-hit != 'true'
         run: |
-          if [ "$RUNNER_OS" = macOS ]; then brew install sbcl; else sudo apt-get update && sudo apt-get install -y sbcl; fi
+          if [ "$RUNNER_OS" = macOS ]; then
+            brew install sbcl
+          else
+            host=$(mktemp -d)
+            curl --fail --silent --show-error --location --retry 3 --output "$host/sbcl.tar.bz2" \
+              "https://downloads.sourceforge.net/project/sbcl/sbcl/$SBCL_VERSION/sbcl-$SBCL_VERSION-x86-64-linux-binary.tar.bz2"
+            echo "$SBCL_LINUX_HOST_SHA256  $host/sbcl.tar.bz2" | sha256sum -c -
+            tar -xjf "$host/sbcl.tar.bz2" -C "$host"
+            (cd "$host/sbcl-$SBCL_VERSION-x86-64-linux" && INSTALL_ROOT="$host/install" sh install.sh)
+            export PATH="$host/install/bin:$PATH" SBCL_HOME="$host/install/lib/sbcl"
+          fi
+          sbcl --version
           sh scripts/build-sbcl.sh "$SBCL_VERSION" "$SBCL_SHA256" "$HOME/sbcl"
       - name: Test
         run: make test-lisp SBCL="$HOME/sbcl/bin/sbcl"
@@ -129,8 +145,14 @@ jobs:
         run: |
           if [ "$RUNNER_OS" = macOS ]; then
             otool -L build/lispm-kernel
-            ! otool -L build/lispm-kernel | tail -n +2 | grep -v -e '^\s*/usr/lib/' -e '^\s*/System/'
-            otool -l build/lispm-kernel | grep -A4 LC_BUILD_VERSION | grep -q "minos $MACOSX_DEPLOYMENT_TARGET\$"
+            ! otool -L build/lispm-kernel | tail -n +2 | grep -v -e '^[[:space:]]*/usr/lib/' -e '^[[:space:]]*/System/'
+            # The oldest macOS it runs on, as either load command has it.
+            minos=$(otool -l build/lispm-kernel | awk '/LC_BUILD_VERSION|LC_VERSION_MIN_MACOSX/ { found = 1 }
+              found && ($1 == "minos" || $1 == "version") { print $2; exit }')
+            echo "minos $minos"
+            awk -v have="$minos" -v want="$MACOSX_DEPLOYMENT_TARGET" 'BEGIN {
+              split(have, h, "."); split(want, w, ".")
+              exit !(h[1] < w[1] || (h[1] == w[1] && h[2] <= w[2])) }'
           else
             ldd build/lispm-kernel
           fi
