@@ -195,6 +195,30 @@
       (is (= 0 (getf (second (find :stats messages :key #'first)) :requests))))
     (is (eq :quit (lispm-kernel:handle-line kernel "(quit)")))))
 
+(deftest runtime-malformed-submissions-are-answered ()
+  (with-kernel (kernel collector)
+    (send kernel
+          "(submit 1 wait (:milliseconds 3000))"
+          "(submit 2 echo 1.5)"
+          "(submit 3 echo (a . b))"
+          "(submit 1 echo 'a)"
+          "(submit x echo 1)")
+    (let ((messages (await collector (lambda (messages)
+                                       (and (done-of 3 messages)
+                                            (= 4 (count :protocol-error messages :key #'first)))))))
+      (is (equal '(:done 2 :rejected :malformed) (done-of 2 messages)))
+      (is (equal '(:done 3 :rejected :malformed) (done-of 3 messages)))
+      (is (= 4 (count :protocol-error messages :key #'first)))
+      ;; Request 1 was accepted: a malformed line with its id leaves it be.
+      (is (eq nil (done-of 1 messages))))
+    (send kernel "(cancel 1)")
+    (let ((messages (answered collector 1)))
+      (is (equal '(:done 1 :cancelled nil) (done-of 1 messages)))
+      (is (= 1 (count 1 (remove :done messages :key #'first :test-not #'eq) :key #'second)))))
+  (is (eql 12 (lispm-kernel::submit-id "(submit 12 echo 1.5)")))
+  (is (eq nil (lispm-kernel::submit-id "(submit 12x echo)")))
+  (is (eq nil (lispm-kernel::submit-id "(cancel 12)"))))
+
 (deftest runtime-closed-kernel-rejects ()
   (let* ((collector (make-collector))
          (kernel (lispm-kernel:start-kernel (collector-sink collector))))

@@ -32,10 +32,11 @@
                (parse-json "\"a\\\"b\\\\c\\/\\n\\t\\b\\f\\r\"")))
   (is (string= (chars #xE9) (parse-json "\"\\u00e9\"")))
   (is (string= (chars #x1F600) (parse-json "\"\\ud83d\\ude00\"")))
-  ;; Surrogates alone are no characters.
-  (is (string= (chars #xFFFD #x41) (parse-json "\"\\ud83dA\"")))
-  (is (string= (chars #xFFFD #x41) (parse-json "\"\\ud83d\\u0041\"")))
-  (is (string= (chars #xFFFD) (parse-json "\"\\ude00\"")))
+  ;; Surrogates alone are no characters: Emacs refuses them.
+  (signals json-error (parse-json "\"\\ud83dA\""))
+  (signals json-error (parse-json "\"\\ud83d\\u0041\""))
+  (signals json-error (parse-json "\"\\ude00\""))
+  (signals json-error (parse-json "\"a\\ud83d\""))
   (is (string= (chars #xE9 #x1F600) (parse-json (concatenate 'string "\"" (chars #xE9 #x1F600) "\"")))))
 
 (deftest json-objects-and-arrays ()
@@ -54,13 +55,29 @@
                   "\"abc" "\"\\x\"" "\"\\u12g4\"" "[1] 2" "'a'" "NaN"))
     (signals json-error (parse-json text)))
   (signals json-error (parse-json (concatenate 'string "\"a" (string #\Newline) "b\"")))
-  (signals json-error (parse-json (make-string 600 :initial-element #\[)))
-  (is (= 299 (length (loop for value = (parse-json (concatenate 'string
-                                                                (make-string 300 :initial-element #\[)
-                                                                (make-string 300 :initial-element #\])))
-                                then (first value)
-                           while (consp value)
-                           collect value)))))
+  ;; Only ASCII digits are digits.
+  (signals json-error (parse-json (concatenate 'string "[" (chars #x661) "]")))
+  (signals json-error (parse-json (concatenate 'string "\"\\u" (chars #x661) "234\""))))
+
+(deftest json-numbers-as-emacs-has-them ()
+  ;; A double that rounds to infinity is refused; an integer of any size is one.
+  (dolist (text '("1e400" "-1e400" "1.7976931348623159e308" "1.797693134862316e308" "17976931348623159e292"))
+    (signals json-error (parse-json text)))
+  (dolist (text '("1e-400" "1.7976931348623157e308" "123456789012345678901234567890"
+                  "0.0e99999999999" "-0" "2.5E+3"))
+    (is (string= text (json-number-text (parse-json text))))))
+
+(defun nested (depth)
+  (concatenate 'string (make-string depth :initial-element #\[) (make-string depth :initial-element #\])))
+
+(deftest json-depth-as-emacs-has-it ()
+  ;; 10001 levels and no more, read on a thread of its own as a worker does.
+  (is (eq :read (sb-thread:join-thread
+                 (sb-thread:make-thread (lambda () (parse-json (nested 10001)) :read)))))
+  (signals json-error (parse-json (nested 10002)))
+  (is (= 3 (length (loop for value = (parse-json (nested 4)) then (first value)
+                         while (consp value)
+                         collect value)))))
 
 (deftest json-trailing-text ()
   (multiple-value-bind (value end) (parse-json "{\"customTitle\": \"x\"} trailing" :trailing t)

@@ -38,8 +38,9 @@
 ;; to: until it is there the mode is on and the desktop's own readers
 ;; answer, and when it cannot be, the mode turns off, saying why.  A
 ;; kernel that exits is started again when a reader is next asked, unless
-;; it exited within `lispm-kernel-desktop-restart-seconds' of starting;
-;; the desktop's own readers answer meanwhile.
+;; it ran shorter than `lispm-kernel-desktop-restart-seconds', and then
+;; not until the mode is turned on anew; the desktop's own readers answer
+;; meanwhile.
 
 ;;; Code:
 
@@ -72,7 +73,8 @@ downloaded or built."
   :type 'number :group 'lispm-kernel)
 
 (defcustom lispm-kernel-desktop-restart-seconds 10
-  "A kernel that exits sooner after starting is not started again."
+  "A kernel that ran shorter than this before it exited is not started
+again, until the mode is turned on anew."
   :type 'number :group 'lispm-kernel)
 
 (defconst lispm-kernel-desktop--agents
@@ -119,11 +121,12 @@ lispm-kernel-program.el has."
 
 (defun lispm-kernel-desktop--runtime ()
   "Return the desktop's kernel when it runs, starting it again once it exited,
-unless it did so soon after it started; else nil."
+unless it ran shorter than `lispm-kernel-desktop-restart-seconds'; else nil."
   (let ((runtime lispm-kernel-desktop--runtime))
     (cond ((null runtime) nil)
           ((lispm-kernel-live-p runtime) runtime)
-          ((< (- (float-time) (lispm-kernel-runtime-started runtime))
+          ((< (- (or (lispm-kernel-runtime-exited-at runtime) (float-time))
+                 (lispm-kernel-runtime-started runtime))
               lispm-kernel-desktop-restart-seconds)
            (setq lispm-kernel-desktop-last-error
                  (or (lispm-kernel-runtime-last-error runtime) (lispm-kernel-runtime-exited runtime)))

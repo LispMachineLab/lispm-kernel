@@ -201,6 +201,18 @@
         (is (string= "Renamed" (getf (row "s3" rows) :title)))
         (is (eql 7 (getf summary :cached)))))))
 
+(deftest sessions-lines-emacs-refuses ()
+  (lispm-kernel/sessions:clear-caches)
+  (with-directory (directory)
+    (let ((root (path directory "projects")))
+      ;; The later summary holds a lone surrogate: Emacs skips its line.
+      (write-file (path root "p/s.jsonl")
+                  "{\"type\":\"summary\",\"summary\":\"Good title\"}"
+                  (claude-user "prompt" :cwd "/c/s")
+                  "{\"type\":\"summary\",\"summary\":\"Bad \\ud83d title\"}"
+                  "{\"type\":\"summary\",\"summary\":\"Huge\",\"n\":1e400}")
+      (is (string= "Good title" (getf (row "s" (scan-rows :claude root)) :title))))))
+
 (deftest sessions-chunks ()
   (lispm-kernel/sessions:clear-caches)
   (with-directory (directory)

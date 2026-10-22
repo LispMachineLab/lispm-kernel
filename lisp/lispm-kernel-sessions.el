@@ -108,11 +108,15 @@ Return the request's id, or nil when the kernel is not running."
              (_ (fail (list kind value))))))
       (if (not (lispm-kernel-live-p runtime))
           (progn (fail 'kernel-not-running) nil)
-        (lispm-kernel-submit runtime 'scan-sessions
-                             `(:agent ,agent :root ,(expand-file-name root)
-                                      ,@(and index (list :index (expand-file-name index))))
-                             :owner owner :generation generation :timeout timeout
-                             :on-result #'result)))))
+        (condition-case error
+            (lispm-kernel-submit runtime 'scan-sessions
+                                 `(:agent ,agent :root ,(expand-file-name root)
+                                          ,@(and index (list :index (expand-file-name index))))
+                                 :owner owner :generation generation :timeout timeout
+                                 :on-result #'result)
+          ;; The kernel went away between asking whether it runs and asking it.
+          (error (fail (list 'kernel-not-running (error-message-string error)))
+                 nil))))))
 
 (provide 'lispm-kernel-sessions)
 ;;; lispm-kernel-sessions.el ends here

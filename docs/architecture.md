@@ -19,7 +19,9 @@ Emacs                                         kernel (SBCL)
 Every message is one datum on one line, in Emacs Lisp's syntax. Emacs
 reads the kernel's with its own `read`, and prints its own with `prin1`,
 newlines and control characters escaped. Only data cross: integers,
-strings, symbols, lists and vectors. The kernel's reader, `src/wire.lisp`,
+strings, symbols, lists and vectors; Emacs strips strings of their text
+properties and refuses what the kernel would not read, such as `1+`, a
+symbol it would take for a number. The kernel's reader, `src/wire.lisp`,
 is not Common Lisp's. It reads Emacs's string escapes, interns nothing
 but keywords, and evaluates nothing. A plain symbol from Emacs arrives as
 a keyword, `codex` as `:codex`. The kernel prints a keyword as `:name` and
@@ -34,7 +36,7 @@ symbols.
 | `(stats)` | `(stats PLIST)` |
 | `(ping DATA...)` | `(pong DATA...)` |
 | `(clear-caches)`, `(quit)` | nothing |
-| a malformed line | `(protocol-error TEXT)` |
+| a malformed line | `(protocol-error TEXT)`, and `(done ID rejected malformed)` when it was a `submit` |
 
 The kernel says `(hello :protocol 1 :pid … :lisp … :jobs …)` first. Emacs
 refuses a kernel of another protocol.
@@ -47,7 +49,8 @@ and its chunks come before it. STATUS is one of:
 - `success`, and the job's result;
 - `failed`, and why;
 - `cancelled`;
-- `rejected`, and why: `capacity`, `stale`, `unknown-job`, `duplicate` or `closed`.
+- `rejected`, and why: `capacity`, `stale`, `unknown-job`, `duplicate`,
+  `closed`, or `malformed` for a submission the kernel could not read.
 
 Admission is bounded: 256 requests at once, 64 of one owner. An owner's
 newer generation cancels its older requests, queued or running, and a
@@ -101,7 +104,12 @@ checks it against them.
   which wins.
 
 A transcript's head is its first 64 KiB, and its tail its last 16 KiB
-after that; a line cut at either end is left out. A file's stamp is its
+after that; a line cut at either end is left out. Lines are JSON as
+Emacs's `json-parse-string` takes it: a lone surrogate escape, a number
+that rounds to infinity or nesting deeper than 10001 leave the line out,
+as in Emacs. One difference remains: where a region is not valid UTF-8,
+the kernel reads U+FFFD for each invalid byte, while Emacs may decode the
+whole region another way. A file's stamp is its
 kind, size, inode, device, and modification and change times in
 nanoseconds, from the C library's `stat` (`src/files.lisp`), checked
 against sb-posix on first use. Each transcript read is kept with its
@@ -119,8 +127,9 @@ They have it read again once that is older than
 `lispm-kernel-desktop-cache-seconds`, or when the sidebar reads sessions
 anew. The session picker and every other caller keep the desktop's own
 readers. A remote or missing root is read the desktop's way. A kernel that
-exits is started again when a reader is next asked, unless it exited
-within `lispm-kernel-desktop-restart-seconds` of starting.
+exits is started again when a reader is next asked, unless it ran shorter
+than `lispm-kernel-desktop-restart-seconds`; then it is not started again
+until the mode is turned on anew.
 
 ## The program
 

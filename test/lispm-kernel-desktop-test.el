@@ -179,6 +179,14 @@ under test, then turn the mode off."
            ,@body)
        (delete-directory directory t))))
 
+(defmacro lispm-kernel-test--with-trees-and-desktop (program &rest body)
+  "Run BODY with the desktop's trees and registry, the kernel PROGRAM."
+  (declare (indent 1))
+  `(lispm-kernel-desktop-test--with-trees
+     (lispm-kernel-desktop-test--with-desktop
+       (let ((lispm-kernel-desktop-program ,program))
+         ,@body))))
+
 (ert-deftest lispm-kernel-desktop-reads-as-the-desktop-does ()
   (lispm-kernel-desktop-test--with-trees
     (lispm-kernel-desktop-test--with-desktop
@@ -254,6 +262,28 @@ under test, then turn the mode off."
                  (lambda () (setq called t) '((:id "remote")))))
         (should (equal (lispm-kernel-desktop-test--read 'codex) '((:id "remote"))))
         (should called)))))
+
+(ert-deftest lispm-kernel-desktop-no-restart-for-a-kernel-that-dies-at-once ()
+  (let ((program (make-temp-file "lispm-kernel-dies" nil nil "#!/bin/sh\nexit 3\n"))
+        (starts 0))
+    (set-file-modes program #o755)
+    (unwind-protect
+        (lispm-kernel-test--with-trees-and-desktop program
+          (let ((start (symbol-function 'lispm-kernel-start))
+                (lispm-kernel-desktop-restart-seconds 0.5))
+            (cl-letf (((symbol-function 'lispm-kernel-start)
+                       (lambda (file) (cl-incf starts) (funcall start file))))
+              (lispm-kernel-desktop-mode 1)
+              (lispm-kernel-test--wait lispm-kernel-desktop--runtime
+                                       (lambda () (not (lispm-kernel-live-p lispm-kernel-desktop--runtime))))
+              ;; Long after it started, it is still not started again: it ran
+              ;; shorter than the restart seconds.
+              (sleep-for 0.6)
+              (dotimes (_ 3)
+                (should (equal (lispm-kernel-desktop-test--sorted (lispm-kernel-desktop-test--read 'claude))
+                               (lispm-kernel-desktop-test--sorted (lispm-desktop-agent-claude-sessions)))))
+              (should (= starts 1)))))
+      (delete-file program))))
 
 (ert-deftest lispm-kernel-desktop-kernel-exits ()
   (lispm-kernel-desktop-test--with-trees

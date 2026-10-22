@@ -91,7 +91,7 @@ timer does.  It calls `lispm-kernel-dispatch' later, with
   ;; Pieces of the line being received, newest first.
   (partial nil)
   timer expiry-timer
-  (closed nil) (exited nil) (dispatching nil)
+  (closed nil) (exited nil) exited-at (dispatching nil)
   (overruns 0) last-error
   (requests (make-hash-table :test #'eql))
   (generations (make-hash-table :test #'eql))
@@ -179,19 +179,36 @@ Callbacks waiting hear nothing more."
 
 ;;;; Sending
 
+(defun lispm-kernel--wire-symbol-p (symbol)
+  "Return non-nil when SYMBOL's name reads back as that symbol in the
+kernel: ASCII letters, digits and _/*+<>=!?-, a keyword's after its
+colon, not starting with ? and no number: 1+ and e1 are none."
+  (let ((name (string-remove-prefix ":" (symbol-name symbol))))
+    (and (string-match-p "\\`[a-zA-Z0-9_/*+<>=!-][a-zA-Z0-9_/*+<>=!?-]*\\'" name)
+         (not (and (string-match-p "[0-9]" name)
+                   (string-match-p "\\`[-+.eE0-9]+\\'" name))))))
+
 (defun lispm-kernel--wire-p (datum &optional depth)
   "Return non-nil when DATUM can go to the kernel: integers, strings,
-plain symbols, lists and vectors of them, nested at most 64 deep."
+plain symbols, lists and vectors of them, nested at most 63 deep, so
+that the message holding it is at most 64 deep."
   (let ((depth (or depth 0)))
-    (and (<= depth 64)
+    (and (<= depth 63)
          (cond ((or (null datum) (eq datum t) (integerp datum) (stringp datum)) t)
-               ((symbolp datum)
-                (string-match-p "\\`:?[[:alnum:]_/*+<>=!?-]+\\'" (symbol-name datum)))
+               ((symbolp datum) (lispm-kernel--wire-symbol-p datum))
                ((consp datum)
                 (and (proper-list-p datum)
                      (cl-every (lambda (item) (lispm-kernel--wire-p item (1+ depth))) datum)))
                ((vectorp datum)
                 (cl-every (lambda (item) (lispm-kernel--wire-p item (1+ depth))) datum))))))
+
+(defun lispm-kernel--plain (datum)
+  "Return DATUM with its strings' text properties left out, which the
+kernel cannot read."
+  (cond ((stringp datum) (substring-no-properties datum))
+        ((proper-list-p datum) (mapcar #'lispm-kernel--plain datum))
+        ((and (vectorp datum) (not (stringp datum))) (vconcat (mapcar #'lispm-kernel--plain datum)))
+        (t datum)))
 
 (defun lispm-kernel--send (runtime form)
   "Send FORM to RUNTIME's kernel, on one line."
@@ -202,7 +219,8 @@ plain symbols, lists and vectors of them, nested at most 64 deep."
         (print-length nil)
         (print-level nil)
         (print-circle nil)
-        (print-quoted t)
+        ;; (quote x) as it is, not 'x, which the kernel does not read.
+        (print-quoted nil)
         (print-integers-as-characters nil))
     (process-send-string (lispm-kernel-runtime-process runtime)
                          (concat (prin1-to-string form) "\n"))))
@@ -221,6 +239,7 @@ or superseded later are cancelled, and their callbacks hear nothing
 more.  Of PRIORITY, -100 to 100, a higher one runs first."
   (unless (lispm-kernel-live-p runtime)
     (error "The kernel is not running"))
+  (setq input (lispm-kernel--plain input))
   (unless (and (symbolp job) (lispm-kernel--wire-p job) (lispm-kernel--wire-p input))
     (error "Only integers, strings, symbols, lists and vectors go to the kernel: %S" input))
   (unless (and (integerp owner) (integerp generation) (integerp priority) (<= -100 priority 100))
@@ -233,8 +252,12 @@ more.  Of PRIORITY, -100 to 100, a higher one runs first."
     (puthash id (lispm-kernel--pending :callback on-result :owner owner :generation generation
                                        :deadline (and timeout (+ (float-time) timeout)))
              (lispm-kernel-runtime-requests runtime))
-    (lispm-kernel--send runtime `(submit ,id ,job ,input :owner ,owner :generation ,generation
-                                         :priority ,priority))
+    (condition-case error
+        (lispm-kernel--send runtime `(submit ,id ,job ,input :owner ,owner :generation ,generation
+                                             :priority ,priority))
+      ;; The kernel went away meanwhile: the request was never made.
+      (error (remhash id (lispm-kernel-runtime-requests runtime))
+             (signal (car error) (cdr error))))
     (when timeout
       (lispm-kernel--arm-expiry runtime))
     id))
@@ -298,7 +321,8 @@ KIND; CALLBACK gets the rest of that message."
   "Note that RUNTIME's kernel PROCESS has exited."
   (unless (or (process-live-p process) (lispm-kernel-runtime-closed runtime))
     (setf (lispm-kernel-runtime-exited runtime)
-          (format "the kernel exited (%s %s)" (process-status process) (process-exit-status process)))
+          (format "the kernel exited (%s %s)" (process-status process) (process-exit-status process))
+          (lispm-kernel-runtime-exited-at runtime) (float-time))
     (lispm-kernel--schedule runtime)))
 
 (defun lispm-kernel--tick (runtime)
@@ -417,6 +441,8 @@ giving way to typing; schedule the rest.  It does not run inside itself."
     (setf (lispm-kernel-runtime-last-error runtime) (lispm-kernel-runtime-exited runtime)))
   (unless (lispm-kernel-runtime-exited runtime)
     (setf (lispm-kernel-runtime-exited runtime) (lispm-kernel-runtime-last-error runtime)))
+  (unless (lispm-kernel-runtime-exited-at runtime)
+    (setf (lispm-kernel-runtime-exited-at runtime) (float-time)))
   (let (ids)
     (maphash (lambda (id _) (push id ids)) (lispm-kernel-runtime-requests runtime))
     (dolist (id (sort ids #'<))

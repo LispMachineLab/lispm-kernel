@@ -23,9 +23,12 @@
 ;;;   JSON    {"a": 1}   [1, 2]   "x"   true   false   null   1.5
 ;;;   Lisp    object     (1 2)    "x"   T      NIL     NIL    number
 ;;;
-;;; An object keeps its members in order and `json-get' finds the first of
-;;; a name.  Numbers keep their text: what is read here never computes
-;;; with them, only asks whether they are there.
+;;; What Emacs refuses is refused here too, so that a line it skips is
+;;; skipped here: a surrogate escape that is not half of a pair, a number
+;;; that rounds to infinity as a double, nesting deeper than 10001.  An
+;;; object keeps its members in order and `json-get' finds the first of a
+;;; name.  Numbers keep their text: what is read here never computes with
+;;; them, only asks whether they are there.
 
 (in-package #:lispm-kernel/json)
 
@@ -51,16 +54,45 @@ OBJECT may be any value: what is no object has no members."
   (when (json-object-p object)
     (cdr (assoc name (json-object-pairs object) :test #'string=))))
 
-(defconstant +max-depth+ 512
-  "How deeply arrays and objects may nest before the text is refused.")
+(defparameter *max-depth* 10001
+  "How deeply arrays and objects may nest, as Emacs's parser allows.")
 
-(defconstant +replacement+ (code-char #xFFFD))
+(defconstant +double-overflow+
+  (+ (rational most-positive-double-float) (expt 2 970))
+  "The least magnitude that rounds to infinity as a double.")
+
+(declaim (inline ascii-digit-p hex-digit-value))
+
+(defun ascii-digit-p (character)
+  (char<= #\0 character #\9))
+
+(defun hex-digit-value (character)
+  (cond ((char<= #\0 character #\9) (- (char-code character) 48))
+        ((char<= #\a character #\f) (- (char-code character) 87))
+        ((char<= #\A character #\F) (- (char-code character) 55))))
+
+(defun overflows-double-p (text)
+  "Return true when the JSON number TEXT, a fraction or an exponent, rounds
+to infinity as a double."
+  (let* ((e (position-if (lambda (character) (char-equal character #\e)) text))
+         (mantissa (subseq text 0 (or e (length text))))
+         (exponent (if e (parse-integer text :start (1+ e)) 0))
+         (dot (position #\. mantissa))
+         (digits (remove #\. (string-left-trim "-" mantissa)))
+         (scale (- exponent (if dot (- (length mantissa) dot 1) 0)))
+         (significant (string-left-trim "0" digits)))
+    (cond ((string= significant "") nil)
+          ;; Its leading digit's place, roughly: far from the boundary either way.
+          ((> (+ scale (length significant)) 310) t)
+          ((< (+ scale (length significant)) 300) nil)
+          (t (>= (* (parse-integer significant) (expt 10 scale)) +double-overflow+)))))
 
 (defun parse-json (string &key (start 0) (end (length string)) trailing)
   "Return the JSON value in STRING between START and END.
 Whitespace may surround it; other text after it is an error unless
 TRAILING, when the position after the value is returned as a second
-value.  Signal `json-error' for anything that is not JSON."
+value.  Signal `json-error' for anything that is not JSON, or that Emacs
+refuses."
   (declare (type string string) (type fixnum start end))
   (let ((string (coerce string '(simple-array character (*))))
         (position start))
@@ -84,7 +116,6 @@ value.  Signal `json-error' for anything that is not JSON."
                  value))
              (value (depth)
                (declare (type fixnum depth))
-               (when (> depth +max-depth+) (fail "nested too deeply"))
                (skip-whitespace)
                (let ((character (peek)))
                  (case character
@@ -94,10 +125,12 @@ value.  Signal `json-error' for anything that is not JSON."
                    (#\t (literal "true" t))
                    (#\f (literal "false" nil))
                    (#\n (literal "null" nil))
-                   (t (if (or (char= character #\-) (digit-char-p character))
+                   (t (if (or (char= character #\-) (ascii-digit-p character))
                           (number)
                           (fail "no value starts here"))))))
              (array (depth)
+               (declare (type fixnum depth))
+               (when (> depth *max-depth*) (fail "nested too deeply"))
                (skip-whitespace)
                (if (char= (peek) #\])
                    (progn (incf position) '())
@@ -110,6 +143,8 @@ value.  Signal `json-error' for anything that is not JSON."
                          (#\] (incf position) (return (nreverse items)))
                          (t (fail "expected , or ]")))))))
              (object (depth)
+               (declare (type fixnum depth))
+               (when (> depth *max-depth*) (fail "nested too deeply"))
                (skip-whitespace)
                (if (char= (peek) #\})
                    (progn (incf position) (make-json-object '()))
@@ -154,18 +189,17 @@ value.  Signal `json-error' for anything that is not JSON."
                    (#\r #\Return) (#\t #\Tab)
                    (#\u (let ((code (hex4)))
                           (cond ((<= #xD800 code #xDBFF)
-                                 ;; A high surrogate pairs with a low one, or stands alone.
-                                 (if (and (< (+ position 1) end)
-                                          (char= (schar string position) #\\)
-                                          (char= (schar string (1+ position)) #\u))
-                                     (let ((mark position))
-                                       (incf position 2)
-                                       (let ((low (hex4)))
-                                         (if (<= #xDC00 low #xDFFF)
-                                             (code-char (+ #x10000 (ash (- code #xD800) 10) (- low #xDC00)))
-                                             (progn (setf position mark) +replacement+))))
-                                     +replacement+))
-                                ((<= #xDC00 code #xDFFF) +replacement+)
+                                 ;; A high surrogate is half of a pair, or refused.
+                                 (unless (and (< (+ position 1) end)
+                                              (char= (schar string position) #\\)
+                                              (char= (schar string (1+ position)) #\u))
+                                   (fail "invalid surrogate"))
+                                 (incf position 2)
+                                 (let ((low (hex4)))
+                                   (unless (<= #xDC00 low #xDFFF)
+                                     (fail "invalid surrogate"))
+                                   (code-char (+ #x10000 (ash (- code #xD800) 10) (- low #xDC00)))))
+                                ((<= #xDC00 code #xDFFF) (fail "invalid surrogate"))
                                 (t (code-char code)))))
                    (t (fail "unknown escape")))))
              (hex4 ()
@@ -173,31 +207,38 @@ value.  Signal `json-error' for anything that is not JSON."
                (let ((code 0))
                  (declare (type fixnum code))
                  (dotimes (i 4)
-                   (let ((digit (digit-char-p (schar string position) 16)))
+                   (let ((digit (hex-digit-value (schar string position))))
                      (unless digit (fail "bad \\u escape"))
                      (setf code (+ (* code 16) digit))
                      (incf position)))
                  code))
              (digits ()
                (let ((first position))
-                 (loop while (and (< position end) (digit-char-p (schar string position)))
+                 (loop while (and (< position end) (ascii-digit-p (schar string position)))
                        do (incf position))
                  (when (= first position) (fail "expected a digit"))))
              (number ()
-               (let ((first position))
+               (let ((first position)
+                     (integral t))
                  (when (char= (peek) #\-) (incf position))
                  (if (char= (peek) #\0)
                      (incf position)
                      (digits))
                  (when (and (< position end) (char= (schar string position) #\.))
+                   (setf integral nil)
                    (incf position)
                    (digits))
                  (when (and (< position end) (char-equal (schar string position) #\e))
+                   (setf integral nil)
                    (incf position)
                    (when (and (< position end) (find (schar string position) "+-"))
                      (incf position))
                    (digits))
-                 (make-json-number (subseq string first position)))))
+                 (let ((text (subseq string first position)))
+                   ;; An integer of any size is one; a double can overflow.
+                   (when (and (not integral) (overflows-double-p text))
+                     (fail "number out of range"))
+                   (make-json-number text)))))
       (let ((result (value 0)))
         (if trailing
             (values result position)

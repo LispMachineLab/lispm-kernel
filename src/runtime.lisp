@@ -23,7 +23,8 @@
 ;;;   kernel (chunk 7 DATA) ...  then exactly one  (done 7 STATUS VALUE)
 ;;;
 ;;; STATUS is success, failed (VALUE says why), cancelled, or rejected
-;;; (VALUE says why: capacity, stale, unknown-job, duplicate, closed).
+;;; (VALUE says why: capacity, stale, unknown-job, duplicate, closed, or
+;;; malformed for a submission the kernel could not read).
 ;;; Every request Emacs sends gets its one done, and its chunks come
 ;;; before it.
 ;;;
@@ -556,11 +557,27 @@ kernel to end.  Signal an error for a malformed one."
        (outbox-put (kernel-outbox kernel) (message-string (list* 'pong arguments))))
       (:quit :quit))))
 
+(defun submit-id (line)
+  "Return the request ID of LINE when it starts as (submit ID, else nil."
+  (let ((prefix "(submit "))
+    (when (and (> (length line) (length prefix))
+               (string= prefix line :end2 (length prefix)))
+      (let ((end (position-if-not #'digit-char-p line :start (length prefix))))
+        (when (and end (> end (length prefix))
+                   (member (char line end) '(#\Space #\Tab #\( #\" #\[)))
+          (parse-integer line :start (length prefix) :end end))))))
+
 (defun handle-line (kernel line)
   "Act on LINE, one message from Emacs; a malformed one is answered with
-(protocol-error TEXT).  Return :quit when Emacs asks the kernel to end."
+(protocol-error TEXT), and when it was a submission of a request not yet
+accepted, with that request's (done ID rejected malformed) as well.
+Return :quit when Emacs asks the kernel to end."
   (handler-case (handle-message kernel (read-message line))
     (error (condition)
       (outbox-put (kernel-outbox kernel)
                   (message-string (list 'protocol-error (condition-text condition))))
+      (let ((id (submit-id line)))
+        (when (and id (not (sb-thread:with-mutex ((kernel-lock kernel))
+                             (gethash id (kernel-requests kernel)))))
+          (reject kernel id 'malformed)))
       nil)))

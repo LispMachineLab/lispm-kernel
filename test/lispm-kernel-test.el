@@ -95,7 +95,18 @@ return the last."
                       [1 "two" [3]] '(nested (list "x")))))
       ;; Plain symbols come back as keywords: the kernel reads them so.
       (should (equal (lispm-kernel-test--collect runtime 'echo data)
-                     `((success ,(cl-subst :list 'list (cl-subst :nested 'nested data)))))))))
+                     `((success ,(cl-subst :list 'list (cl-subst :nested 'nested data)))))))
+    ;; Quoted forms go as they are, strings without their text properties.
+    (should (equal (lispm-kernel-test--collect runtime 'echo `(a 'b #'c ,(propertize "/tmp/x" 'face 'bold)))
+                   '((success (:a (:quote :b) (:function :c) "/tmp/x")))))
+    (should-not (text-properties-at 0 (nth 3 (cadr (car (lispm-kernel-test--collect
+                                                         runtime 'echo (list 1 2 3 (propertize "p" 'face 'bold))))))))))
+
+(defun lispm-kernel-test--nested (depth)
+  "Return a list holding a list, DEPTH deep."
+  (let ((datum 1))
+    (dotimes (_ depth) (setq datum (list datum)))
+    datum))
 
 (ert-deftest lispm-kernel-chunks-then-one-end ()
   (lispm-kernel-test--with-runtime runtime
@@ -113,7 +124,39 @@ return the last."
     (should-error (lispm-kernel-submit runtime 'echo '(1 . 2)))
     (should-error (lispm-kernel-submit runtime 'echo (make-hash-table)))
     (should-error (lispm-kernel-submit runtime 'echo nil :priority 1000))
-    (should (zerop (hash-table-count (lispm-kernel-runtime-requests runtime))))))
+    ;; Symbols the kernel would read as numbers, or escaped.
+    (dolist (symbol (list '1+ '1- 'e1 (intern "-2") (intern "?x") (intern "a.b") (intern "")))
+      (should-error (lispm-kernel-submit runtime 'echo (list symbol))))
+    ;; Deeper than the kernel's reader reads.
+    (should-error (lispm-kernel-submit runtime 'echo (lispm-kernel-test--nested 64)))
+    (should (zerop (hash-table-count (lispm-kernel-runtime-requests runtime))))
+    (should (equal (lispm-kernel-test--collect runtime 'echo (lispm-kernel-test--nested 63))
+                   `((success ,(lispm-kernel-test--nested 63)))))
+    (should (equal (lispm-kernel-test--collect runtime 'echo '(a1 x+ :k-2 -))
+                   '((success (:a1 :x+ :k-2 :-))))))
+  ;; What Emacs cannot stop: a malformed submission still ends.
+  (lispm-kernel-test--with-runtime runtime
+    (let (heard)
+      (cl-letf (((symbol-function 'lispm-kernel--wire-p) (lambda (&rest _) t)))
+        (lispm-kernel-submit runtime 'echo 1.5 :on-result (lambda (kind value) (push (list kind value) heard))))
+      (should (lispm-kernel-test--wait runtime (lambda () heard)))
+      (should (equal heard '((rejected malformed))))
+      (should (eq (car (lispm-kernel-runtime-last-error runtime)) 'protocol-error)))))
+
+(ert-deftest lispm-kernel-a-failed-send-makes-no-request ()
+  (lispm-kernel-test--with-runtime runtime
+    (let (result)
+      (cl-letf (((symbol-function 'process-send-string)
+                 (lambda (&rest _) (error "Process lispm-kernel not running"))))
+        (should-error (lispm-kernel-submit runtime 'echo 1))
+        (should (zerop (hash-table-count (lispm-kernel-runtime-requests runtime))))
+        ;; A scan falls back to the caller's own reader.
+        (should-not (lispm-kernel-scan-sessions runtime 'claude temporary-file-directory
+                                                (lambda (sessions summary) (setq result (list sessions summary)))
+                                                :fallback (lambda () '((:id "own"))))))
+      (with-timeout (5) (while (not result) (accept-process-output nil 0.01)))
+      (should (equal (car result) '((:id "own"))))
+      (should (eq (car (plist-get (cadr result) :native-error)) 'kernel-not-running)))))
 
 (ert-deftest lispm-kernel-cancel-and-timeout ()
   (lispm-kernel-test--with-runtime runtime
