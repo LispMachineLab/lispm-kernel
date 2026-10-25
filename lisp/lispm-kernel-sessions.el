@@ -27,11 +27,15 @@
 ;; Code sessions below a directory, as LispM Desktop's own readers do, see
 ;; src/sessions.lisp, and gives them back as those readers do:
 ;;
-;;   (:agent codex :id ID :cwd CWD :title TITLE :started FLOAT :file FILE :time FLOAT)
-;;   (:agent claude :id ID :cwd CWD :title TITLE :file FILE :time FLOAT)
+;;   (:agent codex :id ID :cwd CWD :title TITLE :started FLOAT :file FILE :time FLOAT
+;;    :turn-ended BOOLEAN)
+;;   (:agent claude :id ID :cwd CWD :title TITLE :file FILE :time FLOAT :turn-ended BOOLEAN)
 ;;
-;; newest first.  When the kernel cannot read them, the caller's own
-;; reader, its FALLBACK, does, later, on Emacs's thread.
+;; newest first.  :turn-ended says whether the session's latest turn had
+;; ended when its transcript was as :time says, as the agent's :ready
+;; reads it; a kernel older than this Lisp leaves it out.  When the
+;; kernel cannot read them, the caller's own reader, its FALLBACK, does,
+;; later, on Emacs's thread.
 
 ;;; Code:
 
@@ -47,13 +51,17 @@ not one."
         (file (plist-get row :file))
         (mtime (plist-get row :mtime)))
     (when (and (stringp id) (stringp cwd) (stringp title) (stringp file) (natnump mtime))
-      (let ((time (float-time (cons mtime 1000000000))))
+      (let ((time (float-time (cons mtime 1000000000)))
+            (turn (and (plist-member row :turn-ended)
+                       (list :turn-ended (and (plist-get row :turn-ended) t)))))
         (if (eq agent 'codex)
-            (list :agent 'codex :id id :cwd cwd :title title
-                  :started (when-let* ((stamp (plist-get row :started)))
-                             (ignore-errors (float-time (parse-iso8601-time-string stamp))))
-                  :file file :time time)
-          (list :agent 'claude :id id :cwd cwd :title title :file file :time time))))))
+            (append (list :agent 'codex :id id :cwd cwd :title title
+                          :started (when-let* ((stamp (plist-get row :started)))
+                                     (ignore-errors (float-time (parse-iso8601-time-string stamp))))
+                          :file file :time time)
+                    turn)
+          (append (list :agent 'claude :id id :cwd cwd :title title :file file :time time)
+                  turn))))))
 
 (cl-defun lispm-kernel-scan-sessions (runtime agent root callback
                                               &key (owner 0) (generation 0) index fallback
@@ -62,7 +70,8 @@ not one."
 AGENT is `codex' or `claude'; INDEX is Codex's session index, whose
 thread names title its sessions.  CALLBACK is called once, later, with
 SESSIONS, newest first, and SUMMARY, a plist: the kernel's counts
-\(:files :rows :empty :skipped :cached :truncated), or :cancelled t, or
+\(:files :rows :empty :skipped :cached :truncated), and :turn-ended t when
+the sessions say whether their latest turn ended, or :cancelled t, or
 :rejected and why, the caller retrying a scan rejected for `capacity'.
 When the kernel fails to read them, or is not running, FALLBACK, a
 function returning the sessions as the caller reads them itself, is

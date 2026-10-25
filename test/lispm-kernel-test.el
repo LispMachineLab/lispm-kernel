@@ -305,7 +305,8 @@ return the last."
                                          :file file
                                          ;; As `file-attributes' has it, to the nanosecond.
                                          :time (float-time (file-attribute-modification-time
-                                                            (file-attributes file))))))))))
+                                                            (file-attributes file)))
+                                         :turn-ended nil)))))))
       (delete-directory directory t))))
 
 (ert-deftest lispm-kernel-sessions-fall-back ()
