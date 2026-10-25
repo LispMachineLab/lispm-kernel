@@ -4,7 +4,7 @@
 
 ;; Author: Ryan.K
 ;; URL: https://github.com/LispMachineLab/lispm-kernel
-;; Version: 0.3.1
+;; Version: 0.4.0
 ;; Package-Requires: ((emacs "30.1"))
 ;; SPDX-License-Identifier: AGPL-3.0-or-later
 

@@ -8,7 +8,7 @@
 ;; `lispm-kernel-program-batch-pin' writes it once the kernel-program
 ;; workflow has published that release.
 
-(:version "e02f0caa6c2886d8"
- :programs (("aarch64-apple-darwin" . "8124cf02266ff44d4d2ece755fb5de04ad8664ca075fd12e40c779a709be6900")
-            ("x86_64-apple-darwin" . "83093b50ca120fa95666ae2228f9b1d017492ad585df9737d9422e5c51a30e87")
-            ("x86_64-unknown-linux-gnu" . "d3cc2a14c9c56bed141a09f5d25ad0506935106fedd1424c35871c678f4a769f")))
+(:version "414c7e2f517bf325"
+ :programs (("aarch64-apple-darwin" . "64094bd99c2cea21276e9c9795301edf9c4b1b51e25b02f9dfe324e968ced099")
+            ("x86_64-apple-darwin" . "992c6e1afeaeb67ec0ecdaa157571504023a47d42af51a5a6751fe92d14c55a1")
+            ("x86_64-unknown-linux-gnu" . "972f01f5db67725cf60d8bee8ff116a51470b034233f2f4a8dadb6cd856f48f7")))
