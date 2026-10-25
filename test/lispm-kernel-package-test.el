@@ -197,6 +197,49 @@ and keeps and reads them as it always does."
       (should (assq 'ack package-archive-contents))
       (should-not calls))))
 
+(defvar lispm-prebuilt-fetch-function)
+
+(ert-deftest lispm-kernel-package-fetches-for-lispm-prebuilt ()
+  "lispm-prebuilt's downloads are the kernel's while the mode is on: the
+file holds what was served, and a failure says why and leaves no file.
+What the kernel cannot fetch is left to lispm-prebuilt, and so is all of
+it once the mode is off."
+  (let ((had (boundp 'lispm-prebuilt-fetch-function))
+        (old (bound-and-true-p lispm-prebuilt-fetch-function))
+        (curled nil))
+    (unwind-protect
+        (progn
+          (setq lispm-prebuilt-fetch-function
+                (lambda (url _file callback &rest _) (push url curled) (funcall callback "curl")))
+          (lispm-kernel-package-test--with (runtime url calls directory '(("/module.gz" . "the module")))
+            (let ((file (expand-file-name "module.gz" directory))
+                  (missing (expand-file-name "missing.gz" directory))
+                  (heard 'pending))
+              (funcall lispm-prebuilt-fetch-function (concat url "module.gz") file
+                       (lambda (why) (setq heard why)) :timeout 30)
+              (should (lispm-kernel-test--wait runtime (lambda () (not (eq heard 'pending)))))
+              (should-not heard)
+              (should (equal (with-temp-buffer (insert-file-contents-literally file) (buffer-string))
+                             "the module"))
+              (setq heard 'pending)
+              (funcall lispm-prebuilt-fetch-function (concat url "missing.gz") missing
+                       (lambda (why) (setq heard why)))
+              (should (lispm-kernel-test--wait runtime (lambda () (not (eq heard 'pending)))))
+              (should (string-match-p "\\`Could not download .*missing\\.gz" heard))
+              (should-not (file-exists-p missing))
+              (should-not curled)
+              (should-not calls)
+              ;; Not http or https: lispm-prebuilt's own.
+              (funcall lispm-prebuilt-fetch-function "file:///nowhere" file #'ignore)
+              (should (equal curled '("file:///nowhere")))
+              (lispm-kernel-package-mode -1)
+              (funcall lispm-prebuilt-fetch-function (concat url "module.gz") file #'ignore)
+              (should (equal curled (list (concat url "module.gz") "file:///nowhere"))))))
+      (lispm-kernel-package-mode -1)
+      (if had
+          (setq lispm-prebuilt-fetch-function old)
+        (makunbound 'lispm-prebuilt-fetch-function)))))
+
 (ert-deftest lispm-kernel-package-mode-advises-only-while-on ()
   (let ((was-on lispm-kernel-package-mode))
     (unwind-protect

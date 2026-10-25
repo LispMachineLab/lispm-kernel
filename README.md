@@ -28,7 +28,9 @@ handshake, which freezes Emacs for most of a second at a time.
 `lispm-kernel-package-mode` hands package.el's background downloads, as an
 archive refresh makes them, to the kernel. The kernel fetches them with curl
 on a thread of its own, and package.el checks and keeps what it got as
-always.
+always. It fetches the native code LispM's packages download through
+[lispm-prebuilt](https://github.com/LispMachineLab/lispm-prebuilt) too, as
+lispm-gl's module.
 
 Its third job runs programs. Emacs that runs one forks itself, a large
 process, and one it waits for, as `call-process` and `process-lines` do,

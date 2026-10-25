@@ -154,6 +154,14 @@ url.el: downloads package.el waits for, files, URLs url.el would reach
 through SOCKS or a gateway of its own, and every download while no such
 kernel runs.
 
+The mode advises `lispm-prebuilt-fetch-function` too, through which
+[lispm-prebuilt](https://github.com/LispMachineLab/lispm-prebuilt)
+downloads the native code of LispM's packages in the background: a
+module, as lispm-gl's, or a program, as lispm-doom's engine. The kernel
+fetches it through the proxy url.el would use, and lispm-prebuilt checks
+it against the SHA-256 its package pins. What the kernel cannot fetch
+lispm-prebuilt downloads with curl itself.
+
 ## Programs
 
 `src/exec.lisp` runs a program Emacs names, a file it found in `exec-path`,
