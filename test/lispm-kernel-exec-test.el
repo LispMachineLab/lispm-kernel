@@ -122,6 +122,25 @@ holding FOO and BAR; return a function that does, given a callback."
           (should (string-match-p "did not finish" exit))
           (should (equal "began\n" output)))))))
 
+(ert-deftest lispm-kernel-exec-locally-program-gone-before-its-input-ends ()
+  ;; As diff may be, which reads no input: it calls back once, later.
+  (let ((heard nil)
+        (send-eof (symbol-function 'process-send-eof))
+        (default-directory temporary-file-directory))
+    (cl-letf (((symbol-function 'process-send-eof)
+               (lambda (&optional process)
+                 ;; Gone first: waiting so takes in no event.
+                 (let ((deadline (+ (float-time) 5)))
+                   (while (and (process-live-p process) (< (float-time) deadline))))
+                 (funcall send-eof process))))
+      (lispm-kernel-exec-locally "sh" '("-c" "printf done; exit 3") (lambda (&rest got) (push got heard))))
+    (should-not heard)
+    (let ((deadline (+ (float-time) 10)))
+      (while (and (not heard) (< (float-time) deadline))
+        (accept-process-output nil 0.005)))
+    (accept-process-output nil 0.1)
+    (should (equal '((3 "done" "")) heard))))
+
 (ert-deftest lispm-kernel-exec-turned-away-runs-in-emacs ()
   (lispm-kernel-exec-test--with (runtime local)
     (let ((default-directory temporary-file-directory))
