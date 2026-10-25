@@ -88,16 +88,20 @@ waiting hears `lost`.
 
 ## Sessions
 
-`src/sessions.lisp` reads the agents' sessions as LispM Desktop's own
-readers do: `lispm-desktop-agent-codex.el`, `lispm-desktop-agent-claude.el`
-and `lispm-desktop-ai.el` are its reference, and `test/lispm-kernel-desktop-test.el`
-checks it against them.
+`src/sessions.lisp` reads the agents' sessions as the editor's agents'
+own readers do, which lispm-agent holds since they left LispM Desktop:
+`lispm-agents-codex.el`, `lispm-agents-claude.el` and `lispm-agents.el`
+are its reference, and `test/lispm-kernel-desktop-test.el` checks it
+against them.
 
 - Codex: `rollout-*.jsonl`, any case, below the root; symbolic links to
   directories are not followed. A session is its head's first
-  `session_meta`, titled by the head's first prompt a person typed, or
-  by its thread name in Codex's session index, which wins. Untitled
-  sessions are left out.
+  `session_meta`, titled by the first prompt a person typed in its head,
+  else in its first MiB, else in its tail, or by its thread name in
+  Codex's session index, which wins. Untitled sessions are left out.
+  Codex may record tools and instructions over the whole head before
+  the first prompt, so the first MiB is read when the head holds none,
+  its last line cut left out.
 - Claude Code: `PROJECT/*.jsonl`. A session is named by its file and
   titled by the last custom title or summary of its head and tail, else
   by the head's first prompt, or by the `custom-title.json` beside it,
@@ -157,6 +161,26 @@ module, as lispm-gl's, or a program, as lispm-doom's engine. The kernel
 fetches it through the proxy url.el would use, and lispm-prebuilt checks
 it against the SHA-256 its package pins. What the kernel cannot fetch
 lispm-prebuilt downloads with curl itself.
+
+## Programs
+
+`src/exec.lisp` runs a program Emacs names, a file it found in `exec-path`,
+with its arguments, directory and whole environment, and the text for its
+standard input. What the program prints on its standard output comes as
+chunks as it comes, read as UTF-8, a character cut between two reads kept
+for the next; the result is its exit code, or the signal that ended it,
+with the last 64 KiB of its standard error. The job ends with the program,
+not with what the program left running holding its output, as Emacs
+ends a process. Cancelling the request, or a program running past its
+timeout, stops the program's process group, SIGTERM and then SIGKILL.
+
+`lisp/lispm-kernel-exec.el` gives Emacs `lispm-kernel-exec`, which calls back
+with the exit code and what was printed, and runs the program in Emacs, in
+the background, where no kernel knowing the job runs, or the program or
+directory is not on this computer. lispm-agent runs its programs through
+`lispm-exec`, whose `lispm-exec-function` `lispm-kernel-exec-mode` advises;
+LispM Desktop runs its own, as ps for the Buffer Manager and git for
+Software Update, through it too.
 
 ## The program
 

@@ -37,6 +37,7 @@ test-lisp:
 test-emacs: $(PROGRAM)
 	LISPM_KERNEL_PROGRAM=$(abspath $(PROGRAM)) $(EMACS_BATCH) \
 	  -l test/lispm-kernel-test.el -l test/lispm-kernel-program-test.el -l test/lispm-kernel-package-test.el \
+	  -l test/lispm-kernel-exec-test.el \
 	  $(if $(DESKTOP),-l test/lispm-kernel-desktop-test.el) \
 	  -f ert-run-tests-batch-and-exit
 	$(if $(DESKTOP),,@echo "No LispM Desktop at $(LISPM_DESKTOP_ROOT): its tests were skipped")

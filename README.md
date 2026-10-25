@@ -30,11 +30,19 @@ archive refresh makes them, to the kernel. The kernel fetches them with curl
 on a thread of its own, and package.el checks and keeps what it got as
 always. It fetches the native code LispM's packages download through
 [lispm-prebuilt](https://github.com/LispMachineLab/lispm-prebuilt) too, as
-lispm-gl's module. See [architecture](docs/architecture.md).
+lispm-gl's module.
+
+Its third job runs programs. Emacs that runs one forks itself, a large
+process, and one it waits for, as `call-process` and `process-lines` do,
+freezes it until the program exits. `lispm-kernel-exec` runs the program in
+the kernel and calls back with its exit code and what it printed, and
+`lispm-kernel-exec-mode` has the kernel run the programs LispM runs through
+`lispm-exec`. Without a kernel that knows the job, Emacs runs them itself,
+in the background. See [architecture](docs/architecture.md).
 
 ## Use
 
-In LispM Desktop, `lispm-desktop-kernel` turns both modes on: Use LispM Kernel
+In LispM Desktop, `lispm-desktop-kernel` turns the modes on: Use LispM Kernel
 in Control Panels › Kernel, or `setopt`, takes effect at once, and the
 Installer gets what is missing. Elsewhere, load `lisp/` of a checkout after
 the desktop's Lisp:
@@ -42,8 +50,11 @@ the desktop's Lisp:
 ```elisp
 (add-to-list 'load-path "/path/to/lispm-kernel/lisp")
 (require 'lispm-kernel-desktop)
+(require 'lispm-kernel-package)
+(require 'lispm-kernel-exec)
 (lispm-kernel-desktop-mode 1)
 (lispm-kernel-package-mode 1)
+(lispm-kernel-exec-mode 1)
 ```
 
 Nobody has to build the program or say where it is. `lisp/lispm-kernel-program.el`
