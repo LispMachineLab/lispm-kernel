@@ -247,7 +247,7 @@ A download is kept only once it was checked, so what is kept was."
 `lispm-kernel-program--current-file', else, when building, the one SBCL
 built, out of date.  Nothing is returned while it is being built or
 downloaded."
-  (unless (lispm-kernel-program--busy-p)
+  (unless (lispm-kernel-program-busy-p)
     (or (lispm-kernel-program--current-file)
         (and (lispm-kernel-program--building-p) (lispm-kernel-program--built-p)
              (lispm-kernel-program--built-file)))))
@@ -286,10 +286,12 @@ sources is there and one is pinned for this computer; else nil."
           ((not (executable-find "gzip")) "unpacking it needs gzip")
           (t "none is there"))))
 
-(defun lispm-kernel-program--busy-p ()
+(defun lispm-kernel-program-busy-p ()
   "Return non-nil while the program is being built or downloaded.
 That lasts until the process's sentinel has run, not only while it runs."
   (and (or lispm-kernel-program--building lispm-kernel-program--downloading) t))
+
+(define-obsolete-function-alias 'lispm-kernel-program--busy-p #'lispm-kernel-program-busy-p "0.4.0")
 
 (defun lispm-kernel-program--finish (what)
   "Say the program is there, it being WHAT, a word such as \"downloaded\",
@@ -493,7 +495,7 @@ built, in the background, see `lispm-kernel-program--plan', the functions
 of `lispm-kernel-program-obtained-functions' being called once that
 ends; nil when there is none and none can be had, and
 `lispm-kernel-program-problem' then says why."
-  (cond ((lispm-kernel-program--busy-p) 'pending)
+  (cond ((lispm-kernel-program-busy-p) 'pending)
         ((pcase (lispm-kernel-program--plan)
            ('build (lispm-kernel-program-build) t)
            ('download (lispm-kernel-program-download) t))
@@ -505,7 +507,7 @@ ends; nil when there is none and none can be had, and
 ;;;; In batch: an installer's or a workflow's
 
 (defun lispm-kernel-program--wait ()
-  (while (lispm-kernel-program--busy-p)
+  (while (lispm-kernel-program-busy-p)
     (accept-process-output nil 0.1)))
 
 (defun lispm-kernel-program--check (program)

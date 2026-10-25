@@ -1,4 +1,4 @@
-;;; lispm-kernel-desktop.el --- The desktop's sessions, read by the kernel -*- lexical-binding: t; -*-
+;;; lispm-kernel-desktop.el --- The agents' sessions, read by the kernel -*- lexical-binding: t; -*-
 
 ;; Copyright (C) 2026  Ryan.K
 
@@ -23,14 +23,15 @@
 
 ;;; Commentary:
 
-;; Give LispM Desktop's agents sidebar the Codex and Claude sessions
-;; without Emacs waiting for them.  `lispm-kernel-desktop-mode' registers
-;; session readers with the desktop (`lispm-agents-add-session-reader'):
-;; they answer with what the kernel read last, or `pending' before that,
-;; and have it read again in the background once that is older than
-;; `lispm-kernel-desktop-cache-seconds' or the sidebar reads sessions
-;; anew.  The kernel also tells whether each session's latest turn has
-;; ended (:turn-ended), and what it read answers:
+;; Give the editor's agents (lispm-agents, of lispm-agent) the Codex and
+;; Claude sessions without Emacs waiting for them.
+;; `lispm-kernel-sessions-mode' registers session readers with them
+;; (`lispm-agents-add-session-reader'): they answer with what the kernel
+;; read last, or `pending' before that, and have it read again in the
+;; background once that is older than `lispm-kernel-desktop-cache-seconds'
+;; or the agents' list reads sessions anew.  The kernel also tells whether
+;; each session's latest turn has ended (:turn-ended), and what it read
+;; answers:
 ;;
 ;; - looking a session up, as for a terminal waiting to be given a
 ;;   message (`lispm-agents-session-lookup-functions'), reading again
@@ -39,20 +40,22 @@
 ;;   however old, `lispm-agents-sessions-arrived' telling when a newer
 ;;   one comes, and the session picker's, at most that old, waiting
 ;;   `lispm-kernel-desktop-wait-seconds' at most for one, else read the
-;;   desktop's own way (`lispm-agents-read-sessions-function').
+;;   agents' own way (`lispm-agents-read-sessions-function').
 ;;
-;; The kernel's messages are taken in on the desktop's frame clock, see
-;; lispm-kernel-broker.el.  Nothing is advised but that function
-;; variable, which is there for it.
+;; The kernel's messages are taken in by timers, or by the host's
+;; `lispm-kernel-scheduler', as LispM Desktop's frame clock.  Nothing is
+;; advised but that function variable, which is there for it.  The
+;; library keeps its name, and its options theirs, from when LispM
+;; Desktop held the agents.
 ;;
 ;; The program is the one `lispm-kernel-desktop-program' names, else the
 ;; one lispm-kernel-program.el downloads and checks, or builds when asked
-;; to: until it is there the mode is on and the desktop's own readers
+;; to: until it is there the mode is on and the agents' own readers
 ;; answer, and when it cannot be, the mode turns off, saying why.  A
 ;; kernel that exits is started again when a reader is next asked; one
 ;; that ran shorter than `lispm-kernel-desktop-restart-seconds' only after
 ;; a while, longer each time it does so again, see
-;; `lispm-kernel-desktop-restart-limit', and the desktop's own readers
+;; `lispm-kernel-desktop-restart-limit', and the agents' own readers
 ;; answer meanwhile.  `lispm-kernel-desktop-restart' starts it again at
 ;; once, and `lispm-kernel-desktop-status' says how it stands, for a
 ;; control panel.
@@ -60,7 +63,6 @@
 ;;; Code:
 
 (require 'lispm-kernel-sessions)
-(require 'lispm-kernel-broker)
 (require 'lispm-kernel-program)
 (defvar lispm-agents-codex-sessions-directory)
 (defvar lispm-agents-codex-index-file)
@@ -86,11 +88,11 @@ downloaded or built."
 
 (defcustom lispm-kernel-desktop-wait-seconds 1
   "Seconds a list of every session, as the session picker's, waits for the
-kernel to read them anew, before the desktop's own reader reads them."
+kernel to read them anew, before the agents' own reader reads them."
   :type 'number :group 'lispm-kernel)
 
 (defcustom lispm-kernel-desktop-scan-timeout 60
-  "Seconds the kernel may take reading before the desktop's own reader is used."
+  "Seconds the kernel may take reading before the agents' own reader is used."
   :type 'number :group 'lispm-kernel)
 
 (defcustom lispm-kernel-desktop-restart-seconds 10
@@ -133,7 +135,9 @@ when the kernel read them, saying whether their latest turn ended.")
   "When the kernel that exited is started again, a `float-time', or nil
 while it runs or its exit was not seen yet.")
 
-(defvar lispm-kernel-desktop-mode nil)
+;; The mode's name of when LispM Desktop held the agents.
+(define-obsolete-variable-alias 'lispm-kernel-desktop-mode 'lispm-kernel-sessions-mode "0.4.0")
+(defvar lispm-kernel-sessions-mode nil)
 
 (defun lispm-kernel-desktop--spec (agent property)
   "Return PROPERTY of AGENT in `lispm-kernel-desktop--agents'."
@@ -152,9 +156,8 @@ lispm-kernel-program.el has."
   (or lispm-kernel-desktop-program (lispm-kernel-program-file)))
 
 (defun lispm-kernel-desktop--start-runtime (program)
-  "Run PROGRAM as the desktop's kernel, its messages on the frame clock."
-  (setq lispm-kernel-desktop--runtime (lispm-kernel-start program))
-  (lispm-kernel-broker-start lispm-kernel-desktop--runtime))
+  "Run PROGRAM as the agents' kernel."
+  (setq lispm-kernel-desktop--runtime (lispm-kernel-start program)))
 
 (defun lispm-kernel-desktop--restart-delay ()
   "Return how many seconds after its exit a kernel that exited soon after
@@ -165,11 +168,10 @@ it started waits to be started again, as many such exits in a row as
           (expt 2 (min 30 (max 0 (1- lispm-kernel-desktop--early-exits)))))))
 
 (defun lispm-kernel-desktop--start-again ()
-  "Stop the desktop's kernel, if it runs, and start it again, everything
+  "Stop the agents' kernel, if it runs, and start it again, everything
 read anew; return it, or nil when it could not be started, saying why in
 `lispm-kernel-desktop-last-error' and trying again after a while."
   (when lispm-kernel-desktop--runtime
-    (lispm-kernel-broker-stop)
     (lispm-kernel-stop lispm-kernel-desktop--runtime))
   (condition-case error
       (progn
@@ -187,7 +189,7 @@ read anew; return it, or nil when it could not be started, saying why in
            nil)))
 
 (defun lispm-kernel-desktop--runtime ()
-  "Return the desktop's kernel when it runs, starting it again once it
+  "Return the agents' kernel when it runs, starting it again once it
 exited; else nil.  A kernel that ran shorter than
 `lispm-kernel-desktop-restart-seconds' is started again only after a
 while, see `lispm-kernel-desktop--restart-delay'."
@@ -208,18 +210,18 @@ while, see `lispm-kernel-desktop--restart-delay'."
              (lispm-kernel-desktop--start-again))))))
 
 (defun lispm-kernel-desktop-restart ()
-  "Start the desktop's kernel again at once, its program as it is now.
+  "Start the agents' kernel again at once, its program as it is now.
 A kernel that keeps exiting is tried again; while the program is being
 downloaded or built, it starts once that is done."
   (interactive)
-  (unless lispm-kernel-desktop-mode
-    (user-error "lispm-kernel-desktop-mode is off"))
+  (unless lispm-kernel-sessions-mode
+    (user-error "lispm-kernel-sessions-mode is off"))
   (setq lispm-kernel-desktop--early-exits 0)
   (cond (lispm-kernel-desktop--runtime
          (unless (lispm-kernel-desktop--start-again)
            (user-error "lispm-kernel could not be started: %s"
                        (lispm-kernel-desktop--why lispm-kernel-desktop-last-error))))
-        ((lispm-kernel-program--busy-p)
+        ((lispm-kernel-program-busy-p)
          (message "lispm-kernel starts once its program is there"))
         (t (lispm-kernel-desktop--enable))))
 
@@ -231,7 +233,7 @@ downloaded or built, it starts once that is done."
         (t (format "%s" error))))
 
 (defun lispm-kernel-desktop-status ()
-  "Return how the desktop's kernel stands, for a control panel to say:
+  "Return how the agents' kernel stands, for a control panel to say:
   (off)                       the mode is off
   (getting FRACTION)          its program is downloaded, FRACTION of it
                               there, or nil while that is not known, or
@@ -240,7 +242,7 @@ downloaded or built, it starts once that is done."
   (exited WHY AT)             it exited, WHY says why, and starts again
                               at AT, a `float-time', when a reader asks"
   (let ((runtime lispm-kernel-desktop--runtime))
-    (cond ((not lispm-kernel-desktop-mode) '(off))
+    (cond ((not lispm-kernel-sessions-mode) '(off))
           ((and runtime (lispm-kernel-live-p runtime))
            (list 'running (lispm-kernel-runtime-process runtime) (lispm-kernel-runtime-started runtime)))
           (runtime
@@ -251,12 +253,13 @@ downloaded or built, it starts once that is done."
                (lispm-kernel-desktop-status)
              (list 'exited (lispm-kernel-desktop--why lispm-kernel-desktop-last-error)
                    (or lispm-kernel-desktop--restart-at (float-time)))))
-          (t (list 'getting (and (lispm-kernel-program--busy-p) lispm-kernel-program-progress))))))
+          (t (list 'getting (and (lispm-kernel-program-busy-p) lispm-kernel-program-progress))))))
 
 (defun lispm-kernel-desktop-runtime ()
-  "Return the desktop's kernel while the mode runs it, else nil.
-One that exited is started again, as the session readers have it."
-  (and lispm-kernel-desktop-mode (lispm-kernel-desktop--runtime)))
+  "Return the agents' kernel while `lispm-kernel-sessions-mode' runs it,
+else nil.  One that exited is started again, as the session readers have
+it."
+  (and lispm-kernel-sessions-mode (lispm-kernel-desktop--runtime)))
 
 ;;;; Reading
 
@@ -287,8 +290,8 @@ Return the entry, or nil when its generation has moved on."
       (puthash agent entry lispm-kernel-desktop--cache))))
 
 (defun lispm-kernel-desktop--arrived (agent generation sessions summary)
-  "Keep AGENT's SESSIONS of GENERATION as SUMMARY says; tell the desktop."
-  (when lispm-kernel-desktop-mode
+  "Keep AGENT's SESSIONS of GENERATION as SUMMARY says; tell the agents."
+  (when lispm-kernel-sessions-mode
     (let ((entry (gethash agent lispm-kernel-desktop--cache)))
       (when (and entry (eql generation (plist-get entry :generation)))
         (when (or (plist-get summary :error) (plist-get summary :native-error))
@@ -332,7 +335,7 @@ Return the entry, or nil when its generation has moved on."
 
 (defun lispm-kernel-desktop--retry (agent generation)
   "Have AGENT's sessions of GENERATION read again after the kernel was full."
-  (when (and lispm-kernel-desktop-mode
+  (when (and lispm-kernel-sessions-mode
              (lispm-kernel-desktop--update agent generation :request nil :retry-timer nil))
     (when-let* ((runtime (lispm-kernel-desktop--runtime)))
       (lispm-kernel-desktop--scan runtime agent))))
@@ -351,7 +354,7 @@ Return the entry, or nil when its generation has moved on."
 (defun lispm-kernel-desktop--read (agent)
   "Return AGENT's sessions as the kernel read them last, or `pending' before.
 A missing or stale reading starts another in the background.  A remote or
-missing root, or no kernel running, is read the desktop's own way."
+missing root, or no kernel running, is read the agents' own way."
   (let ((root (lispm-kernel-desktop--value agent :root))
         (runtime (lispm-kernel-desktop--runtime)))
     (if (or (null runtime) (not (stringp root)) (file-remote-p root) (not (file-directory-p root)))
@@ -439,7 +442,7 @@ last if fresh, see `lispm-kernel-desktop--read-now'.  This is around
 (defun lispm-kernel-desktop--lookup (agent id)
   "Return AGENT's session ID as the kernel read it last, or nil.
 A stale reading starts another; none is waited for, nor read the
-desktop's own way.  This is on `lispm-agents-session-lookup-functions'."
+agents' own way.  This is on `lispm-agents-session-lookup-functions'."
   (when (assq agent lispm-kernel-desktop--agents)
     (let ((entry (lispm-kernel-desktop--read-lately agent)))
       (when (consp entry)
@@ -482,7 +485,7 @@ This is on `lispm-agents-reread-sessions-hook'."
 (defun lispm-kernel-desktop--unavailable ()
   "Signal that no program can be had, saying why."
   (setq lispm-kernel-desktop-last-error (or lispm-kernel-program-problem 'program-unavailable))
-  (user-error "No lispm-kernel program, so the desktop reads sessions itself: %s"
+  (user-error "No lispm-kernel program, so the agents read sessions themselves: %s"
               (or lispm-kernel-program-problem "none is there")))
 
 (defun lispm-kernel-desktop--obtained (there)
@@ -490,11 +493,11 @@ This is on `lispm-agents-reread-sessions-hook'."
 This is on `lispm-kernel-program-obtained-functions' while the mode waits
 for the program."
   (remove-hook 'lispm-kernel-program-obtained-functions #'lispm-kernel-desktop--obtained)
-  (when (and lispm-kernel-desktop-mode (not lispm-kernel-desktop--runtime))
+  (when (and lispm-kernel-sessions-mode (not lispm-kernel-desktop--runtime))
     (condition-case error
         (if there (lispm-kernel-desktop--start) (lispm-kernel-desktop--unavailable))
       (error
-       (lispm-kernel-desktop-mode -1)
+       (lispm-kernel-sessions-mode -1)
        (message "%s" (error-message-string error))))))
 
 (defun lispm-kernel-desktop--enable ()
@@ -503,19 +506,18 @@ program is built or downloaded; signal when impossible."
   (require 'lispm-agents)
   (require 'lispm-agents-codex)
   (require 'lispm-agents-claude)
-  (unless (and (fboundp 'lispm-agents-add-session-reader)
-               (lispm-kernel-broker-available-p))
-    (user-error "This LispM Desktop has no session readers or frame clock; update it"))
+  (unless (fboundp 'lispm-agents-add-session-reader)
+    (user-error "This lispm-agent has no session readers; update it"))
   (if (or lispm-kernel-desktop--runtime lispm-kernel-desktop-program)
       (lispm-kernel-desktop--start)
     (pcase (lispm-kernel-program-obtain)
       ('ready (lispm-kernel-desktop--start))
-      ;; Until it is there, the desktop's own readers answer.
+      ;; Until it is there, the agents' own readers answer.
       ('pending (add-hook 'lispm-kernel-program-obtained-functions #'lispm-kernel-desktop--obtained))
       (_ (lispm-kernel-desktop--unavailable)))))
 
 (defun lispm-kernel-desktop--disable ()
-  "Give the sessions back to the desktop's own readers and stop the kernel."
+  "Give the sessions back to the agents' own readers and stop the kernel."
   (remove-hook 'lispm-kernel-program-obtained-functions #'lispm-kernel-desktop--obtained)
   (when (fboundp 'lispm-agents-remove-session-reader)
     (dolist (spec lispm-kernel-desktop--agents)
@@ -524,7 +526,6 @@ program is built or downloaded; signal when impossible."
     (remove-function lispm-agents-read-sessions-function #'lispm-kernel-desktop--current))
   (remove-hook 'lispm-agents-session-lookup-functions #'lispm-kernel-desktop--lookup)
   (remove-hook 'lispm-agents-reread-sessions-hook #'lispm-kernel-desktop-invalidate)
-  (lispm-kernel-broker-stop)
   (when lispm-kernel-desktop--runtime
     (lispm-kernel-stop lispm-kernel-desktop--runtime))
   (setq lispm-kernel-desktop--runtime nil
@@ -535,28 +536,30 @@ program is built or downloaded; signal when impossible."
   (when (fboundp 'lispm-agents-sessions-arrived)
     (lispm-agents-sessions-arrived)))
 
-(define-minor-mode lispm-kernel-desktop-mode
-  "Read Codex and Claude sessions for the agents sidebar in the background.
-Needs a LispM Desktop with session readers and a frame clock, and the
-kernel program: the one `lispm-kernel-desktop-program' names, else the
-one downloaded for these sources and checked against the SHA-256 pinned
-with the Lisp, or built with SBCL when `lispm-kernel-program-source' says
-so, in the background, see `lispm-kernel-program-obtain'.  Until that is
-there the desktop's own readers answer; without a desktop or a program
-to be had, the mode turns off, saying why, and they stay in use."
+(define-minor-mode lispm-kernel-sessions-mode
+  "Read Codex and Claude sessions for the editor's agents in the background.
+Needs lispm-agent's session readers, and the kernel program: the one
+`lispm-kernel-desktop-program' names, else the one downloaded for these
+sources and checked against the SHA-256 pinned with the Lisp, or built
+with SBCL when `lispm-kernel-program-source' says so, in the
+background, see `lispm-kernel-program-obtain'.  Until that is there the
+agents' own readers answer; without session readers or a program to be
+had, the mode turns off, saying why, and they stay in use."
   :global t :group 'lispm-kernel
-  (if (not lispm-kernel-desktop-mode)
+  (if (not lispm-kernel-sessions-mode)
       (lispm-kernel-desktop--disable)
     (condition-case error
         (lispm-kernel-desktop--enable)
       (error
-       (setq lispm-kernel-desktop-mode nil)
+       (setq lispm-kernel-sessions-mode nil)
        (lispm-kernel-desktop--disable)
        (signal (car error) (cdr error))))))
 
+(define-obsolete-function-alias 'lispm-kernel-desktop-mode #'lispm-kernel-sessions-mode "0.4.0")
+
 (defun lispm-kernel-desktop-unload-function ()
-  "Give the sessions back to the desktop before `unload-feature' runs."
-  (when lispm-kernel-desktop-mode (lispm-kernel-desktop-mode -1))
+  "Give the sessions back to the agents before `unload-feature' runs."
+  (when lispm-kernel-sessions-mode (lispm-kernel-sessions-mode -1))
   nil)
 
 (provide 'lispm-kernel-desktop)

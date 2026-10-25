@@ -78,11 +78,12 @@ holding what Emacs cannot read, fails its request instead.
 `lisp/lispm-kernel.el` starts the program, sends requests and takes the
 kernel's output in. The process filter only splits lines. `lispm-kernel-dispatch`
 reads and acts on them for `lispm-kernel-slice-seconds`, at least one, and
-gives way to typing; `lispm-kernel-scheduler` decides when it runs.
-`lisp/lispm-kernel-broker.el` sets the scheduler to LispM Desktop's frame
-clock, at depth 10, after the terminals. Nothing polls. Process output
-asks for a frame, and one timer a second watches deadlines while requests
-wait. A request past `lispm-kernel-request-timeout` hears `timeout`, and
+gives way to typing; `lispm-kernel-scheduler` decides when it runs: a
+timer, unless a host sets it to a clock of its own. LispM Desktop sets it
+to its frame clock, at depth 10, after the terminals
+(`lisp/lispm-desktop-kernel.el` in its repository). Nothing polls.
+Process output asks for a timer or a frame, and one timer a second
+watches deadlines while requests wait. A request past `lispm-kernel-request-timeout` hears `timeout`, and
 the kernel is asked to cancel it. When the kernel exits, every request
 waiting hears `lost`.
 
@@ -123,26 +124,26 @@ entries does not. Transcripts are read on four threads at once, and of the
 sessions of one id the newest transcript's is kept. Files that vanish,
 are no regular files or cannot be read are counted as skipped. Only a
 root that cannot be listed fails a scan, and Emacs then reads it the
-desktop's way.
+agents' own way.
 
-`lisp/lispm-kernel-desktop.el` gives the desktop's agents sidebar session
-readers that answer at once with what the kernel read last, or `pending`.
-They have it read again once that is older than
-`lispm-kernel-desktop-cache-seconds`, or when the sidebar reads sessions
-anew. Each session also says whether its latest turn had ended
+`lisp/lispm-kernel-desktop.el`'s `lispm-kernel-sessions-mode` gives the
+editor's agents session readers that answer at once with what the kernel
+read last, or `pending`. They have it read again once that is older than
+`lispm-kernel-desktop-cache-seconds`, or when the agents' list reads
+sessions anew. Each session also says whether its latest turn had ended
 (`:turn-ended`), read from the transcript's end as lispm-agent's `:ready`
 reads it: its last 16 KiB, or its last 256 KiB when those hold no record
 of a turn. The same readings answer three more callers in lispm-agent.
 `lispm-agents-session-lookup-functions` looks a session up, for its
 transcript and its turn, when the agents bridge asks whether an agent is
-free for a message; it never waits and never reads the desktop's way.
+free for a message; it never waits and never reads the agents' own way.
 `lispm-agents-read-sessions-function` lists every session. A terminal
 learning its session takes a reading of any age and is told when a newer
 one comes. The session picker takes one no older than the cache, waiting
 up to `lispm-kernel-desktop-wait-seconds` for the kernel to read anew.
 Only readings that say whether turns ended are used there: an older
 kernel's may lack sessions lispm-agent lists. A remote or missing root
-is read the desktop's way. A kernel that
+is read the agents' own way. A kernel that
 exits is started again when a reader is next asked, unless it ran shorter
 than `lispm-kernel-desktop-restart-seconds`; then it is not started again
 until the mode is turned on anew.
@@ -158,7 +159,7 @@ said, and one that is cancelled stops curl. Either removes the file.
 
 `lisp/lispm-kernel-package.el` advises `package--with-response-buffer-1`,
 through which package.el makes every download. A download package.el makes
-in the background, from http or https, goes to the desktop's kernel when it
+in the background, from http or https, goes to the agents' kernel when it
 runs and knows the job. Its body then runs on what the kernel wrote, in a
 unibyte buffer, as package.el runs it on url.el's response, and package.el
 checks the signatures and keeps the archives as always. The others go to

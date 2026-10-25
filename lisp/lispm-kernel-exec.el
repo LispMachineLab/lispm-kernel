@@ -51,7 +51,7 @@
 (require 'cl-lib)
 (require 'lispm-kernel)
 
-(defvar lispm-kernel-desktop-mode)
+(defvar lispm-kernel-sessions-mode)
 (defvar lispm-kernel-exec-mode)
 (defvar lispm-exec-function)
 (declare-function lispm-kernel-desktop-runtime "lispm-kernel-desktop" ())
@@ -61,15 +61,15 @@
 Nil lets it run for ever."
   :type '(choice (const :tag "Never" nil) integer) :group 'lispm-kernel)
 
-(defvar lispm-kernel-exec-runtime-function #'lispm-kernel-exec--desktop-runtime
+(defvar lispm-kernel-exec-runtime-function #'lispm-kernel-exec--sessions-runtime
   "Function returning the runtime whose kernel runs programs, or nil for none.")
 
 (defconst lispm-kernel-exec--owner 4
   "The owner of the kernel's requests for programs, after package.el's.")
 
-(defun lispm-kernel-exec--desktop-runtime ()
-  "Return the desktop's kernel while `lispm-kernel-desktop-mode' runs it."
-  (and (bound-and-true-p lispm-kernel-desktop-mode)
+(defun lispm-kernel-exec--sessions-runtime ()
+  "Return the agents' kernel while `lispm-kernel-sessions-mode' runs it."
+  (and (bound-and-true-p lispm-kernel-sessions-mode)
        (fboundp 'lispm-kernel-desktop-runtime)
        (lispm-kernel-desktop-runtime)))
 
@@ -232,8 +232,8 @@ than `lispm-kernel-exec-timeout'."
 (define-minor-mode lispm-kernel-exec-mode
   "Have the kernel run the programs LispM runs in the background.
 LispM runs them through `lispm-exec', which the mode advises: the kernel
-`lispm-kernel-exec-runtime-function' returns, by default the desktop's
-while `lispm-kernel-desktop-mode' runs it, runs them; while none that
+`lispm-kernel-exec-runtime-function' returns, by default the agents'
+while `lispm-kernel-sessions-mode' runs it, runs them; while none that
 knows the `exec' job runs, `lispm-exec' runs them as without the mode."
   :global t :group 'lispm-kernel
   (if lispm-kernel-exec-mode

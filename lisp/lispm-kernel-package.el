@@ -60,22 +60,22 @@
 (declare-function url-do-setup "url" ())
 (declare-function url-expand-file-name "url-expand" (url &optional default))
 (declare-function url-find-proxy-for-url "url-proxy" (url host))
-(defvar lispm-kernel-desktop-mode)
+(defvar lispm-kernel-sessions-mode)
 (declare-function lispm-kernel-desktop-runtime "lispm-kernel-desktop" ())
 
 (defcustom lispm-kernel-package-timeout 300
   "Seconds a download may take before package.el hears it failed."
   :type 'integer :group 'lispm-kernel)
 
-(defvar lispm-kernel-package-runtime-function #'lispm-kernel-package--desktop-runtime
+(defvar lispm-kernel-package-runtime-function #'lispm-kernel-package--sessions-runtime
   "Function returning the runtime whose kernel downloads, or nil for none.")
 
 (defconst lispm-kernel-package--owner 3
   "The owner of the kernel's requests for package.el, after the agents'.")
 
-(defun lispm-kernel-package--desktop-runtime ()
-  "Return the desktop's kernel while `lispm-kernel-desktop-mode' runs it."
-  (and (bound-and-true-p lispm-kernel-desktop-mode)
+(defun lispm-kernel-package--sessions-runtime ()
+  "Return the agents' kernel while `lispm-kernel-sessions-mode' runs it."
+  (and (bound-and-true-p lispm-kernel-sessions-mode)
        (fboundp 'lispm-kernel-desktop-runtime)
        (lispm-kernel-desktop-runtime)))
 
@@ -189,7 +189,7 @@ with why it failed; else leave it to ORIGINAL, a
   "Have the kernel make the downloads package.el makes in the background,
 and those of LispM's packages' native code, through lispm-prebuilt.
 The kernel is the one `lispm-kernel-package-runtime-function' returns,
-by default the desktop's while `lispm-kernel-desktop-mode' runs it; while
+by default the agents' while `lispm-kernel-sessions-mode' runs it; while
 none that knows the `fetch' job runs, url.el downloads, and lispm-prebuilt
 runs curl, as without the mode.  package.el checks and keeps what is
 fetched as it always does, and lispm-prebuilt checks it against its pins."

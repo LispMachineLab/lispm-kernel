@@ -8,11 +8,6 @@ on:
 permissions:
   contents: read
 
-env:
-  # The LispM Desktop the integration is tested against: its main, which has
-  # the frame clock and session readers since LispMachineLab/lispm-desktop#64.
-  DESKTOP_REF: main
-
 jobs:
   lisp:
     name: SBCL on ${{ matrix.os }}
@@ -43,17 +38,7 @@ jobs:
         emacs: ['30.1', '31.1']
     steps:
       - uses: actions/checkout@v7
-      # LispM Desktop and the projects it runs, side by side as on a user's
-      # computer, so the desktop finds them as ../<repository>.
-      - uses: actions/checkout@v7
-        with:
-          repository: LispMachineLab/lispm-desktop
-          ref: ${{ env.DESKTOP_REF }}
-          path: .ci/lispm-desktop
-      - uses: actions/checkout@v7
-        with:
-          repository: LispMachineLab/lispm-browser
-          path: .ci/lispm-browser
+      # lispm-agent, whose editor's agents the kernel reads sessions for.
       - uses: actions/checkout@v7
         with:
           repository: LispMachineLab/lispm-agent
@@ -64,6 +49,6 @@ jobs:
       - name: Install SBCL
         run: sudo apt-get update && sudo apt-get install -y sbcl
       - name: Byte-compile
-        run: make compile LISPM_DESKTOP_ROOT=.ci/lispm-desktop
+        run: make compile LISPM_AGENT=.ci/lispm-agent/lisp
       - name: Test
-        run: make test-emacs LISPM_DESKTOP_ROOT=.ci/lispm-desktop
+        run: make test-emacs LISPM_AGENT=.ci/lispm-agent/lisp

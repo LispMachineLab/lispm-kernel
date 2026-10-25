@@ -1,4 +1,4 @@
-;;; lispm-kernel-desktop-test.el --- The kernel reading LispM Desktop's sessions -*- lexical-binding: t; -*-
+;;; lispm-kernel-desktop-test.el --- The kernel reading the agents' sessions -*- lexical-binding: t; -*-
 
 ;; Copyright (C) 2026  Ryan.K
 
@@ -23,9 +23,10 @@
 
 ;;; Commentary:
 
-;; Against a LispM Desktop with session readers and a frame clock, whose
-;; own readers are the reference: what the kernel reads must be what they
-;; read.  Load after lispm-kernel-test.el, which names the program.
+;; Against lispm-agent's session readers, whose own readers are the
+;; reference: what the kernel reads must be what they read.  No LispM
+;; Desktop is loaded: the kernel's messages are taken in by timers.  Load
+;; after lispm-kernel-test.el, which names the program.
 
 ;;; Code:
 
@@ -37,7 +38,6 @@
 ;; Loaded before any test fakes their functions: loading them later would
 ;; replace the fakes, and undoing a fake would then unbind the real ones.
 (require 'lispm-agents)
-(require 'lispm-desktop-frame)
 (defvar lispm-kernel-test-program)
 (defvar lispm-agents-session-lookup-functions)
 
@@ -64,7 +64,7 @@ under test, then turn the mode off."
                ((symbol-function 'lispm-agents-sessions-arrived)
                 (lambda () (cl-incf lispm-kernel-desktop-test--arrived))))
        (unwind-protect (progn ,@body)
-         (lispm-kernel-desktop-mode -1)))))
+         (lispm-kernel-sessions-mode -1)))))
 
 (defun lispm-kernel-desktop-test--read (agent)
   "Call AGENT's registered reader."
@@ -223,11 +223,12 @@ latest turn ended as lispm-agent's :ready reads it; return them without."
 (ert-deftest lispm-kernel-desktop-reads-as-the-desktop-does ()
   (lispm-kernel-desktop-test--with-trees
     (lispm-kernel-desktop-test--with-desktop
-      (lispm-kernel-desktop-mode 1)
+      (lispm-kernel-sessions-mode 1)
       (should (assq 'codex lispm-kernel-desktop-test--readers))
       (should (assq 'claude lispm-kernel-desktop-test--readers))
       (should (memq #'lispm-kernel-desktop-invalidate lispm-agents-reread-sessions-hook))
-      (should (eq lispm-kernel-broker--runtime lispm-kernel-desktop--runtime))
+      ;; Taken in by timers: the mode sets no scheduler of its own.
+      (should-not lispm-kernel-scheduler)
       (dolist (agent '(codex claude))
         (should (eq (lispm-kernel-desktop-test--read agent) 'pending))
         (let* ((read (lispm-kernel-desktop-test--read-until-known agent))
@@ -249,7 +250,7 @@ latest turn ended as lispm-agent's :ready reads it; return them without."
 (ert-deftest lispm-kernel-desktop-reads-again-when-stale ()
   (lispm-kernel-desktop-test--with-trees
     (lispm-kernel-desktop-test--with-desktop
-      (lispm-kernel-desktop-mode 1)
+      (lispm-kernel-sessions-mode 1)
       (let ((first (lispm-kernel-desktop-test--read-until-known 'claude)))
         ;; Fresh: no reading starts.
         (lispm-kernel-desktop-test--read 'claude)
@@ -268,7 +269,7 @@ latest turn ended as lispm-agent's :ready reads it; return them without."
 
 (ert-deftest lispm-kernel-desktop-reread-supersedes-and-keeps-old-sessions ()
   (lispm-kernel-desktop-test--with-desktop
-    (lispm-kernel-desktop-mode 1)
+    (lispm-kernel-sessions-mode 1)
     (puthash 'codex '(:root "/r" :sessions ((:id "old")) :known t :generation 0 :time 1 :request 42)
              lispm-kernel-desktop--cache)
     (run-hooks 'lispm-agents-reread-sessions-hook)
@@ -281,21 +282,20 @@ latest turn ended as lispm-agent's :ready reads it; return them without."
 
 (ert-deftest lispm-kernel-desktop-off-gives-everything-back ()
   (lispm-kernel-desktop-test--with-desktop
-    (lispm-kernel-desktop-mode 1)
+    (lispm-kernel-sessions-mode 1)
     (let ((runtime lispm-kernel-desktop--runtime))
-      (lispm-kernel-desktop-mode 1)
+      (lispm-kernel-sessions-mode 1)
       (should (eq runtime lispm-kernel-desktop--runtime))
-      (lispm-kernel-desktop-mode -1)
+      (lispm-kernel-sessions-mode -1)
       (should-not lispm-kernel-desktop-test--readers)
       (should-not (memq #'lispm-kernel-desktop-invalidate lispm-agents-reread-sessions-hook))
       (should-not lispm-kernel-desktop--runtime)
-      (should-not lispm-kernel-broker--runtime)
       (should-not (process-live-p (lispm-kernel-runtime-process runtime))))))
 
 (ert-deftest lispm-kernel-desktop-remote-root-uses-the-desktop-reader ()
   (let ((lispm-agents-codex-sessions-directory "/ssh:host:/sessions/") called)
     (lispm-kernel-desktop-test--with-desktop
-      (lispm-kernel-desktop-mode 1)
+      (lispm-kernel-sessions-mode 1)
       (cl-letf (((symbol-function 'lispm-agents-codex-sessions)
                  (lambda () (setq called t) '((:id "remote")))))
         (should (equal (lispm-kernel-desktop-test--read 'codex) '((:id "remote"))))
@@ -321,7 +321,7 @@ by hand tries it at once."
                                        (lispm-kernel-desktop-test--sorted (lispm-agents-claude-sessions)))))))
             (cl-letf (((symbol-function 'lispm-kernel-start)
                        (lambda (file) (cl-incf starts) (funcall start file))))
-              (lispm-kernel-desktop-mode 1)
+              (lispm-kernel-sessions-mode 1)
               (funcall died)
               ;; The desktop's reader answers meanwhile, and it is not
               ;; started again at once.
@@ -361,7 +361,7 @@ restart command starts a running kernel anew."
     (lispm-kernel-desktop-test--with-desktop
       (should (equal (lispm-kernel-desktop-status) '(off)))
       (should-error (lispm-kernel-desktop-restart) :type 'user-error)
-      (lispm-kernel-desktop-mode 1)
+      (lispm-kernel-sessions-mode 1)
       (let ((runtime lispm-kernel-desktop--runtime))
         (pcase (lispm-kernel-desktop-status)
           (`(running ,process ,since)
@@ -372,13 +372,12 @@ restart command starts a running kernel anew."
         (should-not (eq runtime lispm-kernel-desktop--runtime))
         (should-not (lispm-kernel-live-p runtime))
         (should (lispm-kernel-live-p lispm-kernel-desktop--runtime))
-        (should (eq lispm-kernel-broker--runtime lispm-kernel-desktop--runtime))
         (should (eq (car (lispm-kernel-desktop-status)) 'running))))))
 
 (ert-deftest lispm-kernel-desktop-kernel-exits ()
   (lispm-kernel-desktop-test--with-trees
     (lispm-kernel-desktop-test--with-desktop
-      (lispm-kernel-desktop-mode 1)
+      (lispm-kernel-sessions-mode 1)
       (let ((runtime lispm-kernel-desktop--runtime)
             (reference (lispm-agents-claude-sessions)))
         (lispm-kernel-test--wait runtime (lambda () (lispm-kernel-runtime-hello runtime)))
@@ -395,7 +394,6 @@ restart command starts a running kernel anew."
         (should (eq (lispm-kernel-desktop-test--read 'claude) 'pending))
         (should-not (eq runtime lispm-kernel-desktop--runtime))
         (should (lispm-kernel-live-p lispm-kernel-desktop--runtime))
-        (should (eq lispm-kernel-broker--runtime lispm-kernel-desktop--runtime))
         (should (equal (lispm-kernel-desktop-test--sorted
                         (lispm-kernel-desktop-test--turns-dropped
                          (lispm-kernel-desktop-test--read-until-known 'claude)))
@@ -410,7 +408,7 @@ of a kernel that says nothing of turns, are the agents' own."
   (lispm-kernel-desktop-test--with-trees
     (lispm-kernel-desktop-test--with-desktop
       (let ((own (lambda () (error "The agents' own reader was asked"))))
-        (lispm-kernel-desktop-mode 1)
+        (lispm-kernel-sessions-mode 1)
         (should-not (funcall lispm-agents-read-sessions-function 'claude own t))
         (should (equal (lispm-kernel-desktop-test--sorted
                         (lispm-kernel-desktop-test--turns-dropped
@@ -425,19 +423,19 @@ of a kernel that says nothing of turns, are the agents' own."
         (should (eq (funcall lispm-agents-read-sessions-function 'hermes (lambda () 'own)) 'own))
         (setf (plist-get (gethash 'claude lispm-kernel-desktop--cache) :turns) nil)
         (should (eq (funcall lispm-agents-read-sessions-function 'claude (lambda () 'own)) 'own))
-        (lispm-kernel-desktop-mode -1)
+        (lispm-kernel-sessions-mode -1)
         (should (eq lispm-agents-read-sessions-function #'lispm-agents-read-sessions))))))
 
 (ert-deftest lispm-kernel-desktop-looks-sessions-up-without-reading ()
   "A session is looked up in what the kernel read, saying whether its turn
-ended; nothing is read the desktop's own way, nor waited for."
+ended; nothing is read the agents' own way, nor waited for."
   (lispm-kernel-desktop-test--with-trees
     (lispm-kernel-desktop-test--with-desktop
       (let ((lispm-agents-session-lookup-functions nil))
-        (lispm-kernel-desktop-mode 1)
+        (lispm-kernel-sessions-mode 1)
         (should (memq #'lispm-kernel-desktop--lookup lispm-agents-session-lookup-functions))
         (cl-letf (((symbol-function 'lispm-agents-claude-sessions)
-                   (lambda () (error "Read the desktop's own way"))))
+                   (lambda () (error "Read the agents' own way"))))
           ;; Asked before the first reading: unknown, and it is read.
           (should-not (lispm-kernel-desktop--lookup 'claude "a"))
           (should (integerp (plist-get (gethash 'claude lispm-kernel-desktop--cache) :request)))
@@ -453,14 +451,14 @@ ended; nothing is read the desktop's own way, nor waited for."
           ;; No kernel running: nothing known.
           (cl-letf (((symbol-function 'lispm-kernel-desktop-runtime) #'ignore))
             (should-not (lispm-kernel-desktop--lookup 'claude "a"))))
-        (lispm-kernel-desktop-mode -1)
+        (lispm-kernel-sessions-mode -1)
         (should-not lispm-agents-session-lookup-functions)))))
 
 (ert-deftest lispm-kernel-desktop-tells-only-of-new-sessions ()
   "Sessions read again as they were are not drawn again."
   (lispm-kernel-desktop-test--with-trees
     (lispm-kernel-desktop-test--with-desktop
-      (lispm-kernel-desktop-mode 1)
+      (lispm-kernel-sessions-mode 1)
       (lispm-kernel-desktop-test--read-until-known 'claude)
       (let ((arrived lispm-kernel-desktop-test--arrived)
             (lispm-kernel-desktop-cache-seconds 0))
@@ -485,7 +483,7 @@ ended; nothing is read the desktop's own way, nor waited for."
 (ert-deftest lispm-kernel-desktop-falls-back-when-the-kernel-cannot-read ()
   (lispm-kernel-desktop-test--with-trees
     (lispm-kernel-desktop-test--with-desktop
-      (lispm-kernel-desktop-mode 1)
+      (lispm-kernel-sessions-mode 1)
       (cl-letf (((symbol-function 'lispm-kernel-scan-sessions)
                  (lambda (_runtime _agent _root callback &rest options)
                    (run-at-time 0 nil (lambda ()
@@ -499,7 +497,7 @@ ended; nothing is read the desktop's own way, nor waited for."
 (ert-deftest lispm-kernel-desktop-retries-when-the-kernel-is-full ()
   (lispm-kernel-desktop-test--with-trees
     (lispm-kernel-desktop-test--with-desktop
-      (lispm-kernel-desktop-mode 1)
+      (lispm-kernel-sessions-mode 1)
       (let ((scan (symbol-function 'lispm-kernel-scan-sessions))
             (attempts 0))
         (cl-letf (((symbol-function 'lispm-kernel-scan-sessions)
@@ -525,8 +523,8 @@ registered once it is there, and the mode turns off when none can be had."
           (asked 0))
       (cl-letf (((symbol-function 'lispm-kernel-program-obtain) (lambda () (cl-incf asked) 'pending))
                 ((symbol-function 'lispm-kernel-program-file) (lambda () lispm-kernel-test-program)))
-        (lispm-kernel-desktop-mode 1)
-        (should lispm-kernel-desktop-mode)
+        (lispm-kernel-sessions-mode 1)
+        (should lispm-kernel-sessions-mode)
         (should (= asked 1))
         (should-not lispm-kernel-desktop--runtime)
         (should-not lispm-kernel-desktop-test--readers)
@@ -534,72 +532,47 @@ registered once it is there, and the mode turns off when none can be had."
         (should (lispm-kernel-live-p lispm-kernel-desktop--runtime))
         (should (assq 'codex lispm-kernel-desktop-test--readers))
         (should-not lispm-kernel-program-obtained-functions)
-        (lispm-kernel-desktop-mode -1)
+        (lispm-kernel-sessions-mode -1)
         ;; None could be got, and the user is told why.
-        (lispm-kernel-desktop-mode 1)
+        (lispm-kernel-sessions-mode 1)
         (setq lispm-kernel-program-problem "its SHA-256 differs, so it was refused")
         (cl-letf (((symbol-function 'message)
                    (lambda (format &rest args) (push (apply #'format format args) messages))))
           (run-hook-with-args 'lispm-kernel-program-obtained-functions nil))
-        (should-not lispm-kernel-desktop-mode)
+        (should-not lispm-kernel-sessions-mode)
         (should-not lispm-kernel-desktop-test--readers)
         (should (equal lispm-kernel-desktop-last-error lispm-kernel-program-problem))
         (should (seq-some (lambda (text) (string-search "so it was refused" text)) messages))
         ;; Turned off while waiting, it stays off once the program is there.
-        (lispm-kernel-desktop-mode 1)
-        (lispm-kernel-desktop-mode -1)
+        (lispm-kernel-sessions-mode 1)
+        (lispm-kernel-sessions-mode -1)
         (should-not lispm-kernel-program-obtained-functions)
         (should-not lispm-kernel-desktop--runtime))
       ;; Nothing to be had at all.
       (cl-letf (((symbol-function 'lispm-kernel-program-obtain) #'ignore))
-        (should-error (lispm-kernel-desktop-mode 1) :type 'user-error))
-      (should-not lispm-kernel-desktop-mode)
+        (should-error (lispm-kernel-sessions-mode 1) :type 'user-error))
+      (should-not lispm-kernel-sessions-mode)
       (should-not lispm-kernel-desktop-test--readers)
-      (should-not lispm-kernel-broker--runtime))))
+      (should-not lispm-kernel-desktop--runtime))))
 
-(ert-deftest lispm-kernel-broker-takes-messages-on-the-frame-clock ()
-  (let ((runtime (lispm-kernel-start lispm-kernel-test-program)) requests clients)
-    (unwind-protect
-        (cl-letf (((symbol-function 'lispm-desktop-frame-request)
-                   (lambda (name) (push name requests)))
-                  ((symbol-function 'lispm-desktop-frame-add-client)
-                   (lambda (name function &optional depth) (push (list name function depth) clients)))
-                  ((symbol-function 'lispm-desktop-frame-remove-client)
-                   (lambda (name) (setq clients (assq-delete-all name clients)))))
-          (lispm-kernel-broker-start runtime)
-          (should (equal (car clients) (list 'lispm-kernel #'lispm-kernel-broker--frame
-                                             lispm-kernel-broker-depth)))
-          (should (eq lispm-kernel-scheduler #'lispm-kernel-broker--schedule))
-          (let (heard)
-            (lispm-kernel-submit runtime 'echo "x" :on-result (lambda (kind _) (push kind heard)))
-            ;; What the kernel writes asks the clock for a frame; no timer.
-            (with-timeout (5) (while (not (memq 'lispm-kernel requests)) (accept-process-output nil 0.01)))
-            (should (memq 'lispm-kernel requests))
-            (should-not (lispm-kernel-runtime-timer runtime))
-            (with-timeout (5) (while (< (length (lispm-kernel-runtime-incoming runtime)) 2)
-                                (accept-process-output nil 0.01)))
-            (let (slice)
-              (cl-letf (((symbol-function 'lispm-kernel-dispatch)
-                         (lambda (_) (setq slice lispm-kernel-slice-seconds))))
-                ;; Messages waiting: the clock is asked back.
-                (should (lispm-kernel-broker--frame (+ (float-time) 0.005)))
-                (should (< 0.004 slice 0.0051))))
-            (should-not (lispm-kernel-broker--frame (+ (float-time) 0.005)))
-            (should (equal heard '(success))))
-          (lispm-kernel-broker-stop)
-          (should-not clients)
-          (should-not lispm-kernel-scheduler))
-      (lispm-kernel-broker-stop)
-      (lispm-kernel-stop runtime))))
+(ert-deftest lispm-kernel-desktop-mode-is-the-sessions-mode ()
+  "The mode's old name, of when LispM Desktop held the agents, still turns
+it on and off, and says whether it is on."
+  (lispm-kernel-desktop-test--with-desktop
+    (with-suppressed-warnings ((obsolete lispm-kernel-desktop-mode))
+      (lispm-kernel-desktop-mode 1)
+      (should lispm-kernel-sessions-mode)
+      (should lispm-kernel-desktop-mode)
+      (lispm-kernel-desktop-mode -1)
+      (should-not lispm-kernel-sessions-mode))))
 
 (ert-deftest lispm-kernel-desktop-unload-gives-sessions-back ()
   (lispm-kernel-desktop-test--with-desktop
-    (lispm-kernel-desktop-mode 1)
+    (lispm-kernel-sessions-mode 1)
     (should lispm-kernel-desktop-test--readers)
     (unload-feature 'lispm-kernel-desktop t)
     (should-not lispm-kernel-desktop-test--readers)
     (should-not (memq 'lispm-kernel-desktop-invalidate lispm-agents-reread-sessions-hook))
-    (should-not lispm-kernel-broker--runtime)
     (require 'lispm-kernel-desktop)))
 
 (provide 'lispm-kernel-desktop-test)
