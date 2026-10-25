@@ -24,7 +24,7 @@
 ;;; Commentary:
 
 ;; `lispm-kernel-scan-sessions' has the kernel read the Codex or Claude
-;; Code sessions below a directory, as LispM Desktop's own readers do, see
+;; Code sessions below a directory, as lispm-agent's own readers do, see
 ;; src/sessions.lisp, and gives them back as those readers do:
 ;;
 ;;   (:agent codex :id ID :cwd CWD :title TITLE :started FLOAT :file FILE :time FLOAT
@@ -108,8 +108,8 @@ Return the request's id, or nil when the kernel is not running."
                 (when-let* ((session (lispm-kernel-sessions--session agent row)))
                   (push session rows))))
              ('success
-              ;; Sorted as the desktop sorts, those of one time in the
-              ;; order the kernel sent them, which is the desktop's.
+              ;; Sorted as the agents' list sorts, those of one time in the
+              ;; order the kernel sent them, which is their readers'.
               (finish (sort (nreverse rows) (lambda (a b) (> (plist-get a :time) (plist-get b :time))))
                       value))
              ('cancelled (finish nil '(:cancelled t)))

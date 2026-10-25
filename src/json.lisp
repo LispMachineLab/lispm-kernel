@@ -16,7 +16,7 @@
 ;; You should have received a copy of the GNU Affero General Public License
 ;; along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-;;; Strict JSON (RFC 8259), read the way LispM Desktop reads it in Emacs,
+;;; Strict JSON (RFC 8259), read the way lispm-agent reads it in Emacs,
 ;;; `json-parse-string' with :null-object and :false-object nil and lists
 ;;; for arrays:
 ;;;

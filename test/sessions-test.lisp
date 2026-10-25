@@ -16,7 +16,7 @@
 ;; You should have received a copy of the GNU Affero General Public License
 ;; along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-;;; What LispM Desktop's own readers make of these transcripts is checked
+;;; What lispm-agent's own readers make of these transcripts is checked
 ;;; against what the kernel makes of them in test/lispm-kernel-desktop-test.el;
 ;;; here, the kernel alone.
 
@@ -150,6 +150,36 @@
       (let ((rows (scan-rows :codex root :index index)))
         (is (string= "Named B" (getf (row "b" rows) :title)))
         (is (string= "forked" (getf (row "a" rows) :title)))))))
+
+(deftest sessions-codex-prompt-past-the-head ()
+  (lispm-kernel/sessions:clear-caches)
+  (with-directory (directory)
+    (let ((root (path directory "sessions")))
+      (flet ((rollout (id &rest lines)
+               (apply #'write-file (path root (format nil "rollout-~A.jsonl" id))
+                      (codex-meta id (format nil "/p/~A" id)) lines)))
+        ;; Tools and instructions over the whole head, then the prompt.
+        (apply #'rollout "past"
+               (append (padding 700) (list (codex-said "<instructions>") (codex-typed "past the head"))
+                       (padding 20000) (list (codex-typed "in the tail"))))
+        ;; The prompt's line is cut by the head's end.
+        (rollout "cut" (concatenate 'string (codex-typed "cut")
+                                    (make-string 70000 :initial-element #\Space)))
+        ;; Past the first MiB, in the tail only.
+        (apply #'rollout "tail" (append (padding 11000) (list (codex-typed "only in the tail"))
+                                        (padding 10)))
+        ;; Past the first MiB and before the tail: no title.
+        (apply #'rollout "none" (append (padding 11000) (list (codex-typed "lost")) (padding 200)))
+        ;; In the head and in the tail: the head's.
+        (apply #'rollout "head" (append (list (codex-typed "in the head")) (padding 700)
+                                        (list (codex-typed "late")))))
+      (multiple-value-bind (rows summary) (scan-rows :codex root)
+        (is (equal '("cut" "head" "past" "tail") (mapcar (lambda (row) (getf row :id)) rows)))
+        (is (string= "past the head" (getf (row "past" rows) :title)))
+        (is (string= "cut" (getf (row "cut" rows) :title)))
+        (is (string= "only in the tail" (getf (row "tail" rows) :title)))
+        (is (string= "in the head" (getf (row "head" rows) :title)))
+        (is (eql 1 (getf summary :empty)))))))
 
 (defun claude-fixture (directory)
   "Write a Claude Code tree in DIRECTORY; return its root."
