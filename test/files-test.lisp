@@ -103,13 +103,33 @@
         (is (= 655 (length head)))
         (is (string= "000656" (subseq (first tail) 0 6)))))))
 
+(deftest files-lines-of-a-region ()
+  (with-directory (directory)
+    ;; 1000 lines of 99 characters and a newline: 100000 bytes.
+    (let ((file (apply #'write-file (path directory "big") (numbered-lines 1000 99))))
+      (multiple-value-bind (lines stamp) (read-lines file 0 1048576)
+        (is (= 100000 (stamp-size stamp)))
+        (is (= 1000 (length lines))))
+      ;; Line 100 is cut by the start, and line 655 by the end.
+      (let ((lines (read-lines file 10050 65536)))
+        (is (string= "000101" (subseq (first lines) 0 6)))
+        (is (string= "000654" (subseq (car (last lines)) 0 6))))
+      ;; A start at a line's start leaves that line out too, as Emacs does.
+      (is (string= "000101" (subseq (first (read-lines file 10000 20000)) 0 6))))
+    ;; The last line, unended, is cut only by an end before the file's.
+    (let ((file (write-octets (path directory "small") (octets (format nil "a~%b~%c")))))
+      (is (equal '("a" "b" "c") (read-lines file 0 100)))
+      (is (equal '("a" "b") (read-lines file 0 4)))
+      (is (equal '("a") (read-lines file 0 3))))))
+
 (deftest files-only-regular-files-are-read ()
   (with-directory (directory)
     (let ((fifo (path directory "fifo")))
       (sb-posix:mkfifo fifo #o600)
       ;; Opened without waiting for a writer, then refused.
       (is (eq nil (read-head-and-tail fifo 65536 16384)))
-      (is (eq nil (read-file-octets fifo 100))))
+      (is (eq nil (read-file-octets fifo 100)))
+      (is (eq nil (read-lines fifo 0 100))))
     (is (eq nil (read-head-and-tail directory 65536 16384)))
     (is (eq nil (read-head-and-tail (path directory "missing") 65536 16384)))))
 

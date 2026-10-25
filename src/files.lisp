@@ -251,8 +251,8 @@ stamp; return nil without running it when PATH is none."
 stamp, or nil when it is none or cannot be read.
 The head is the first HEAD-BYTES, its last line left out when the file
 goes on; the tail, read only when the file is longer than HEAD-BYTES, is
-the last TAIL-BYTES after the head, its first line left out.  So LispM
-Desktop reads a transcript."
+the last TAIL-BYTES after the head, its first line left out.  So
+lispm-agent reads a transcript."
   (handler-case
       (with-regular-file (stream stamp path)
         (let* ((size (stamp-size stamp))
@@ -262,6 +262,22 @@ Desktop reads a transcript."
                        (read-range stream (max head-bytes (- size tail-bytes)) size))))
           (values (octet-lines head :drop-last (< head-end size))
                   (and tail (octet-lines tail :drop-first t))
+                  stamp)))
+    (error () nil)))
+
+(defun read-lines (path start end)
+  "Return the lines of regular file PATH from octet START to END, and its
+stamp, or nil when it is none or cannot be read.
+A START past 0 leaves out the line it is in, even one starting there; an
+END short of the file's end the line it cuts.  So lispm-agent reads a
+region of a transcript, `lispm-agents-read-json-region'."
+  (handler-case
+      (with-regular-file (stream stamp path)
+        (let* ((size (stamp-size stamp))
+               (end (min end size)))
+          (values (and (< start end)
+                       (octet-lines (read-range stream start end)
+                                    :drop-first (plusp start) :drop-last (< end size)))
                   stamp)))
     (error () nil)))
 

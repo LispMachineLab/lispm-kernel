@@ -204,7 +204,7 @@ under test, then turn the mode off."
           ;; As the sidebar draws them, those of one time in one order too.
           (should (equal (lispm-agents--sort-sessions sessions)
                          (lispm-agents--sort-sessions reference)))
-          (should (= (length sessions) (if (eq agent 'codex) 3 4)))))
+          (should (= (length sessions) 4))))
       (should (> lispm-kernel-desktop-test--arrived 0))
       (should-not lispm-kernel-desktop-last-error))))
 

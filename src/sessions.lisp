@@ -17,15 +17,16 @@
 ;; along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 ;;; The job scan-sessions finds the Codex or Claude Code sessions under a
-;;; directory as LispM Desktop's own readers find them, in
-;;; lispm-desktop-agent-codex.el, lispm-desktop-agent-claude.el and
-;;; lispm-desktop-ai.el, which are the reference for what is read here:
+;;; directory as lispm-agent's own readers find them, in
+;;; lispm-agents-codex.el, lispm-agents-claude.el and lispm-agents.el,
+;;; which are the reference for what is read here:
 ;;;
 ;;;   Codex   rollout-*.jsonl, any case, in the tree below the root,
 ;;;           symbolic links to directories not followed.  The session
-;;;           is its head's first session_meta, titled by its head's first
-;;;           prompt a person typed, or by its thread name in Codex's
-;;;           session index, which wins; untitled ones are left out.
+;;;           is its head's first session_meta, titled by the first
+;;;           prompt a person typed in its head, else in its first MiB,
+;;;           else in its tail, or by its thread name in Codex's session
+;;;           index, which wins; untitled ones are left out.
 ;;;   Claude  PROJECT/*.jsonl below the root.  The session is named by
 ;;;           its file, titled by the last custom title or summary of its
 ;;;           head and tail, else its head's first prompt, or by the
@@ -47,10 +48,14 @@
 (in-package #:lispm-kernel/sessions)
 
 (defconstant +head-bytes+ 65536
-  "Bytes read from the start of a transcript, as LispM Desktop reads.")
+  "Bytes read from the start of a transcript, as lispm-agent reads.")
 
 (defconstant +tail-bytes+ 16384
-  "Bytes read from the end of a transcript, as LispM Desktop reads.")
+  "Bytes read from the end of a transcript, as lispm-agent reads.")
+
+(defconstant +prompt-bytes+ (* 1024 1024)
+  "Bytes from the start of a Codex transcript its first prompt is looked
+for in when its head holds none, as lispm-agent reads.")
 
 (defparameter *max-depth* 32
   "How deep below the root Codex's tree is walked.")
@@ -85,7 +90,7 @@
   (mtime 0 :type integer :read-only t)
   (started nil :type (or null string) :read-only t))
 
-;;;; As LispM Desktop reads transcripts
+;;;; As lispm-agent reads transcripts
 
 (defun whitespacep (character)
   (member character '(#\Space #\Tab #\Newline #\Return)))
@@ -99,7 +104,7 @@
   "Return true when TEXT reads as a prompt a person typed.
 Agents inject context, command echoes and reminders as tagged blocks
 that start with <, and Codex injects project guidance headed
-# AGENTS.md; those are no prompts.  So `lispm-desktop-agent-human-text-p'."
+# AGENTS.md; those are no prompts.  So `lispm-agents-human-text-p'."
   (and (stringp text)
        (let ((start (position-if-not #'whitespacep text)))
          (and start
@@ -108,7 +113,7 @@ that start with <, and Codex injects project guidance headed
 
 (defun content-text (content)
   "Return the text of message CONTENT, a string or a list of typed parts.
-So `lispm-desktop-agent-content-text'."
+So `lispm-agents-content-text'."
   (cond ((stringp content) content)
         ((listp content)
          (with-output-to-string (output)
@@ -194,8 +199,20 @@ order or FROM-END."
            (let ((text (content-text (json-get payload "content"))))
              (and (human-text-p text) text))))))
 
-(defun codex-session (path head stamp)
-  "Return the Codex session of transcript PATH, whose head lines are HEAD."
+(defun codex-title (path head tail stamp)
+  "Return the first prompt a person typed in Codex transcript PATH, whose
+head and tail lines are HEAD and TAIL: in its head, else in its first
+`+prompt-bytes+', read now, else in its tail.  Codex may record tools and
+instructions over the whole head before it.  So `lispm-agents-codex--session'."
+  (or (first-line head #'codex-prompt)
+      ;; A transcript no longer than its head has nothing more at its start.
+      (and (> (stamp-size stamp) +head-bytes+)
+           (first-line (make-lines (read-lines path 0 +prompt-bytes+)) #'codex-prompt))
+      (and tail (first-line tail #'codex-prompt))))
+
+(defun codex-session (path head tail stamp)
+  "Return the Codex session of transcript PATH, whose head and tail lines
+are HEAD and TAIL."
   (let* ((meta (first-line head (lambda (object)
                                   (and (equal (json-get object "type") "session_meta") object))))
          (payload (json-get meta "payload"))
@@ -203,7 +220,7 @@ order or FROM-END."
          (cwd (json-get payload "cwd")))
     (when (and (stringp id) (stringp cwd))
       (let ((timestamp (json-get payload "timestamp")))
-        (make-session id cwd (first-line head #'codex-prompt) path (stamp-mtime stamp)
+        (make-session id cwd (codex-title path head tail stamp) path (stamp-mtime stamp)
                       (and (stringp timestamp) timestamp))))))
 
 (defun codex-files (root)
@@ -436,15 +453,13 @@ of its own directory, beside its transcript, or nil."
           (if found
               (cons :cached session)
               (multiple-value-bind (head tail read-stamp)
-                  ;; Codex's sessions are all in the head.
-                  (read-head-and-tail path +head-bytes+ (if (eq agent :codex) 0 +tail-bytes+))
+                  (read-head-and-tail path +head-bytes+ +tail-bytes+)
                 (if (null read-stamp)
                     (cons :skipped nil)
                     (let ((session (compact-session
-                                    (if (eq agent :codex)
-                                        (codex-session path (make-lines head) read-stamp)
-                                        (claude-session path (make-lines head)
-                                                        (and tail (make-lines tail)) read-stamp)))))
+                                    (funcall (if (eq agent :codex) #'codex-session #'claude-session)
+                                             path (make-lines head) (and tail (make-lines tail))
+                                             read-stamp))))
                       (store cache 'transcripts path read-stamp session)
                       (cons :read session)))))))))
 
@@ -475,7 +490,7 @@ of its own directory, beside its transcript, or nil."
 
 (defun newest-per-id (pairs)
   "Return PAIRS, (SESSION . TITLE), keeping the newest transcript of each id,
-in the order each id first comes, as LispM Desktop's hash table has them."
+in the order each id first comes, as lispm-agent's hash table has them."
   (let ((latest (make-hash-table :test 'equal))
         (ids '()))
     (dolist (pair pairs)

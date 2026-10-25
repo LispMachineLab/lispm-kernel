@@ -60,6 +60,7 @@
            #:file-stamp
            #:directory-names
            #:read-head-and-tail
+           #:read-lines
            #:read-file-octets
            #:octet-lines
            #:native-stat-p))

@@ -151,6 +151,35 @@
         (is (string= "Named B" (getf (row "b" rows) :title)))
         (is (string= "forked" (getf (row "a" rows) :title)))))))
 
+(deftest sessions-codex-prompt-past-the-head ()
+  "Codex may record tools and instructions over the whole head before the
+first prompt: it is looked for in the first MiB then, else in the tail."
+  (lispm-kernel/sessions:clear-caches)
+  (with-directory (directory)
+    (let ((root (path directory "sessions")))
+      (apply #'write-file (path root "rollout-f.jsonl")
+             (codex-meta "f" "/p/f")
+             (append (padding 700) (list (codex-typed "past the head") (codex-typed "later"))
+                     (padding 200)))
+      ;; Its line cut by the head's end.
+      (write-file (path root "rollout-g.jsonl")
+                  (codex-meta "g" "/p/g")
+                  (concatenate 'string (codex-typed "cut by the head")
+                               (make-string 70000 :initial-element #\Space)))
+      (apply #'write-file (path root "rollout-h.jsonl")
+             (codex-meta "h" "/p/h")
+             (append (padding 10500) (list (codex-typed "past the first MiB"))
+                     (padding 200) (list (codex-typed "in the tail"))))
+      (apply #'write-file (path root "rollout-i.jsonl")
+             (codex-meta "i" "/p/i")
+             (append (padding 10500) (list (codex-typed "neither")) (padding 200)))
+      (multiple-value-bind (rows summary) (scan-rows :codex root)
+        (is (equal '("f" "g" "h") (mapcar (lambda (row) (getf row :id)) rows)))
+        (is (string= "past the head" (getf (row "f" rows) :title)))
+        (is (string= "cut by the head" (getf (row "g" rows) :title)))
+        (is (string= "in the tail" (getf (row "h" rows) :title)))
+        (is (equal '(:files 4 :rows 3 :empty 1 :skipped 0 :cached 0 :truncated nil) summary))))))
+
 (defun claude-fixture (directory)
   "Write a Claude Code tree in DIRECTORY; return its root."
   (let ((root (path directory "projects"))
