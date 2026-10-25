@@ -103,7 +103,7 @@ SHA-256 of what is published."
 
 (defun lispm-kernel-program-test--wait ()
   (with-timeout (20 (error "Waited too long"))
-    (while (lispm-kernel-program--busy-p)
+    (while (lispm-kernel-program-busy-p)
       (accept-process-output nil 0.02))))
 
 (ert-deftest lispm-kernel-program-target ()
@@ -246,9 +246,9 @@ it is not there."
            (exec-path (cons bin exec-path)))
       (lispm-kernel-program-test--pin `(("aarch64-apple-darwin" . ,(make-string 64 ?b))))
       (should (eq (lispm-kernel-program-obtain) 'pending))
-      (should (lispm-kernel-program--busy-p))
+      (should (lispm-kernel-program-busy-p))
       (lispm-kernel-program-stop)
-      (should-not (lispm-kernel-program--busy-p))
+      (should-not (lispm-kernel-program-busy-p))
       (should (equal lispm-kernel-program-test--obtained '(nil)))
       (should (string-match-p "stopped" lispm-kernel-program-problem))
       (should-not lispm-kernel-program--stopped)

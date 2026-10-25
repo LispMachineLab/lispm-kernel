@@ -45,14 +45,16 @@
 ;;
 ;; What the kernel writes wakes Emacs as any process output does, and is
 ;; taken in a slice at a time, `lispm-kernel-slice-seconds' long, giving
-;; way to typing: by a timer, or by `lispm-kernel-scheduler', which
-;; lispm-kernel-broker.el sets to LispM Desktop's frame clock.  Callbacks
-;; run on Emacs's thread and cannot be preempted; they should be short.
+;; way to typing: by a timer, or by `lispm-kernel-scheduler', which a
+;; host may set to a clock of its own, as LispM Desktop does to its frame
+;; clock.  Callbacks run on Emacs's thread and cannot be preempted; they
+;; should be short.
 ;; The program comes from lispm-kernel-program.el.
 
 ;;; Code:
 
 (require 'cl-lib)
+(require 'subr-x)
 
 (defconst lispm-kernel-protocol 1
   "The protocol this Lisp speaks; a kernel saying another is refused.")

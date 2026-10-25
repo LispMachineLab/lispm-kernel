@@ -12,13 +12,16 @@ kernel  (chunk 7 ((:id "…" :cwd "…" :title "…" :file "…" :mtime 1761…)
 ```
 
 What the kernel writes wakes Emacs as any process output does. Emacs takes
-it in a slice at a time, on [LispM Desktop](https://github.com/LispMachineLab/lispm-desktop)'s
-frame clock, giving way to typing. SBCL has native threads and no global
+it in a slice at a time, by timers, or on the clock of a host that has one,
+as [LispM Desktop](https://github.com/LispMachineLab/lispm-desktop)'s frame
+clock, giving way to typing. SBCL has native threads and no global
 lock, so the kernel's jobs run in parallel with each other and with Emacs. A
 kernel that crashes takes none of Emacs with it.
 
-Its first job reads the Codex and Claude Code sessions for the desktop's
-agents sidebar. It reads them as the desktop's own readers do, to the
+Its first job reads the Codex and Claude Code sessions for the editor's
+agents of [lispm-agent](https://github.com/LispMachineLab/lispm-agent), as
+LispM Desktop's agents sidebar lists them. It reads them as the agents' own
+readers do, to the
 nanosecond of each transcript's time, on several threads at once. It keeps
 what it read, so the next scan reads only transcripts that changed.
 
@@ -34,15 +37,19 @@ always. See [architecture](docs/architecture.md).
 
 In LispM Desktop, `lispm-desktop-kernel` turns both modes on: Use LispM Kernel
 in Control Panels › Kernel, or `setopt`, takes effect at once, and the
-Installer gets what is missing. Elsewhere, load `lisp/` of a checkout after
-the desktop's Lisp:
+Installer gets what is missing; the desktop takes the kernel's messages in
+on its frame clock. Elsewhere, with or without the desktop, load `lisp/` of
+a checkout after lispm-agent's Lisp:
 
 ```elisp
 (add-to-list 'load-path "/path/to/lispm-kernel/lisp")
 (require 'lispm-kernel-desktop)
-(lispm-kernel-desktop-mode 1)
+(lispm-kernel-sessions-mode 1)
 (lispm-kernel-package-mode 1)
 ```
+
+`lispm-kernel-sessions-mode` was called `lispm-kernel-desktop-mode`, a name
+that still works.
 
 Nobody has to build the program or say where it is. `lisp/lispm-kernel-program.el`
 downloads the one built for this computer from these sources, in the
@@ -50,12 +57,12 @@ background. It keeps it only when its SHA-256 is the one pinned in
 [`lisp/lispm-kernel-program-sums.eld`](lisp/lispm-kernel-program-sums.eld).
 Those checksums come with the Lisp, from this repository's signed history,
 not from the release beside the programs. Until the program is there, and
-wherever it cannot be, the desktop reads sessions itself, and the mode says
-why. `lispm-kernel-program-progress-functions` hear how far the download is,
+wherever it cannot be, the agents read sessions themselves, and the mode
+says why. `lispm-kernel-program-progress-functions` hear how far the download is,
 and `lispm-kernel-program-stop` stops it. Setting `lispm-kernel-desktop-program`
 to a file runs that one as it is.
 
-A kernel that exits is started again when the sidebar next reads sessions.
+A kernel that exits is started again when the agents next read sessions.
 One that exits within `lispm-kernel-desktop-restart-seconds` of its start is
 started again after that many seconds, twice as many each time it does so
 again, up to `lispm-kernel-desktop-restart-limit`; `M-x lispm-kernel-desktop-restart`
@@ -69,7 +76,7 @@ To build it from the sources there are instead, which needs SBCL, run
 ```
 make                # build/lispm-kernel
 make test-lisp      # the kernel's own tests, in SBCL
-make test-emacs     # Emacs and the program, with LispM Desktop beside (../lispm-desktop)
+make test-emacs     # Emacs and the program, with lispm-agent beside (../lispm-agent/lisp)
 make compile        # byte-compile the Emacs Lisp, warnings failing it
 ```
 
