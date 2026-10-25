@@ -7,8 +7,8 @@ Lisps talk in S-expressions, one per line:
 
 ```
 Emacs   (submit 7 scan-sessions (:agent codex :root "~/.codex/sessions/") :owner 1 :generation 3)
-kernel  (chunk 7 ((:id "…" :cwd "…" :title "…" :file "…" :mtime 1761…)))
-        (done 7 success (:files 55 :rows 7 :empty 48 :skipped 0 :cached 0 :truncated nil))
+kernel  (chunk 7 ((:id "…" :cwd "…" :title "…" :file "…" :mtime 1761… :turn-ended t)))
+        (done 7 success (:files 55 :rows 7 :empty 48 :skipped 0 :cached 0 :truncated nil :turn-ended t))
 ```
 
 What the kernel writes wakes Emacs as any process output does. Emacs takes
@@ -23,7 +23,11 @@ agents of [lispm-agent](https://github.com/LispMachineLab/lispm-agent), as
 LispM Desktop's agents sidebar lists them. It reads them as the agents' own
 readers do, to the
 nanosecond of each transcript's time, on several threads at once. It keeps
-what it read, so the next scan reads only transcripts that changed.
+what it read, so the next scan reads only transcripts that changed. Each
+session also says whether its agent's latest turn has ended. With that,
+lispm-agent's session picker, a terminal learning its own session, and the
+agents waiting to message a busy agent all use what the kernel read, and
+none of them reads transcripts on Emacs's thread.
 
 Its second job downloads for package.el. Even in the background, url.el
 negotiates TLS on Emacs's thread, and through a proxy it waits for each
@@ -31,7 +35,9 @@ handshake, which freezes Emacs for most of a second at a time.
 `lispm-kernel-package-mode` hands package.el's background downloads, as an
 archive refresh makes them, to the kernel. The kernel fetches them with curl
 on a thread of its own, and package.el checks and keeps what it got as
-always.
+always. It fetches the native code LispM's packages download through
+[lispm-prebuilt](https://github.com/LispMachineLab/lispm-prebuilt) too, as
+lispm-gl's module.
 
 Its third job runs programs. Emacs that runs one forks itself, a large
 process, and one it waits for, as `call-process` and `process-lines` do,

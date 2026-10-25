@@ -36,7 +36,11 @@
 ;;; after that, lines cut at either end left out.  A Codex transcript's
 ;;; first MiB, its last line cut left out too, is read only when its
 ;;; head holds no prompt: Codex may record tools and instructions over
-;;; the whole head before the first prompt.  Each transcript read is
+;;; the whole head before the first prompt.  Whether the session's
+;;; latest turn has ended is told by the last record of a turn its end
+;;; holds, as the agents' :ready read it in lispm-agents-codex.el and
+;;; lispm-agents-claude.el: its last 16 KiB, or when they hold none, its
+;;; last 256 KiB, the line the start cuts left out.  Each transcript read is
 ;;; kept with its stamp, so another scan reads only those that changed;
 ;;; a complete scan forgets those it did not see.  Transcripts are read
 ;;; on several threads at once.  Of the sessions of one id, the newest
@@ -44,9 +48,11 @@
 ;;;
 ;;; Sessions go to Emacs in chunks, lists of
 ;;;
-;;;   (:id ID :cwd CWD :title TITLE :file FILE :mtime NANOSECONDS [:started TIMESTAMP])
+;;;   (:id ID :cwd CWD :title TITLE :file FILE :mtime NANOSECONDS :turn-ended BOOLEAN
+;;;    [:started TIMESTAMP])
 ;;;
-;;; and the result is the scan's summary, a plist of counts.
+;;; and the result is the scan's summary, a plist of counts, and
+;;; :turn-ended t, which says the rows tell whether a turn ended.
 
 (in-package #:lispm-kernel/sessions)
 
@@ -59,6 +65,13 @@
 (defconstant +prompt-bytes+ (* 1024 1024)
   "Bytes from the start of a Codex transcript its first prompt is looked
 for in when its head holds none, as lispm-agent reads.")
+
+(defconstant +turn-bytes+ 16384
+  "Bytes at the end of a transcript first looked in for how its latest turn went.")
+
+(defconstant +end-bytes+ (* 256 1024)
+  "Bytes at the end of a transcript looked in for how its latest turn went
+when the last `+turn-bytes+' do not tell, as `lispm-agents-tail-bytes'.")
 
 (defparameter *max-depth* 32
   "How deep below the root Codex's tree is walked.")
@@ -84,14 +97,15 @@ for in when its head holds none, as lispm-agent reads.")
 (defparameter *threads* 4
   "Threads reading the transcripts of one scan.")
 
-(defstruct (session (:constructor make-session (id cwd title file mtime &optional started))
+(defstruct (session (:constructor make-session (id cwd title file mtime &optional started turn-ended))
                     (:copier nil))
   (id "" :type string :read-only t)
   (cwd "" :type string :read-only t)
   (title nil :type (or null string) :read-only t)
   (file "" :type string :read-only t)
   (mtime 0 :type integer :read-only t)
-  (started nil :type (or null string) :read-only t))
+  (started nil :type (or null string) :read-only t)
+  (turn-ended nil :type boolean :read-only t))
 
 ;;;; As lispm-agent reads transcripts
 
@@ -386,6 +400,54 @@ of its own directory, beside its transcript, or nil."
                   (store cache 'titles path read-stamp title))
                 (values title path))))))))
 
+;;;; How the latest turn went
+
+(defun codex-turn (object)
+  "Return :ended or :working when Codex transcript OBJECT records a turn
+ending or starting, else nil.  So `lispm-agents-codex-turn-ended-p'."
+  (when (equal (json-get object "type") "event_msg")
+    (let ((type (json-get (json-get object "payload") "type")))
+      (cond ((member type '("task_complete" "turn_complete" "turn_aborted") :test #'equal) :ended)
+            ((member type '("task_started" "turn_started") :test #'equal) :working)))))
+
+(defun interruption-p (text)
+  (and (stringp text) (prefixp "[Request interrupted by user" text)))
+
+(defun claude-turn (object)
+  "Return :ended or :working when Claude Code transcript OBJECT is a message
+of Claude's or its user's, else nil: Claude's answer, or its user's
+interruption, ends a turn.  So `lispm-agents-claude-turn-ended-p'."
+  (let ((type (json-get object "type"))
+        (message (json-get object "message")))
+    (cond ((equal type "assistant")
+           (if (member (json-get message "stop_reason") '("end_turn" "stop_sequence" "max_tokens" "refusal")
+                       :test #'equal)
+               :ended
+               :working))
+          ((equal type "user")
+           (let ((content (json-get message "content")))
+             (if (if (stringp content)
+                     (interruption-p content)
+                     (and (listp content)
+                          (some (lambda (block) (interruption-p (json-get block "text"))) content)))
+                 :ended
+                 :working))))))
+
+(defun turn-ended (agent path)
+  "Return true when the latest turn the end of AGENT's transcript PATH
+tells of has ended, false when it has not or none is told of there.
+The end is its last `+turn-bytes+', else its last `+end-bytes+': a record
+of a turn in the first is the last of the second too."
+  (let ((turn (if (eq agent :codex) #'codex-turn #'claude-turn)))
+    (flet ((look (bytes)
+             (multiple-value-bind (octets stamp cut) (read-file-octets path bytes)
+               (declare (ignore stamp))
+               (values (and octets
+                            (first-line (make-lines (octet-lines octets :drop-first cut)) turn :from-end t))
+                       cut))))
+      (multiple-value-bind (state cut) (look +turn-bytes+)
+        (eq :ended (if (or state (not cut)) state (look +end-bytes+)))))))
+
 ;;;; What is kept between scans
 
 (defstruct (cache (:constructor make-cache ()) (:copier nil))
@@ -444,11 +506,14 @@ of its own directory, beside its transcript, or nil."
 
 ;;;; Scanning
 
-(defun compact-session (session)
+(defun compact-session (session agent path)
+  "Return SESSION, of AGENT's transcript PATH, compact, with whether its
+latest turn has ended."
   (when session
     (make-session (ascii-compact (session-id session)) (ascii-compact (session-cwd session))
                   (ascii-compact (session-title session)) (ascii-compact (session-file session))
-                  (session-mtime session) (ascii-compact (session-started session)))))
+                  (session-mtime session) (ascii-compact (session-started session))
+                  (turn-ended agent path))))
 
 (defun transcript-session (cache agent path)
   "Return what transcript PATH is, (STATUS . SESSION): STATUS is :read,
@@ -467,7 +532,8 @@ of its own directory, beside its transcript, or nil."
                     (let ((session (compact-session
                                     (funcall (if (eq agent :codex) #'codex-session #'claude-session)
                                              path (make-lines head) (and tail (make-lines tail))
-                                             read-stamp))))
+                                             read-stamp)
+                                    agent path)))
                       (store cache 'transcripts path read-stamp session)
                       (cons :read session)))))))))
 
@@ -479,6 +545,7 @@ of its own directory, beside its transcript, or nil."
 (defun session-row (session title)
   (list* :id (session-id session) :cwd (session-cwd session) :title (truncate-title title)
          :file (session-file session) :mtime (session-mtime session)
+         :turn-ended (session-turn-ended session)
          (and (session-started session) (list :started (session-started session)))))
 
 (defun row-length (row)
@@ -516,7 +583,7 @@ in the order each id first comes, as lispm-agent's hash table has them."
 
 (defun scan (agent root &key index (emit #'emit))
   "Find AGENT's sessions below ROOT, give them to EMIT in chunks and return
-the summary (:files :rows :empty :skipped :cached :truncated).
+the summary (:files :rows :empty :skipped :cached :truncated :turn-ended t).
 AGENT is :codex or :claude; INDEX is Codex's session index, if any.
 Signal an error when ROOT is no directory that can be listed."
   (let* ((root (normalize-root root))
@@ -562,7 +629,7 @@ Signal an error when ROOT is no directory that can be listed."
                             (newest-per-id pairs))))
           (emit-rows rows emit)
           (list :files (length files) :rows (length rows) :empty empty :skipped skipped
-                :cached from-cache :truncated (and truncated t)))))))
+                :cached from-cache :truncated (and truncated t) :turn-ended t))))))
 
 (define-job (scan-sessions :class :io) (input)
   "Find the sessions of INPUT's :agent, codex or claude, below its :root,

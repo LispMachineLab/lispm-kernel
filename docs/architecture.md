@@ -130,8 +130,20 @@ agents' own way.
 editor's agents session readers that answer at once with what the kernel
 read last, or `pending`. They have it read again once that is older than
 `lispm-kernel-desktop-cache-seconds`, or when the agents' list reads
-sessions anew. The session picker and every other caller keep the agents'
-own readers. A remote or missing root is read the agents' own way. A kernel that
+sessions anew. Each session also says whether its latest turn had ended
+(`:turn-ended`), read from the transcript's end as lispm-agent's `:ready`
+reads it: its last 16 KiB, or its last 256 KiB when those hold no record
+of a turn. The same readings answer three more callers in lispm-agent.
+`lispm-agents-session-lookup-functions` looks a session up, for its
+transcript and its turn, when the agents bridge asks whether an agent is
+free for a message; it never waits and never reads the agents' own way.
+`lispm-agents-read-sessions-function` lists every session. A terminal
+learning its session takes a reading of any age and is told when a newer
+one comes. The session picker takes one no older than the cache, waiting
+up to `lispm-kernel-desktop-wait-seconds` for the kernel to read anew.
+Only readings that say whether turns ended are used there: an older
+kernel's may lack sessions lispm-agent lists. A remote or missing root
+is read the agents' own way. A kernel that
 exits is started again when a reader is next asked, unless it ran shorter
 than `lispm-kernel-desktop-restart-seconds`; then it is not started again
 until the mode is turned on anew.
@@ -154,6 +166,14 @@ checks the signatures and keeps the archives as always. The others go to
 url.el: downloads package.el waits for, files, URLs url.el would reach
 through SOCKS or a gateway of its own, and every download while no such
 kernel runs.
+
+The mode advises `lispm-prebuilt-fetch-function` too, through which
+[lispm-prebuilt](https://github.com/LispMachineLab/lispm-prebuilt)
+downloads the native code of LispM's packages in the background: a
+module, as lispm-gl's, or a program, as lispm-doom's engine. The kernel
+fetches it through the proxy url.el would use, and lispm-prebuilt checks
+it against the SHA-256 its package pins. What the kernel cannot fetch
+lispm-prebuilt downloads with curl itself.
 
 ## Programs
 

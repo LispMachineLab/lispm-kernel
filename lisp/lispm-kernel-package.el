@@ -42,6 +42,11 @@
 ;; of its own, and all of them while no kernel that knows the job runs,
 ;; as before its program is there, url.el downloads as it does without
 ;; the mode.
+;;
+;; The native code LispM's packages download, through lispm-prebuilt, a
+;; module or a program of theirs, goes to the kernel too: the mode advises
+;; `lispm-prebuilt-fetch-function' alike, leaving to it what the kernel
+;; cannot fetch.
 
 ;;; Code:
 
@@ -50,6 +55,8 @@
 (require 'url-parse)
 
 (defvar url-gateway-method)
+(defvar lispm-kernel-package-mode)
+(defvar lispm-prebuilt-fetch-function)
 (declare-function url-do-setup "url" ())
 (declare-function url-expand-file-name "url-expand" (url &optional default))
 (declare-function url-find-proxy-for-url "url-proxy" (url host))
@@ -142,19 +149,62 @@ NOERROR."
         (error (ignore-errors (delete-file target))
                (apply original url body keys))))))
 
+;;;; lispm-prebuilt's downloads
+
+(cl-defun lispm-kernel-package--prebuilt-fetch (original url file callback &rest keys
+                                                         &key timeout &allow-other-keys)
+  "Have the kernel fetch URL into FILE, then call CALLBACK with nil, or
+with why it failed; else leave it to ORIGINAL, a
+`lispm-prebuilt-fetch-function', with KEYS.  TIMEOUT is in seconds."
+  (let* ((runtime (and (string-match-p "\\`https?:" url) (lispm-kernel-package--runtime)))
+         (route (and runtime (lispm-kernel-package--proxy url)))
+         (timeout (min 3600 (max 1 (or timeout lispm-kernel-package-timeout)))))
+    (if (not route)
+        (apply original url file callback keys)
+      (condition-case nil
+          (lispm-kernel-submit
+           runtime 'fetch (list :url url :file (expand-file-name file) :proxy (cadr route) :timeout timeout)
+           :owner lispm-kernel-package--owner
+           ;; The kernel's own deadline comes first, curl's then its.
+           :timeout (+ timeout 10)
+           :on-result (lambda (kind value)
+                        (pcase kind
+                          ('chunk nil)
+                          ('success (funcall callback nil))
+                          ;; Turned away, as when full: as without the kernel.
+                          ('rejected (apply original url file callback keys))
+                          (_ (ignore-errors (delete-file file))
+                             (funcall callback (format "Could not download %s: %s" url
+                                                       (or value kind)))))))
+        ;; The kernel went away meanwhile.
+        (error (apply original url file callback keys))))))
+
+(defun lispm-kernel-package--advise-prebuilt ()
+  "Advise `lispm-prebuilt-fetch-function' while the mode is on and it is there."
+  (when (and lispm-kernel-package-mode (boundp 'lispm-prebuilt-fetch-function))
+    (add-function :around lispm-prebuilt-fetch-function #'lispm-kernel-package--prebuilt-fetch)))
+
 ;;;###autoload
 (define-minor-mode lispm-kernel-package-mode
-  "Have the kernel make the downloads package.el makes in the background.
+  "Have the kernel make the downloads package.el makes in the background,
+and those of LispM's packages' native code, through lispm-prebuilt.
 The kernel is the one `lispm-kernel-package-runtime-function' returns,
 by default the agents' while `lispm-kernel-sessions-mode' runs it; while
-none that knows the `fetch' job runs, url.el downloads, as without the
-mode.  package.el checks and keeps what is fetched as it always does."
+none that knows the `fetch' job runs, url.el downloads, and lispm-prebuilt
+runs curl, as without the mode.  package.el checks and keeps what is
+fetched as it always does, and lispm-prebuilt checks it against its pins."
   :global t :group 'lispm-kernel
   (if lispm-kernel-package-mode
-      (advice-add 'package--with-response-buffer-1 :around
-                  #'lispm-kernel-package--with-response-buffer)
+      (progn
+        (advice-add 'package--with-response-buffer-1 :around
+                    #'lispm-kernel-package--with-response-buffer)
+        (if (boundp 'lispm-prebuilt-fetch-function)
+            (lispm-kernel-package--advise-prebuilt)
+          (with-eval-after-load 'lispm-prebuilt (lispm-kernel-package--advise-prebuilt))))
     (advice-remove 'package--with-response-buffer-1
-                   #'lispm-kernel-package--with-response-buffer)))
+                   #'lispm-kernel-package--with-response-buffer)
+    (when (boundp 'lispm-prebuilt-fetch-function)
+      (remove-function lispm-prebuilt-fetch-function #'lispm-kernel-package--prebuilt-fetch))))
 
 (provide 'lispm-kernel-package)
 ;;; lispm-kernel-package.el ends here

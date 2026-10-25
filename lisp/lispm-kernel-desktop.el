@@ -29,12 +29,24 @@
 ;; (`lispm-agents-add-session-reader'): they answer with what the kernel
 ;; read last, or `pending' before that, and have it read again in the
 ;; background once that is older than `lispm-kernel-desktop-cache-seconds'
-;; or the agents' list reads sessions anew.  Every other caller, the
-;; session picker among them, keeps the agents' own readers.  The
-;; kernel's messages are taken in by timers, or by the host's
+;; or the agents' list reads sessions anew.  The kernel also tells whether
+;; each session's latest turn has ended (:turn-ended), and what it read
+;; answers:
+;;
+;; - looking a session up, as for a terminal waiting to be given a
+;;   message (`lispm-agents-session-lookup-functions'), reading again
+;;   when it is stale but never waiting, nor reading itself;
+;; - the list of every session a terminal learns its session from,
+;;   however old, `lispm-agents-sessions-arrived' telling when a newer
+;;   one comes, and the session picker's, at most that old, waiting
+;;   `lispm-kernel-desktop-wait-seconds' at most for one, else read the
+;;   agents' own way (`lispm-agents-read-sessions-function').
+;;
+;; The kernel's messages are taken in by timers, or by the host's
 ;; `lispm-kernel-scheduler', as LispM Desktop's frame clock.  Nothing is
-;; advised.  The library keeps its name, and its options theirs, from
-;; when LispM Desktop held the agents.
+;; advised but that function variable, which is there for it.  The
+;; library keeps its name, and its options theirs, from when LispM
+;; Desktop held the agents.
 ;;
 ;; The program is the one `lispm-kernel-desktop-program' names, else the
 ;; one lispm-kernel-program.el downloads and checks, or builds when asked
@@ -56,6 +68,7 @@
 (defvar lispm-agents-codex-index-file)
 (defvar lispm-agents-claude-projects-directory)
 (defvar lispm-agents-reread-sessions-hook)
+(defvar lispm-agents-read-sessions-function)
 (declare-function lispm-agents-add-session-reader "ext:lispm-agents" (agent reader))
 (declare-function lispm-agents-remove-session-reader "ext:lispm-agents" (agent))
 (declare-function lispm-agents-sessions-arrived "ext:lispm-agents" ())
@@ -71,6 +84,11 @@ downloaded or built."
 
 (defcustom lispm-kernel-desktop-cache-seconds 2
   "Seconds what the kernel read is shown before a reader has it read again."
+  :type 'number :group 'lispm-kernel)
+
+(defcustom lispm-kernel-desktop-wait-seconds 1
+  "Seconds a list of every session, as the session picker's, waits for the
+kernel to read them anew, before the agents' own reader reads them."
   :type 'number :group 'lispm-kernel)
 
 (defcustom lispm-kernel-desktop-scan-timeout 60
@@ -101,9 +119,10 @@ root and index, and their own reader.")
 (defvar lispm-kernel-desktop--runtime nil)
 
 (defvar lispm-kernel-desktop--cache (make-hash-table :test #'eq)
-  "Per agent, a plist (:root :generation :sessions :known :time :request
-:started :retry-timer).  :known is non-nil once sessions were read, :time
-is when, nil when they must be read anew.")
+  "Per agent, a plist (:root :generation :sessions :known :time :turns
+:request :started :retry-timer).  :known is non-nil once sessions were
+read, :time is when, nil when they must be read anew; :turns is non-nil
+when the kernel read them, saying whether their latest turn ended.")
 
 (defvar lispm-kernel-desktop-last-error nil
   "Why the kernel could not read sessions last, or nil.")
@@ -288,10 +307,15 @@ Return the entry, or nil when its generation has moved on."
          ((plist-get summary :rejected)
           (lispm-kernel-desktop--update agent generation :request nil))
          (t
-          (lispm-kernel-desktop--update
-           agent generation :request nil :time (float-time) :known t
-           :sessions (if (plist-get summary :error) (plist-get entry :sessions) sessions))
-          (lispm-agents-sessions-arrived)))))))
+          (let ((known (plist-get entry :known))
+                (old (plist-get entry :sessions))
+                (sessions (if (plist-get summary :error) (plist-get entry :sessions) sessions)))
+            (lispm-kernel-desktop--update
+             agent generation :request nil :time (float-time) :known t
+             :turns (plist-get summary :turn-ended) :sessions sessions)
+            ;; Read again as they were, they need not be drawn again.
+            (unless (and known (equal sessions old))
+              (lispm-agents-sessions-arrived)))))))))
 
 (defun lispm-kernel-desktop--scan (runtime agent)
   "Have RUNTIME's kernel read AGENT's sessions in the background."
@@ -343,6 +367,88 @@ missing root, or no kernel running, is read the agents' own way."
             (copy-sequence (plist-get entry :sessions))
           'pending)))))
 
+(defun lispm-kernel-desktop--fresh (agent &optional since)
+  "Return AGENT's cache entry when it holds sessions the kernel read since
+SINCE, a `float-time', by default `lispm-kernel-desktop-cache-seconds'
+ago, saying whether their latest turn ended, else nil.  A kernel older
+than this Lisp says nothing of turns: what it read may want sessions
+lispm-agent reads."
+  (let ((entry (gethash agent lispm-kernel-desktop--cache)))
+    (and (plist-get entry :known)
+         (plist-get entry :turns)
+         (plist-get entry :time)
+         (>= (plist-get entry :time) (or since (- (float-time) lispm-kernel-desktop-cache-seconds)))
+         entry)))
+
+(defun lispm-kernel-desktop--read-lately (agent)
+  "Return AGENT's cache entry when it holds sessions the kernel read, of
+any age, see `lispm-kernel-desktop--fresh', `pending' before the first
+such, or nil.  A stale reading starts another, which says so when it
+comes, see `lispm-agents-sessions-arrived'."
+  (let ((root (lispm-kernel-desktop--value agent :root))
+        (runtime (lispm-kernel-desktop-runtime)))
+    (when (and runtime (stringp root) (not (file-remote-p root)) (file-directory-p root))
+      (let ((entry (lispm-kernel-desktop--entry runtime agent root)))
+        (when (lispm-kernel-desktop--stale-p entry)
+          (lispm-kernel-desktop--scan runtime agent))
+        (or (lispm-kernel-desktop--fresh agent 0)
+            (and (not (plist-get (gethash agent lispm-kernel-desktop--cache) :known))
+                 'pending))))))
+
+(defun lispm-kernel-desktop--read-now (agent)
+  "Return AGENT's cache entry once it holds a fresh reading, see
+`lispm-kernel-desktop--fresh', else waiting for the kernel to read them
+anew, at most `lispm-kernel-desktop-wait-seconds'; nil when none comes.
+While it waits, only the kernel's messages are taken in, no timer
+running."
+  (let ((root (lispm-kernel-desktop--value agent :root))
+        (runtime (lispm-kernel-desktop-runtime)))
+    (when (and runtime (stringp root) (not (file-remote-p root)) (file-directory-p root))
+      (let ((entry (lispm-kernel-desktop--entry runtime agent root)))
+        (or (lispm-kernel-desktop--fresh agent)
+            ;; Not while the kernel's messages are taken in: none more would be.
+            (unless (lispm-kernel-runtime-dispatching runtime)
+              (when (lispm-kernel-desktop--stale-p entry)
+                (lispm-kernel-desktop--scan runtime agent))
+              (let* ((since (float-time))
+                     (deadline (+ since lispm-kernel-desktop-wait-seconds))
+                     (process (lispm-kernel-runtime-process runtime))
+                     request)
+                (while (and (not (lispm-kernel-desktop--fresh agent since))
+                            (integerp (setq request (plist-get (gethash agent lispm-kernel-desktop--cache)
+                                                               :request)))
+                            (gethash request (lispm-kernel-runtime-requests runtime))
+                            (lispm-kernel-live-p runtime)
+                            (< (float-time) deadline))
+                  (accept-process-output process 0.01 nil 1)
+                  (lispm-kernel-dispatch runtime))
+                (lispm-kernel-desktop--fresh agent since))))))))
+
+(defun lispm-kernel-desktop--current (read agent sessions &optional recent)
+  "Return AGENT's sessions as the kernel read them lately, else as READ,
+the function this wraps, reads them with SESSIONS, AGENT's :sessions.
+When RECENT, what it read a while ago will do, or none while it reads
+them first, see `lispm-kernel-desktop--read-lately'; else what it read
+last if fresh, see `lispm-kernel-desktop--read-now'.  This is around
+`lispm-agents-read-sessions-function' while the mode is on."
+  (pcase (and (assq agent lispm-kernel-desktop--agents)
+              (if recent
+                  (lispm-kernel-desktop--read-lately agent)
+                (lispm-kernel-desktop--read-now agent)))
+    ('pending nil)
+    ('nil (funcall read agent sessions recent))
+    (entry (copy-sequence (plist-get entry :sessions)))))
+
+(defun lispm-kernel-desktop--lookup (agent id)
+  "Return AGENT's session ID as the kernel read it last, or nil.
+A stale reading starts another; none is waited for, nor read the
+agents' own way.  This is on `lispm-agents-session-lookup-functions'."
+  (when (assq agent lispm-kernel-desktop--agents)
+    (let ((entry (lispm-kernel-desktop--read-lately agent)))
+      (when (consp entry)
+        (seq-find (lambda (session) (equal (plist-get session :id) id))
+                  (plist-get entry :sessions))))))
+
 (defun lispm-kernel-desktop-invalidate ()
   "Read the sessions anew: supersede readings under way, keep showing the old.
 This is on `lispm-agents-reread-sessions-hook'."
@@ -371,6 +477,9 @@ This is on `lispm-agents-reread-sessions-hook'."
     (let ((agent (car spec)))
       (lispm-agents-add-session-reader
        agent (lambda () (lispm-kernel-desktop--read agent)))))
+  (when (boundp 'lispm-agents-read-sessions-function)
+    (add-function :around lispm-agents-read-sessions-function #'lispm-kernel-desktop--current))
+  (add-hook 'lispm-agents-session-lookup-functions #'lispm-kernel-desktop--lookup)
   (add-hook 'lispm-agents-reread-sessions-hook #'lispm-kernel-desktop-invalidate))
 
 (defun lispm-kernel-desktop--unavailable ()
@@ -413,6 +522,9 @@ program is built or downloaded; signal when impossible."
   (when (fboundp 'lispm-agents-remove-session-reader)
     (dolist (spec lispm-kernel-desktop--agents)
       (lispm-agents-remove-session-reader (car spec))))
+  (when (boundp 'lispm-agents-read-sessions-function)
+    (remove-function lispm-agents-read-sessions-function #'lispm-kernel-desktop--current))
+  (remove-hook 'lispm-agents-session-lookup-functions #'lispm-kernel-desktop--lookup)
   (remove-hook 'lispm-agents-reread-sessions-hook #'lispm-kernel-desktop-invalidate)
   (when lispm-kernel-desktop--runtime
     (lispm-kernel-stop lispm-kernel-desktop--runtime))

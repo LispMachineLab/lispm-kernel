@@ -39,6 +39,7 @@
 ;; replace the fakes, and undoing a fake would then unbind the real ones.
 (require 'lispm-agents)
 (defvar lispm-kernel-test-program)
+(defvar lispm-agents-session-lookup-functions)
 
 (defvar lispm-kernel-desktop-test--readers nil
   "Readers the faked desktop registry holds, an alist (AGENT . READER).")
@@ -121,7 +122,8 @@ under test, then turn the mode off."
      (expand-file-name "rollout-4.jsonl" day)
      '(:type "session_meta" :payload (:id "four" :cwd "/w/four"))
      (list :type "event_msg" :payload (list :type "user_message"
-                                            :message (concat "Unicode " (string #xe9 #x3bb #x1f600)))))
+                                            :message (concat "Unicode " (string #xe9 #x3bb #x1f600))))
+     '(:type "event_msg" :payload (:type "task_complete")))
     ;; Past the first MiB: the prompt of five is in its tail, six's before it.
     (let ((padding (concat "{\"type\":\"response_item\",\"payload\":{\"type\":\"reasoning\",\"x\":\""
                            (make-string 60 ?.) "\"}}")))
@@ -147,7 +149,8 @@ under test, then turn the mode off."
   (lispm-kernel-desktop-test--write
    (expand-file-name "project/a.jsonl" directory)
    '(:type "user" :cwd "/c/a" :isMeta t :message (:content "ignore me"))
-   '(:type "user" :cwd "/c/a" :message (:content [(:text "hello ") (:text "there")])))
+   '(:type "user" :cwd "/c/a" :message (:content [(:text "hello ") (:text "there")]))
+   '(:type "assistant" :message (:stop_reason "end_turn")))
   (apply #'lispm-kernel-desktop-test--write
          (expand-file-name "project/b.jsonl" directory)
          '(:type "user" :cwd "/c/b" :message (:content "early"))
@@ -167,6 +170,22 @@ under test, then turn the mode off."
    (expand-file-name ".other/e.jsonl" directory)
    '(:type "user" :cwd "/c/e" :message (:content "<command-name>"))
    '(:type "summary" :summary "Only a summary")))
+
+(defun lispm-kernel-desktop-test--turns-dropped (sessions)
+  "Check that each of SESSIONS, as the kernel read them, says whether its
+latest turn ended as lispm-agent's :ready reads it; return them without."
+  (mapcar (lambda (session)
+            (should (plist-member session :turn-ended))
+            (should (eq (plist-get session :turn-ended)
+                        (and (funcall (if (eq (plist-get session :agent) 'codex)
+                                          #'lispm-agents-codex-turn-ended-p
+                                        #'lispm-agents-claude-turn-ended-p)
+                                      (lispm-agents-read-json-tail (plist-get session :file)))
+                             t)))
+            (let ((copy (copy-sequence session)))
+              (cl-remf copy :turn-ended)
+              copy))
+          sessions))
 
 (defun lispm-kernel-desktop-test--sorted (sessions)
   "Return SESSIONS sorted by file, as the desktop compares them."
@@ -212,14 +231,19 @@ under test, then turn the mode off."
       (should-not lispm-kernel-scheduler)
       (dolist (agent '(codex claude))
         (should (eq (lispm-kernel-desktop-test--read agent) 'pending))
-        (let ((sessions (lispm-kernel-desktop-test--read-until-known agent))
-              (reference (funcall (if (eq agent 'codex)
-                                      #'lispm-agents-codex-sessions
-                                    #'lispm-agents-claude-sessions))))
+        (let* ((read (lispm-kernel-desktop-test--read-until-known agent))
+               (sessions (lispm-kernel-desktop-test--turns-dropped read))
+               (reference (funcall (if (eq agent 'codex)
+                                       #'lispm-agents-codex-sessions
+                                     #'lispm-agents-claude-sessions))))
           ;; As the sidebar draws them, those of one time in one order too.
           (should (equal (lispm-agents--sort-sessions sessions)
                          (lispm-agents--sort-sessions reference)))
-          (should (= (length sessions) (if (eq agent 'codex) 5 4)))))
+          (should (= (length sessions) (if (eq agent 'codex) 5 4)))
+          ;; One turn ended, others not.
+          (should (equal (mapcar (lambda (session) (plist-get session :id))
+                                 (seq-filter (lambda (session) (plist-get session :turn-ended)) read))
+                         (if (eq agent 'codex) '("four") '("a"))))))
       (should (> lispm-kernel-desktop-test--arrived 0))
       (should-not lispm-kernel-desktop-last-error))))
 
@@ -370,8 +394,91 @@ restart command starts a running kernel anew."
         (should (eq (lispm-kernel-desktop-test--read 'claude) 'pending))
         (should-not (eq runtime lispm-kernel-desktop--runtime))
         (should (lispm-kernel-live-p lispm-kernel-desktop--runtime))
-        (should (equal (lispm-kernel-desktop-test--sorted (lispm-kernel-desktop-test--read-until-known 'claude))
+        (should (equal (lispm-kernel-desktop-test--sorted
+                        (lispm-kernel-desktop-test--turns-dropped
+                         (lispm-kernel-desktop-test--read-until-known 'claude)))
                        (lispm-kernel-desktop-test--sorted reference)))))))
+
+(ert-deftest lispm-kernel-desktop-lists-every-session-from-a-new-reading ()
+  "Lists of every session take what the kernel read lately, waiting for it
+to read anew when that is stale; those that may be a while old take
+what it read, or none while it reads first.  Other agents, and readings
+of a kernel that says nothing of turns, are the agents' own."
+  (skip-unless (boundp 'lispm-agents-read-sessions-function))
+  (lispm-kernel-desktop-test--with-trees
+    (lispm-kernel-desktop-test--with-desktop
+      (let ((own (lambda () (error "The agents' own reader was asked"))))
+        (lispm-kernel-sessions-mode 1)
+        (should-not (funcall lispm-agents-read-sessions-function 'claude own t))
+        (should (equal (lispm-kernel-desktop-test--sorted
+                        (lispm-kernel-desktop-test--turns-dropped
+                         (funcall lispm-agents-read-sessions-function 'claude own)))
+                       (lispm-kernel-desktop-test--sorted (lispm-agents-claude-sessions))))
+        (lispm-kernel-desktop-test--write
+         (expand-file-name "project/f.jsonl" lispm-agents-claude-projects-directory)
+         '(:type "user" :cwd "/c/f" :message (:content "new one")))
+        (let ((lispm-kernel-desktop-cache-seconds 0))
+          (should (= (length (funcall lispm-agents-read-sessions-function 'claude own t)) 4))
+          (should (= (length (funcall lispm-agents-read-sessions-function 'claude own)) 5)))
+        (should (eq (funcall lispm-agents-read-sessions-function 'hermes (lambda () 'own)) 'own))
+        (setf (plist-get (gethash 'claude lispm-kernel-desktop--cache) :turns) nil)
+        (should (eq (funcall lispm-agents-read-sessions-function 'claude (lambda () 'own)) 'own))
+        (lispm-kernel-sessions-mode -1)
+        (should (eq lispm-agents-read-sessions-function #'lispm-agents-read-sessions))))))
+
+(ert-deftest lispm-kernel-desktop-looks-sessions-up-without-reading ()
+  "A session is looked up in what the kernel read, saying whether its turn
+ended; nothing is read the agents' own way, nor waited for."
+  (lispm-kernel-desktop-test--with-trees
+    (lispm-kernel-desktop-test--with-desktop
+      (let ((lispm-agents-session-lookup-functions nil))
+        (lispm-kernel-sessions-mode 1)
+        (should (memq #'lispm-kernel-desktop--lookup lispm-agents-session-lookup-functions))
+        (cl-letf (((symbol-function 'lispm-agents-claude-sessions)
+                   (lambda () (error "Read the agents' own way"))))
+          ;; Asked before the first reading: unknown, and it is read.
+          (should-not (lispm-kernel-desktop--lookup 'claude "a"))
+          (should (integerp (plist-get (gethash 'claude lispm-kernel-desktop--cache) :request)))
+          (should (lispm-kernel-test--wait
+                   lispm-kernel-desktop--runtime
+                   (lambda () (plist-get (gethash 'claude lispm-kernel-desktop--cache) :known))))
+          (let ((session (lispm-kernel-desktop--lookup 'claude "a")))
+            (should (equal (plist-get session :file)
+                           (expand-file-name "project/a.jsonl" lispm-agents-claude-projects-directory)))
+            (should (eq (plist-get session :turn-ended) t)))
+          (should-not (lispm-kernel-desktop--lookup 'claude "none"))
+          (should-not (lispm-kernel-desktop--lookup 'hermes "a"))
+          ;; No kernel running: nothing known.
+          (cl-letf (((symbol-function 'lispm-kernel-desktop-runtime) #'ignore))
+            (should-not (lispm-kernel-desktop--lookup 'claude "a"))))
+        (lispm-kernel-sessions-mode -1)
+        (should-not lispm-agents-session-lookup-functions)))))
+
+(ert-deftest lispm-kernel-desktop-tells-only-of-new-sessions ()
+  "Sessions read again as they were are not drawn again."
+  (lispm-kernel-desktop-test--with-trees
+    (lispm-kernel-desktop-test--with-desktop
+      (lispm-kernel-sessions-mode 1)
+      (lispm-kernel-desktop-test--read-until-known 'claude)
+      (let ((arrived lispm-kernel-desktop-test--arrived)
+            (lispm-kernel-desktop-cache-seconds 0))
+        (cl-flet ((read-again ()
+                    (lispm-kernel-desktop-test--read 'claude)
+                    (should (lispm-kernel-test--wait
+                             lispm-kernel-desktop--runtime
+                             (lambda () (null (plist-get (gethash 'claude lispm-kernel-desktop--cache)
+                                                         :request)))))))
+          (read-again)
+          (should (= lispm-kernel-desktop-test--arrived arrived))
+          (lispm-kernel-desktop-test--write
+           (expand-file-name "project/a.jsonl" lispm-agents-claude-projects-directory)
+           '(:type "user" :cwd "/c/a" :message (:content "hello there"))
+           '(:type "assistant" :message (:stop_reason "tool_use")))
+          (read-again)
+          (should (= lispm-kernel-desktop-test--arrived (1+ arrived)))
+          (should-not (plist-get (seq-find (lambda (session) (equal (plist-get session :id) "a"))
+                                           (lispm-kernel-desktop-test--read 'claude))
+                                 :turn-ended)))))))
 
 (ert-deftest lispm-kernel-desktop-falls-back-when-the-kernel-cannot-read ()
   (lispm-kernel-desktop-test--with-trees

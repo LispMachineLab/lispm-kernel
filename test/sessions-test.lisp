@@ -121,13 +121,13 @@
         (is (equal '("a" "b" "e" "y") (mapcar (lambda (row) (getf row :id)) rows)))
         (is (equal (list :id "a" :cwd "/p/a" :title "Named A"
                          :file (path root "2026/10/22/rollout-a-fork.jsonl")
-                         :mtime (* 1700000100 1000000000) :started "2026-10-22T02:00:00Z")
+                         :mtime (* 1700000100 1000000000) :turn-ended nil :started "2026-10-22T02:00:00Z")
                    (row "a" rows)))
         (is (string= "hello b" (getf (row "b" rows) :title)))
         (is (string= "Named E" (getf (row "e" rows) :title)))
         (is (string= "linked y" (getf (row "y" rows) :title)))
         (is (string= (path root "2026/rollout-link.jsonl") (getf (row "y" rows) :file)))
-        (is (equal '(:files 9 :rows 4 :empty 2 :skipped 2 :cached 0 :truncated nil) summary)))
+        (is (equal '(:files 9 :rows 4 :empty 2 :skipped 2 :cached 0 :truncated nil :turn-ended t) summary)))
       ;; Without the index, sessions are titled by their prompts, or left out.
       (let ((rows (scan-rows :codex root)))
         (is (equal '("a" "b" "y") (mapcar (lambda (row) (getf row :id)) rows)))
@@ -218,18 +218,75 @@
       (multiple-value-bind (rows summary) (scan-rows :claude root)
         (is (equal '("s1" "s2" "s3" "s5" "s6" "s8") (mapcar (lambda (row) (getf row :id)) rows)))
         (is (equal (list :id "s1" :cwd "/c/one" :title "first prompt" :file (path root "proj/s1.jsonl")
-                         :mtime (stamp-mtime (file-stamp (path root "proj/s1.jsonl"))))
+                         :mtime (stamp-mtime (file-stamp (path root "proj/s1.jsonl"))) :turn-ended nil)
                    (row "s1" rows)))
         (is (string= "Late summary" (getf (row "s2" rows) :title)))
         (is (string= "From file" (getf (row "s3" rows) :title)))
         (is (string= "hidden" (getf (row "s5" rows) :title)))
         (is (string= (path root "linkedproj/s6.jsonl") (getf (row "s6" rows) :file)))
         (is (string= "Chosen 8" (getf (row "s8" rows) :title)))
-        (is (equal '(:files 7 :rows 6 :empty 1 :skipped 0 :cached 0 :truncated nil) summary)))
+        (is (equal '(:files 7 :rows 6 :empty 1 :skipped 0 :cached 0 :truncated nil :turn-ended t) summary)))
       (write-file (path root "proj/s3/custom-title.json") "{\"customTitle\": \"Renamed\"}")
       (multiple-value-bind (rows summary) (scan-rows :claude root)
         (is (string= "Renamed" (getf (row "s3" rows) :title)))
         (is (eql 7 (getf summary :cached)))))))
+
+(defun claude-said (stop-reason)
+  (format nil "{\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"stop_reason\":~A,\"content\":[{\"type\":\"text\",\"text\":\"done\"}]}}"
+          (if stop-reason (json-string stop-reason) "null")))
+
+(defun codex-event (type)
+  (format nil "{\"type\":\"event_msg\",\"payload\":{\"type\":~A}}" (json-string type)))
+
+(defun system-lines (count)
+  "Return COUNT records that tell of no turn, a hundred bytes each."
+  (loop repeat count
+        collect (format nil "{\"type\":\"system\",\"x\":\"~A\"}" (make-string 77 :initial-element #\y))))
+
+(deftest sessions-turn-ended ()
+  (lispm-kernel/sessions:clear-caches)
+  (with-directory (directory)
+    (let ((root (path directory "projects")))
+      (flet ((claude (name &rest lines)
+               (apply #'write-file (path root (format nil "p/~A.jsonl" name))
+                      (claude-user "prompt" :cwd "/c") lines)))
+        (claude "answered" (claude-said "tool_use") (claude-user "result") (claude-said "end_turn"))
+        (claude "working" (claude-said "end_turn") (claude-user "next") (claude-said "tool_use"))
+        (claude "asked" (claude-said "end_turn") (claude-user "next"))
+        (claude "interrupted" (claude-said "tool_use") (claude-user "[Request interrupted by user]"))
+        (claude "interrupted-text"
+                "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"[Request interrupted by user for tool use]\"}}")
+        (claude "unknown-reason" (claude-said nil))
+        (claude "then-system" (claude-said "max_tokens") "{\"type\":\"system\",\"subtype\":\"turn_duration\"}")
+        ;; Past the last 16 KiB, within the last 256 KiB.
+        (apply #'claude "far" (claude-said "end_turn") (system-lines 200))
+        ;; Past the last 256 KiB: as good as none.
+        (apply #'claude "too-far" (claude-said "end_turn") (system-lines 2700))
+        ;; Its answer cut by the start of the last 16 KiB.
+        (claude "long-answer" (claude-said "tool_use")
+                (format nil "{\"type\":\"assistant\",\"pad\":\"~A\",\"message\":{\"stop_reason\":\"end_turn\"}}"
+                        (make-string 20000 :initial-element #\z))
+                (first (system-lines 1))))
+      (let ((rows (scan-rows :claude root)))
+        (is (equal '(("answered" t) ("asked" nil) ("far" t) ("interrupted" t) ("interrupted-text" t)
+                     ("long-answer" t) ("then-system" t) ("too-far" nil) ("unknown-reason" nil)
+                     ("working" nil))
+                   (mapcar (lambda (row) (list (getf row :id) (getf row :turn-ended))) rows))))
+      ;; A turn begun after one ended is seen at the next scan.
+      (write-file (path root "p/answered.jsonl")
+                  (claude-user "prompt" :cwd "/c") (claude-said "end_turn") (claude-user "more"))
+      (is (eq nil (getf (row "answered" (scan-rows :claude root)) :turn-ended))))
+    (let ((root (path directory "sessions")))
+      (flet ((codex (name &rest events)
+               (apply #'write-file (path root (format nil "2026/10/25/rollout-~A.jsonl" name))
+                      (codex-meta name "/p") (codex-typed "go") (mapcar #'codex-event events))))
+        (codex "complete" "task_started" "agent_message" "task_complete" "token_count")
+        (codex "started" "task_complete" "task_started" "agent_message")
+        (codex "aborted" "turn_started" "turn_aborted")
+        (codex "none" "agent_message"))
+      (let ((rows (scan-rows :codex root)))
+        (is (equal '(("aborted" t) ("complete" t) ("none" nil) ("started" nil))
+                   (mapcar (lambda (row) (list (getf row :id) (getf row :turn-ended))) rows)))))))
 
 (deftest sessions-lines-emacs-refuses ()
   (lispm-kernel/sessions:clear-caches)
