@@ -88,16 +88,20 @@ waiting hears `lost`.
 
 ## Sessions
 
-`src/sessions.lisp` reads the agents' sessions as LispM Desktop's own
-readers do: `lispm-desktop-agent-codex.el`, `lispm-desktop-agent-claude.el`
-and `lispm-desktop-ai.el` are its reference, and `test/lispm-kernel-desktop-test.el`
-checks it against them.
+`src/sessions.lisp` reads the agents' sessions as the editor's agents'
+own readers do, which lispm-agent holds since they left LispM Desktop:
+`lispm-agents-codex.el`, `lispm-agents-claude.el` and `lispm-agents.el`
+are its reference, and `test/lispm-kernel-desktop-test.el` checks it
+against them.
 
 - Codex: `rollout-*.jsonl`, any case, below the root; symbolic links to
   directories are not followed. A session is its head's first
-  `session_meta`, titled by the head's first prompt a person typed, or
-  by its thread name in Codex's session index, which wins. Untitled
-  sessions are left out.
+  `session_meta`, titled by the first prompt a person typed in its head,
+  else in its first MiB, else in its tail, or by its thread name in
+  Codex's session index, which wins. Untitled sessions are left out.
+  Codex may record tools and instructions over the whole head before
+  the first prompt, so the first MiB is read when the head holds none,
+  its last line cut left out.
 - Claude Code: `PROJECT/*.jsonl`. A session is named by its file and
   titled by the last custom title or summary of its head and tail, else
   by the head's first prompt, or by the `custom-title.json` beside it,

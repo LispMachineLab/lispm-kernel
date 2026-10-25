@@ -251,8 +251,8 @@ stamp; return nil without running it when PATH is none."
 stamp, or nil when it is none or cannot be read.
 The head is the first HEAD-BYTES, its last line left out when the file
 goes on; the tail, read only when the file is longer than HEAD-BYTES, is
-the last TAIL-BYTES after the head, its first line left out.  So LispM
-Desktop reads a transcript."
+the last TAIL-BYTES after the head, its first line left out.  So lispm-agent
+reads a transcript."
   (handler-case
       (with-regular-file (stream stamp path)
         (let* ((size (stamp-size stamp))

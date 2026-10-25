@@ -122,6 +122,20 @@ under test, then turn the mode off."
      '(:type "session_meta" :payload (:id "four" :cwd "/w/four"))
      (list :type "event_msg" :payload (list :type "user_message"
                                             :message (concat "Unicode " (string #xe9 #x3bb #x1f600)))))
+    ;; Past the first MiB: the prompt of five is in its tail, six's before it.
+    (let ((padding (concat "{\"type\":\"response_item\",\"payload\":{\"type\":\"reasoning\",\"x\":\""
+                           (make-string 60 ?.) "\"}}")))
+      (apply #'lispm-kernel-desktop-test--write
+             (expand-file-name "rollout-5.jsonl" day)
+             '(:type "session_meta" :payload (:id "five" :cwd "/w/five"))
+             (append (make-list 11000 padding)
+                     '((:type "event_msg" :payload (:type "user_message" :message "In the tail")))))
+      (apply #'lispm-kernel-desktop-test--write
+             (expand-file-name "rollout-6.jsonl" day)
+             '(:type "session_meta" :payload (:id "six" :cwd "/w/six"))
+             (append (make-list 11000 padding)
+                     '((:type "event_msg" :payload (:type "user_message" :message "Lost")))
+                     (make-list 200 padding))))
     (lispm-kernel-desktop-test--write
      (expand-file-name "session_index.jsonl" (file-name-directory (directory-file-name directory)))
      '(:id "two" :thread_name "Named two")
@@ -204,7 +218,7 @@ under test, then turn the mode off."
           ;; As the sidebar draws them, those of one time in one order too.
           (should (equal (lispm-agents--sort-sessions sessions)
                          (lispm-agents--sort-sessions reference)))
-          (should (= (length sessions) (if (eq agent 'codex) 3 4)))))
+          (should (= (length sessions) (if (eq agent 'codex) 5 4)))))
       (should (> lispm-kernel-desktop-test--arrived 0))
       (should-not lispm-kernel-desktop-last-error))))
 
