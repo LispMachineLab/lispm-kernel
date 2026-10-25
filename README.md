@@ -7,8 +7,8 @@ Lisps talk in S-expressions, one per line:
 
 ```
 Emacs   (submit 7 scan-sessions (:agent codex :root "~/.codex/sessions/") :owner 1 :generation 3)
-kernel  (chunk 7 ((:id "…" :cwd "…" :title "…" :file "…" :mtime 1761…)))
-        (done 7 success (:files 55 :rows 7 :empty 48 :skipped 0 :cached 0 :truncated nil))
+kernel  (chunk 7 ((:id "…" :cwd "…" :title "…" :file "…" :mtime 1761… :turn-ended t)))
+        (done 7 success (:files 55 :rows 7 :empty 48 :skipped 0 :cached 0 :truncated nil :turn-ended t))
 ```
 
 What the kernel writes wakes Emacs as any process output does. Emacs takes
@@ -20,7 +20,11 @@ kernel that crashes takes none of Emacs with it.
 Its first job reads the Codex and Claude Code sessions for the desktop's
 agents sidebar. It reads them as the desktop's own readers do, to the
 nanosecond of each transcript's time, on several threads at once. It keeps
-what it read, so the next scan reads only transcripts that changed.
+what it read, so the next scan reads only transcripts that changed. Each
+session also says whether its agent's latest turn has ended. With that,
+lispm-agent's session picker, a terminal learning its own session, and the
+agents waiting to message a busy agent all use what the kernel read, and
+none of them reads transcripts on Emacs's thread.
 
 Its second job downloads for package.el. Even in the background, url.el
 negotiates TLS on Emacs's thread, and through a proxy it waits for each

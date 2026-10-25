@@ -129,8 +129,20 @@ desktop's way.
 readers that answer at once with what the kernel read last, or `pending`.
 They have it read again once that is older than
 `lispm-kernel-desktop-cache-seconds`, or when the sidebar reads sessions
-anew. The session picker and every other caller keep the desktop's own
-readers. A remote or missing root is read the desktop's way. A kernel that
+anew. Each session also says whether its latest turn had ended
+(`:turn-ended`), read from the transcript's end as lispm-agent's `:ready`
+reads it: its last 16 KiB, or its last 256 KiB when those hold no record
+of a turn. The same readings answer three more callers in lispm-agent.
+`lispm-agents-session-lookup-functions` looks a session up, for its
+transcript and its turn, when the agents bridge asks whether an agent is
+free for a message; it never waits and never reads the desktop's way.
+`lispm-agents-read-sessions-function` lists every session. A terminal
+learning its session takes a reading of any age and is told when a newer
+one comes. The session picker takes one no older than the cache, waiting
+up to `lispm-kernel-desktop-wait-seconds` for the kernel to read anew.
+Only readings that say whether turns ended are used there: an older
+kernel's may lack sessions lispm-agent lists. A remote or missing root
+is read the desktop's way. A kernel that
 exits is started again when a reader is next asked, unless it ran shorter
 than `lispm-kernel-desktop-restart-seconds`; then it is not started again
 until the mode is turned on anew.
