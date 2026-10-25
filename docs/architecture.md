@@ -154,6 +154,26 @@ url.el: downloads package.el waits for, files, URLs url.el would reach
 through SOCKS or a gateway of its own, and every download while no such
 kernel runs.
 
+## Programs
+
+`src/exec.lisp` runs a program Emacs names, a file it found in `exec-path`,
+with its arguments, directory and whole environment, and the text for its
+standard input. What the program prints on its standard output comes as
+chunks as it comes, read as UTF-8, a character cut between two reads kept
+for the next; the result is its exit code, or the signal that ended it,
+with the last 64 KiB of its standard error. The job ends with the program,
+not with what the program left running holding its output, as Emacs
+ends a process. Cancelling the request, or a program running past its
+timeout, stops the program's process group, SIGTERM and then SIGKILL.
+
+`lisp/lispm-kernel-exec.el` gives Emacs `lispm-kernel-exec`, which calls back
+with the exit code and what was printed, and runs the program in Emacs, in
+the background, where no kernel knowing the job runs, or the program or
+directory is not on this computer. lispm-agent runs its programs through
+`lispm-exec`, whose `lispm-exec-function` `lispm-kernel-exec-mode` advises;
+LispM Desktop runs its own, as ps for the Buffer Manager and git for
+Software Update, through it too.
+
 ## The program
 
 `scripts/build.lisp` compiles the system afresh, failing on any warning,
