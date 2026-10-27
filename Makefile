@@ -14,11 +14,14 @@ EMACS ?= emacs
 # lisp/ of lispm-agent, the editor's agents, whose session readers the
 # kernel feeds: a checkout beside this one by default.
 LISPM_AGENT ?= ../lispm-agent/lisp
+# LispM Kit, whose engine translates the agent's words: a checkout beside
+# this one by default.
+LISPM_KIT ?= ../lispm-kit
 SBCL_RUN = $(SBCL) --non-interactive --no-sysinit --no-userinit
 PROGRAM = build/lispm-kernel
 SOURCES = lispm-kernel.asd scripts/build.lisp $(wildcard src/*.lisp)
 AGENTS = $(wildcard $(LISPM_AGENT)/lispm-agents.el)
-EMACS_BATCH = $(EMACS) -Q --batch -L lisp $(if $(AGENTS),-L $(LISPM_AGENT))
+EMACS_BATCH = $(EMACS) -Q --batch -L lisp $(if $(AGENTS),-L $(LISPM_KIT) -L $(LISPM_AGENT))
 
 .PHONY: all test test-lisp test-emacs compile pin check-pins clean
 
