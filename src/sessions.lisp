@@ -30,7 +30,14 @@
 ;;;   Claude  PROJECT/*.jsonl below the root.  The session is named by
 ;;;           its file, titled by the last custom title or summary of its
 ;;;           head and tail, else its head's first prompt, or by the
-;;;           custom-title.json beside it, which wins.
+;;;           custom-title.json beside it, which wins.  The subagents a
+;;;           session ran, PROJECT/SESSION/subagents/agent-*.jsonl, are
+;;;           sessions under it (:parent), titled by the task Claude
+;;;           recorded in the agent-*.meta.json beside each, else as a
+;;;           session is; one started by another subagent is under that.
+;;;           A Codex thread spawned by another, its session_meta naming
+;;;           the parent thread, is likewise under it, titled by its
+;;;           agent path and nickname.
 ;;;
 ;;; A transcript's head is its first 64 KiB, its tail its last 16 KiB
 ;;; after that, lines cut at either end left out.  A Codex transcript's
@@ -49,7 +56,7 @@
 ;;; Sessions go to Emacs in chunks, lists of
 ;;;
 ;;;   (:id ID :cwd CWD :title TITLE :file FILE :mtime NANOSECONDS :turn-ended BOOLEAN
-;;;    [:started TIMESTAMP])
+;;;    [:started TIMESTAMP] [:parent ID])
 ;;;
 ;;; and the result is the scan's summary, a plist of counts, and
 ;;; :turn-ended t, which says the rows tell whether a turn ended.
@@ -97,7 +104,8 @@ when the last `+turn-bytes+' do not tell, as `lispm-agents-tail-bytes'.")
 (defparameter *threads* 4
   "Threads reading the transcripts of one scan.")
 
-(defstruct (session (:constructor make-session (id cwd title file mtime &optional started turn-ended))
+(defstruct (session (:constructor make-session (id cwd title file mtime
+                                                 &optional started turn-ended parent))
                     (:copier nil))
   (id "" :type string :read-only t)
   (cwd "" :type string :read-only t)
@@ -105,7 +113,12 @@ when the last `+turn-bytes+' do not tell, as `lispm-agents-tail-bytes'.")
   (file "" :type string :read-only t)
   (mtime 0 :type integer :read-only t)
   (started nil :type (or null string) :read-only t)
-  (turn-ended nil :type boolean :read-only t))
+  (turn-ended nil :type boolean :read-only t)
+  (parent nil :type (or null string) :read-only t))
+
+(defun non-blank (value)
+  "Return VALUE when it is a string that is not blank, else nil."
+  (and (stringp value) (not (blankp value)) value))
 
 ;;;; As lispm-agent reads transcripts
 
@@ -235,15 +248,29 @@ first `+prompt-bytes+', else of its tail."
          (id (json-get payload "id"))
          (cwd (json-get payload "cwd")))
     (when (and (stringp id) (stringp cwd))
-      (let ((timestamp (json-get payload "timestamp")))
+      (let ((timestamp (json-get payload "timestamp"))
+            (parent (non-blank (json-get payload "parent_thread_id"))))
         (make-session id cwd
-                      (or (first-line head #'codex-prompt)
+                      (or (and parent (codex-subagent-title payload))
+                          (first-line head #'codex-prompt)
                           ;; A transcript within its head has nothing past it.
                           (and (> (stamp-size stamp) +head-bytes+)
                                (codex-prompt-past-head path head))
                           (and tail (first-line tail #'codex-prompt)))
                       path (stamp-mtime stamp)
-                      (and (stringp timestamp) timestamp))))))
+                      (and (stringp timestamp) timestamp)
+                      nil parent)))))
+
+(defun codex-subagent-title (payload)
+  "Return the title of the Codex subagent whose session metadata is
+PAYLOAD: the last part of its agent path, with the nickname Codex gave
+it; nil when it names neither.  So `lispm-agents-codex--subagent-title'."
+  (let* ((path (non-blank (json-get payload "agent_path")))
+         (task (and path (non-blank (subseq path (1+ (or (position #\/ path :from-end t) -1))))))
+         (nickname (non-blank (json-get payload "agent_nickname"))))
+    (cond ((and task nickname) (format nil "~A (~A)" task nickname))
+          (task task)
+          (nickname nickname))))
 
 (defun codex-files (root)
   "Return the Codex transcripts below ROOT, how many names could not be
@@ -342,11 +369,47 @@ be decoded, and whether a project could not be listed."
             (multiple-value-bind (names bad listed) (directory-names directory)
               (incf undecodable bad)
               (if listed
-                  (dolist (name (sort names #'string<))
-                    (when (jsonl-name-p name)
-                      (push (concatenate 'string directory "/" name) files)))
+                  (let ((names (sort names #'string<)))
+                    (dolist (name names)
+                      (when (jsonl-name-p name)
+                        (push (concatenate 'string directory "/" name) files)))
+                    ;; Then the subagents each session ran, in its own
+                    ;; directory, as lispm-agents-claude--files lists them.
+                    (dolist (name names)
+                      (let ((subagents (concatenate 'string directory "/" name "/subagents")))
+                        (when (and (not (jsonl-name-p name))
+                                   (let ((stamp (file-stamp subagents)))
+                                     (and stamp (eq (stamp-kind stamp) :directory))))
+                          (multiple-value-bind (agents bad listed) (directory-names subagents)
+                            (incf undecodable bad)
+                            (if listed
+                                (dolist (agent (sort agents #'string<))
+                                  (when (jsonl-name-p agent)
+                                    (push (concatenate 'string subagents "/" agent) files)))
+                                (setf truncated t)))))))
                   (setf truncated t))))))
       (values (nreverse files) undecodable truncated))))
+
+(defun claude-subagent (path)
+  "Return what Claude records of the subagent whose transcript is PATH:
+the id of the session it is under, and the task and parent subagent of
+its agent-*.meta.json, as (SESSION TASK PARENT); nil for a session's
+own transcript.  So `lispm-agents-claude--subagent'."
+  (let* ((directory (file-directory path))
+         (above (file-directory directory)))
+    (when (and (string= (file-name-base directory) "subagents") (plusp (length above)))
+      (let* ((meta (concatenate 'string (subseq path 0 (- (length path) 6)) ".meta.json"))
+             (object (multiple-value-bind (octets stamp cut) (read-file-octets meta *max-title-file-bytes*)
+                       (and octets stamp (not cut)
+                            (handler-case
+                                (parse-json (sb-ext:octets-to-string
+                                             octets :external-format '(:utf-8 :replacement #\REPLACEMENT_CHARACTER))
+                                            :trailing t)
+                              (json-error () nil))))))
+        (list (file-name-base above)
+              (non-blank (json-get object "description"))
+              (let ((agent (non-blank (json-get object "parentAgentId"))))
+                (and agent (concatenate 'string "agent-" agent))))))))
 
 (defun claude-session (path head tail stamp)
   "Return the Claude Code session of transcript PATH, whose head and tail
@@ -371,9 +434,12 @@ lines are HEAD and TAIL."
                                           (let ((text (content-text
                                                        (json-get (json-get object "message") "content"))))
                                             (and (human-text-p text) text))))))
-          (cwd (or (cwd head) (and tail (cwd tail)))))
-      (when (and cwd (or title prompt))
-        (make-session (file-name-base path) cwd (or title prompt) path (stamp-mtime stamp))))))
+          (cwd (or (cwd head) (and tail (cwd tail))))
+          (subagent (claude-subagent path)))
+      (destructuring-bind (&optional session task parent) subagent
+        (when (and cwd (or title task prompt))
+          (make-session (file-name-base path) cwd (or title task prompt) path (stamp-mtime stamp)
+                        nil nil (and subagent (or parent session))))))))
 
 (defun custom-title (octets)
   "Return the custom title of a custom-title.json holding OCTETS, or nil."
@@ -513,7 +579,7 @@ latest turn has ended."
     (make-session (ascii-compact (session-id session)) (ascii-compact (session-cwd session))
                   (ascii-compact (session-title session)) (ascii-compact (session-file session))
                   (session-mtime session) (ascii-compact (session-started session))
-                  (turn-ended agent path))))
+                  (turn-ended agent path) (ascii-compact (session-parent session)))))
 
 (defun transcript-session (cache agent path)
   "Return what transcript PATH is, (STATUS . SESSION): STATUS is :read,
@@ -546,7 +612,8 @@ latest turn has ended."
   (list* :id (session-id session) :cwd (session-cwd session) :title (truncate-title title)
          :file (session-file session) :mtime (session-mtime session)
          :turn-ended (session-turn-ended session)
-         (and (session-started session) (list :started (session-started session)))))
+         (append (and (session-started session) (list :started (session-started session)))
+                 (and (session-parent session) (list :parent (session-parent session))))))
 
 (defun row-length (row)
   (+ 64 (loop for item in row when (stringp item) sum (length item))))
