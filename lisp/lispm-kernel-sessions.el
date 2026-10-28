@@ -28,8 +28,9 @@
 ;; src/sessions.lisp, and gives them back as those readers do:
 ;;
 ;;   (:agent codex :id ID :cwd CWD :title TITLE :started FLOAT :file FILE :time FLOAT
-;;    :turn-ended BOOLEAN)
-;;   (:agent claude :id ID :cwd CWD :title TITLE :file FILE :time FLOAT :turn-ended BOOLEAN)
+;;    :turn-ended BOOLEAN [:parent ID])
+;;   (:agent claude :id ID :cwd CWD :title TITLE :file FILE :time FLOAT :turn-ended BOOLEAN
+;;    [:parent ID])
 ;;
 ;; newest first.  :turn-ended says whether the session's latest turn had
 ;; ended when its transcript was as :time says, as the agent's :ready
@@ -53,15 +54,19 @@ not one."
     (when (and (stringp id) (stringp cwd) (stringp title) (stringp file) (natnump mtime))
       (let ((time (float-time (cons mtime 1000000000)))
             (turn (and (plist-member row :turn-ended)
-                       (list :turn-ended (and (plist-get row :turn-ended) t)))))
+                       (list :turn-ended (and (plist-get row :turn-ended) t))))
+            ;; A session another started, see `lispm-agents-session-tree'.
+            (parent (when-let* ((parent (plist-get row :parent))
+                                ((stringp parent)))
+                      (list :parent parent))))
         (if (eq agent 'codex)
             (append (list :agent 'codex :id id :cwd cwd :title title
                           :started (when-let* ((stamp (plist-get row :started)))
                                      (ignore-errors (float-time (parse-iso8601-time-string stamp))))
                           :file file :time time)
-                    turn)
+                    turn parent)
           (append (list :agent 'claude :id id :cwd cwd :title title :file file :time time)
-                  turn))))))
+                  turn parent))))))
 
 (cl-defun lispm-kernel-scan-sessions (runtime agent root callback
                                               &key (owner 0) (generation 0) index fallback

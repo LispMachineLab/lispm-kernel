@@ -309,6 +309,28 @@ return the last."
                                          :turn-ended nil)))))))
       (delete-directory directory t))))
 
+(ert-deftest lispm-kernel-sessions-under-their-parents ()
+  "A row naming the thread or session that started its session keeps it
+as the session's :parent; a parent that is no id is none."
+  (should (equal (plist-get (lispm-kernel-sessions--session
+                             'claude '(:id "agent-a1" :cwd "/w" :title "Find it" :file "/t/agent-a1.jsonl"
+                                           :mtime 1700000000000000000 :turn-ended t :parent "s1"))
+                            :parent)
+                 "s1"))
+  (should (equal (plist-get (lispm-kernel-sessions--session
+                             'codex '(:id "f" :cwd "/w" :title "review" :file "/t/rollout-f.jsonl"
+                                          :mtime 1700000000000000000 :parent "b"))
+                            :parent)
+                 "b"))
+  (should-not (plist-member (lispm-kernel-sessions--session
+                             'codex '(:id "b" :cwd "/w" :title "hello" :file "/t/rollout-b.jsonl"
+                                          :mtime 1700000000000000000))
+                            :parent))
+  (should-not (plist-member (lispm-kernel-sessions--session
+                             'claude '(:id "s1" :cwd "/w" :title "first" :file "/t/s1.jsonl"
+                                           :mtime 1700000000000000000 :parent 7))
+                            :parent)))
+
 (ert-deftest lispm-kernel-sessions-fall-back ()
   (let ((directory (make-temp-file "lispm-kernel-sessions" t))
         result)
