@@ -331,6 +331,21 @@ as the session's :parent; a parent that is no id is none."
                                            :mtime 1700000000000000000 :parent 7))
                             :parent)))
 
+(ert-deftest lispm-kernel-sessions-opening-time-is-independent-of-mtime ()
+  "Both agents retain creation time separately from transcript freshness."
+  (dolist (agent '(claude codex))
+    (let* ((row '(:id "child" :cwd "/w" :title "Review" :file "/t/child.jsonl"
+                 :mtime 1700000000000000000 :parent "parent"
+                 :started "2026-10-21T01:02:03.456Z"))
+           (session (lispm-kernel-sessions--session agent row)))
+      (should (= (plist-get session :started)
+                 (float-time (parse-iso8601-time-string "2026-10-21T01:02:03.456Z"))))
+      (should (= (plist-get session :time) 1700000000.0))
+      (should (equal (plist-get session :parent) "parent"))
+      (should-not (plist-get (lispm-kernel-sessions--session
+                              agent (plist-put (copy-sequence row) :started "invalid"))
+                             :started)))))
+
 (ert-deftest lispm-kernel-sessions-fall-back ()
   (let ((directory (make-temp-file "lispm-kernel-sessions" t))
         result)

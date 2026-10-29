@@ -238,6 +238,12 @@ those, and hold none."
   (first-line (make-lines (read-head-and-tail path +prompt-bytes+ 0))
               #'codex-prompt :start (line-count head)))
 
+(defun codex-spawn-field (payload field)
+  "Return nonblank FIELD from Codex metadata PAYLOAD or its spawn source."
+  (let ((spawn (json-get (json-get (json-get payload "source") "subagent") "thread_spawn")))
+    (or (non-blank (json-get payload field))
+        (non-blank (json-get spawn field)))))
+
 (defun codex-session (path head tail stamp)
   "Return the Codex session of transcript PATH, whose head and tail lines
 are HEAD and TAIL.  Its title is the first prompt of its head, else of its
@@ -249,7 +255,7 @@ first `+prompt-bytes+', else of its tail."
          (cwd (json-get payload "cwd")))
     (when (and (stringp id) (stringp cwd))
       (let ((timestamp (json-get payload "timestamp"))
-            (parent (non-blank (json-get payload "parent_thread_id"))))
+            (parent (codex-spawn-field payload "parent_thread_id")))
         (make-session id cwd
                       (or (and parent (codex-subagent-title payload))
                           (first-line head #'codex-prompt)
@@ -265,9 +271,9 @@ first `+prompt-bytes+', else of its tail."
   "Return the title of the Codex subagent whose session metadata is
 PAYLOAD: the last part of its agent path, with the nickname Codex gave
 it; nil when it names neither.  So `lispm-agents-codex--subagent-title'."
-  (let* ((path (non-blank (json-get payload "agent_path")))
+  (let* ((path (codex-spawn-field payload "agent_path"))
          (task (and path (non-blank (subseq path (1+ (or (position #\/ path :from-end t) -1))))))
-         (nickname (non-blank (json-get payload "agent_nickname"))))
+         (nickname (codex-spawn-field payload "agent_nickname")))
     (cond ((and task nickname) (format nil "~A (~A)" task nickname))
           (task task)
           (nickname nickname))))
@@ -435,11 +441,14 @@ lines are HEAD and TAIL."
                                                        (json-get (json-get object "message") "content"))))
                                             (and (human-text-p text) text))))))
           (cwd (or (cwd head) (and tail (cwd tail))))
+          ;; Later replies change mtime, but not when the session opened.
+          (started (first-line head (lambda (object)
+                                      (non-blank (json-get object "timestamp")))))
           (subagent (claude-subagent path)))
       (destructuring-bind (&optional session task parent) subagent
         (when (and cwd (or title task prompt))
           (make-session (file-name-base path) cwd (or title task prompt) path (stamp-mtime stamp)
-                        nil nil (and subagent (or parent session))))))))
+                        started nil (and subagent (or parent session))))))))
 
 (defun custom-title (octets)
   "Return the custom title of a custom-title.json holding OCTETS, or nil."
