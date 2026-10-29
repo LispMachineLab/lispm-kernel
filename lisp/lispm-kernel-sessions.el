@@ -29,8 +29,8 @@
 ;;
 ;;   (:agent codex :id ID :cwd CWD :title TITLE :started FLOAT :file FILE :time FLOAT
 ;;    :turn-ended BOOLEAN [:parent ID])
-;;   (:agent claude :id ID :cwd CWD :title TITLE :file FILE :time FLOAT :turn-ended BOOLEAN
-;;    [:parent ID])
+;;   (:agent claude :id ID :cwd CWD :title TITLE :started FLOAT :file FILE :time FLOAT
+;;    :turn-ended BOOLEAN [:parent ID])
 ;;
 ;; newest first.  :turn-ended says whether the session's latest turn had
 ;; ended when its transcript was as :time says, as the agent's :ready
@@ -59,14 +59,11 @@ not one."
             (parent (when-let* ((parent (plist-get row :parent))
                                 ((stringp parent)))
                       (list :parent parent))))
-        (if (eq agent 'codex)
-            (append (list :agent 'codex :id id :cwd cwd :title title
-                          :started (when-let* ((stamp (plist-get row :started)))
-                                     (ignore-errors (float-time (parse-iso8601-time-string stamp))))
-                          :file file :time time)
-                    turn parent)
-          (append (list :agent 'claude :id id :cwd cwd :title title :file file :time time)
-                  turn parent))))))
+        (append (list :agent agent :id id :cwd cwd :title title
+                      :started (when-let* ((stamp (plist-get row :started)))
+                                 (ignore-errors (float-time (parse-iso8601-time-string stamp))))
+                      :file file :time time)
+                turn parent)))))
 
 (cl-defun lispm-kernel-scan-sessions (runtime agent root callback
                                               &key (owner 0) (generation 0) index fallback
