@@ -148,9 +148,10 @@ under test, then turn the mode off."
   "Write Claude Code transcripts in DIRECTORY."
   (lispm-kernel-desktop-test--write
    (expand-file-name "project/a.jsonl" directory)
+   '(:type "queue-operation" :timestamp "2026-10-21T00:00:00.123Z")
    '(:type "user" :cwd "/c/a" :isMeta t :message (:content "ignore me"))
    '(:type "user" :cwd "/c/a" :message (:content [(:text "hello ") (:text "there")]))
-   '(:type "assistant" :message (:stop_reason "end_turn")))
+   '(:type "assistant" :timestamp "2026-10-22T03:00:00Z" :message (:stop_reason "end_turn")))
   (apply #'lispm-kernel-desktop-test--write
          (expand-file-name "project/b.jsonl" directory)
          '(:type "user" :cwd "/c/b" :message (:content "early"))
