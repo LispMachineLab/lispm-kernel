@@ -145,20 +145,35 @@ read, and :summary for the kernel."
   (concat "{\"type\":\"response_item\",\"payload\":{\"type\":\"message\","
           "\"role\":\"assistant\",\"content\":\"" (make-string 512 ?x) "\"}}\n"))
 
+(defconst lispm-kernel-bench--ended-turn
+  "{\"type\":\"event_msg\",\"payload\":{\"type\":\"task_complete\"}}\n"
+  "A Codex transcript line that ends a turn.")
+
+(defconst lispm-kernel-bench--long-factor 6
+  "How many times more filler lines a long transcript has than a short one.")
+
 (defun lispm-kernel-bench--fixtures (root count filler-lines)
-  "Write COUNT synthetic Codex transcripts below ROOT, each with FILLER-LINES.
-Return the number of bytes written."
+  "Write COUNT synthetic Codex transcripts below ROOT and return the bytes
+written.  Every fourth is short, the one after it short with its turn ended,
+then long, then long with its ended turn: a short one's head and tail hold
+all of it, while a long one's do not, so its turn is looked for at the end
+of it.  Each has FILLER-LINES filler lines, a long one six times that."
   (make-directory root t)
   (let ((filler (lispm-kernel-bench--filler))
         (bytes 0))
     (dotimes (index count)
-      (with-temp-file (expand-file-name (format "rollout-%04d.jsonl" index) root)
-        (insert (format "{\"type\":\"session_meta\",\"payload\":{\"id\":\"%d\",\"cwd\":\"/fixture\",\"timestamp\":\"2026-01-01T00:00:00.000Z\"}}\n"
-                        index))
-        (insert (format "{\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"fixture %d\"}}\n"
-                        index))
-        (dotimes (_ filler-lines) (insert filler))
-        (setq bytes (+ bytes (buffer-size)))))
+      (let* ((kind (mod index 4))
+             (turn-p (cl-oddp kind))
+             (lines (if (>= kind 2) (* lispm-kernel-bench--long-factor filler-lines)
+                      filler-lines)))
+        (with-temp-file (expand-file-name (format "rollout-%04d.jsonl" index) root)
+          (insert (format "{\"type\":\"session_meta\",\"payload\":{\"id\":\"%d\",\"cwd\":\"/fixture\",\"timestamp\":\"2026-01-01T00:00:00.000Z\"}}\n"
+                          index))
+          (insert (format "{\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"fixture %d\"}}\n"
+                          index))
+          (dotimes (_ lines) (insert filler))
+          (when turn-p (insert lispm-kernel-bench--ended-turn))
+          (setq bytes (+ bytes (buffer-size))))))
     bytes))
 
 ;;;; Terminals
@@ -377,6 +392,9 @@ tests do, rather than let the frame clock take the messages in."
                             (cons 'kernel_program program)
                             (cons 'fixture_files count)
                             (cons 'filler_lines_per_file filler-lines)
+                            (cons 'long_filler_lines_per_file
+                                  (* lispm-kernel-bench--long-factor filler-lines))
+                            (cons 'files_ending_a_turn (/ (+ count 1) 2))
                             (cons 'fixture_bytes bytes)
                             (cons 'terminals terminal-count)
                             (cons 'visible_terminals (if (> terminal-count 0) 1 0))

@@ -123,6 +123,72 @@ when the last `+turn-bytes+' do not tell, as `lispm-agents-tail-bytes'.")
   "Return VALUE when it is a string that is not blank, else nil."
   (and (stringp value) (not (blankp value)) value))
 
+(defun iso-timestamp-p (string)
+  "Return true when STRING is an ISO 8601 date and time in the forms agents
+write: `2026-10-21T01:02:03.456Z', each of the seconds, the fraction and
+the zone optional.  Emacs's `parse-iso8601-time-string' reads them, and
+the first one it reads is the session's start; one it cannot read is
+passed over, so a stamp that is no date tells nothing."
+  (labels ((digits-p (start count)
+             (and (<= (+ start count) (length string))
+                  (loop for index from start below (+ start count)
+                        always (digit-char-p (char string index)))))
+           (digit-count (start)
+             (loop for index from start below (length string)
+                   while (digit-char-p (char string index))
+                   count 1))
+           (zone-p (start)
+             (let ((length (length string)))
+               (cond ((= start length) t)
+                     ((and (find (char string start) "Zz")
+                           (= (1+ start) length))
+                      t)
+                     ((find (char string start) "+-")
+                      (let ((rest (1+ start)))
+                        (or (and (= (+ rest 2) length) (digits-p rest 2))
+                            (and (= (+ rest 4) length) (digits-p rest 4))
+                            (and (= (+ rest 5) length)
+                                 (digits-p rest 2)
+                                 (char= (char string (+ rest 2)) #\:)
+                                 (digits-p (+ rest 3) 2)))))
+                     (t nil))))
+           (tail-p (start)
+             (let* ((length (length string))
+                    (after (if (and (< start length) (char= (char string start) #\.))
+                               (let ((count (digit-count (1+ start))))
+                                 (and (plusp count) (+ start 1 count)))
+                               start)))
+               (and after (zone-p after))))
+           (clock-p (start extended)
+             (if extended
+                 (let ((position start))
+                   (and (digits-p position 2)
+                        (progn (incf position 2)
+                               (dotimes (_ 2)
+                                 (when (and (< position (length string))
+                                            (char= (char string position) #\:))
+                                   (if (digits-p (1+ position) 2)
+                                       (incf position 3)
+                                       (return-from clock-p nil))))
+                               (tail-p position))))
+                 (let ((count (digit-count start)))
+                   (and (member count '(2 4 6))
+                        (tail-p (+ start count)))))))
+    (and (stringp string)
+         (let ((length (length string)))
+           (cond
+             ;; 2026-10-21T01:02:03, its clock from the hour up.
+             ((and (>= length 13) (digits-p 0 4) (char= (char string 4) #\-))
+              (and (digits-p 5 2) (char= (char string 7) #\-) (digits-p 8 2)
+                   (< 10 length)
+                   (find (char string 10) "Tt ")
+                   (clock-p 11 t)))
+             ;; 20261021T010203.
+             ((and (>= length 11) (digits-p 0 8))
+              (and (find (char string 8) "Tt ")
+                   (clock-p 9 nil)))
+             (t nil))))))
+
 ;;;; As lispm-agent reads transcripts
 
 (defun whitespacep (character)
@@ -446,7 +512,8 @@ lines are HEAD and TAIL."
           (cwd (or (cwd head) (and tail (cwd tail))))
           ;; Later replies change mtime, but not when the session opened.
           (started (first-line head (lambda (object)
-                                      (non-blank (json-get object "timestamp")))))
+                                      (let ((stamp (json-get object "timestamp")))
+                                        (and (iso-timestamp-p stamp) stamp)))))
           (subagent (claude-subagent path)))
       (destructuring-bind (&optional session task parent) subagent
         (when (and cwd (or title task prompt))
@@ -511,14 +578,14 @@ interruption, ends a turn.  So `lispm-agents-claude-turn-ended-p'."
                  :ended
                  :working))))))
 
-(defun turn-ended (agent path &key head tail cut size)
+(defun turn-ended (agent path &key head tail cut covered)
   "Return true when the latest turn the end of AGENT's transcript PATH
 tells of has ended, false when it has not or none is told of there.
 The end is its last `+turn-bytes+', else its last `+end-bytes+': a record
 of a turn in the first is the last of the second too.  HEAD, TAIL, CUT
-and SIZE are what `read-head-and-tail' returned for PATH; with them, it
-is read again only when they do not hold all of it and TAIL tells of no
-turn.  Without HEAD, it is read now."
+and COVERED are what `read-head-and-tail' returned for PATH: when they
+hold every line of it, it is not read again; when they do not and TAIL
+tells of no turn, its end is read.  Without HEAD, it is read now."
   (let ((turn (if (eq agent :codex) #'codex-turn #'claude-turn)))
     (labels ((look (lines)
                (and lines (first-line lines turn :from-end t)))
@@ -532,9 +599,8 @@ turn.  Without HEAD, it is read now."
           (let ((state (or (look tail)
                            (look (and cut (make-lines (list cut)))))))
             (cond (state (eq :ended state))
-                  ((and size (> size (+ +head-bytes+ +tail-bytes+)))
-                   (eq :ended (read-look +end-bytes+)))
-                  (t (eq :ended (look head)))))
+                  (covered (eq :ended (look head)))
+                  (t (eq :ended (read-look +end-bytes+)))))
           (multiple-value-bind (state cut) (read-look +turn-bytes+)
             (eq :ended (if (or state (not cut)) state (read-look +end-bytes+))))))))
 
@@ -596,15 +662,15 @@ turn.  Without HEAD, it is read now."
 
 ;;;; Scanning
 
-(defun compact-session (session agent path &key head tail cut size)
+(defun compact-session (session agent path &key head tail cut covered)
   "Return SESSION, of AGENT's transcript PATH, compact, with whether its
-latest turn has ended.  HEAD, TAIL, CUT and SIZE are what
+latest turn has ended.  HEAD, TAIL, CUT and COVERED are what
 `read-head-and-tail' returned for PATH."
   (when session
     (make-session (ascii-compact (session-id session)) (ascii-compact (session-cwd session))
                   (ascii-compact (session-title session)) (ascii-compact (session-file session))
                   (session-mtime session) (ascii-compact (session-started session))
-                  (turn-ended agent path :head head :tail tail :cut cut :size size)
+                  (turn-ended agent path :head head :tail tail :cut cut :covered covered)
                   (ascii-compact (session-parent session)))))
 
 (defun transcript-session (cache agent path)
@@ -617,8 +683,9 @@ latest turn has ended.  HEAD, TAIL, CUT and SIZE are what
         (multiple-value-bind (session found) (cached cache 'transcripts path stamp)
           (if found
               (cons :cached session)
-              (multiple-value-bind (head tail read-stamp cut size)
+              (multiple-value-bind (head tail read-stamp cut size covered)
                   (read-head-and-tail path +head-bytes+ +tail-bytes+)
+                (declare (ignore size))
                 (if (null read-stamp)
                     (cons :skipped nil)
                     (let* ((head-lines (make-lines head))
@@ -627,7 +694,7 @@ latest turn has ended.  HEAD, TAIL, CUT and SIZE are what
                                      (funcall (if (eq agent :codex) #'codex-session #'claude-session)
                                               path head-lines tail-lines read-stamp)
                                      agent path :head head-lines :tail tail-lines
-                                     :cut cut :size size)))
+                                     :cut cut :covered covered)))
                       (store cache 'transcripts path read-stamp session)
                       (cons :read session)))))))))
 

@@ -269,12 +269,15 @@
     (let* ((root (path directory "projects"))
            (file (path root "proj/parent/subagents/agent-child.jsonl"))
            (first "{\"type\":\"queue-operation\",\"timestamp\":\"2026-10-21T01:00:00Z\"}")
+           ;; A stamp that is a string but no date tells nothing, as it tells
+           ;; Emacs's reader nothing: the one after it is the session's start.
+           (stamped "{\"type\":\"system\",\"timestamp\":\"not a time\"}")
            (prompt (claude-user "read the log" :cwd "/p/child")))
-      (set-mtime (write-file file "{\"timestamp\":7}" first prompt) 1700000100)
+      (set-mtime (write-file file "{\"timestamp\":7}" stamped first prompt) 1700000100)
       (let ((initial (row "agent-child" (scan-rows :claude root))))
         (is (string= "2026-10-21T01:00:00Z" (getf initial :started)))
         (is (string= "parent" (getf initial :parent)))
-        (set-mtime (write-file file "{\"timestamp\":7}" first prompt
+        (set-mtime (write-file file "{\"timestamp\":7}" stamped first prompt
                               "{\"type\":\"assistant\",\"timestamp\":\"2026-10-22T09:00:00Z\"}")
                    1700000200)
         (let ((updated (row "agent-child" (scan-rows :claude root))))
@@ -370,9 +373,22 @@
           (apply #'claude "long" (append (list (claude-said "end_turn")) (filler 850)))
           ;; No turn at all, in a transcript the head and tail hold.
           (apply #'claude "none" (filler 700))))
-      (let ((rows (scan-rows :claude root)))
-        (is (equal '(("cut" t) ("head" t) ("long" t) ("none" nil))
-                   (mapcar (lambda (row) (list (getf row :id) (getf row :turn-ended))) rows)))))))
+      (let ((counter (make-array 1 :element-type '(unsigned-byte 64) :initial-element 0))
+            (original (symbol-function 'lispm-kernel/files:read-file-octets)))
+        (unwind-protect
+             (progn
+               (setf (symbol-function 'lispm-kernel/files:read-file-octets)
+                     (lambda (&rest arguments)
+                       (sb-ext:atomic-incf (aref counter 0))
+                       (apply original arguments)))
+               (let ((rows (scan-rows :claude root)))
+                 (is (equal '(("cut" t) ("head" t) ("long" t) ("none" nil))
+                            (mapcar (lambda (row) (list (getf row :id) (getf row :turn-ended)))
+                                    rows)))
+                 ;; Only the transcript whose head and tail leave its end out
+                 ;; is read again: the other three are read once, by the scan.
+                 (is (= 1 (aref counter 0)))))
+          (setf (symbol-function 'lispm-kernel/files:read-file-octets) original))))))
 
 (deftest sessions-lines-emacs-refuses ()
   (lispm-kernel/sessions:clear-caches)

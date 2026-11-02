@@ -145,7 +145,7 @@ def summarize(runs):
             "p50_ms": round(median([c["probe"]["p50"] for c in cases]), 3),
             "p95_ms": round(median([c["probe"]["p95"] for c in cases]), 3),
             "p99_ms": round(median([c["probe"]["p99"] for c in cases]), 3),
-            "max_ms": round(max(c["probe"]["max"] for c in cases), 3),
+            "max_ms": round(median([c["probe"]["max"] for c in cases]), 3),
             "gcs": round(median([c["gcs"] for c in cases]), 3),
             "gc_ms": round(median([c["gc_ms"] for c in cases]), 3),
             "rows": cases[0]["rows"],

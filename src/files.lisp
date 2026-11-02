@@ -269,7 +269,8 @@ goes on; the tail, read only when the file is longer than HEAD-BYTES, is
 the last TAIL-BYTES after the head, its first line left out.  So lispm-agent
 reads a transcript.  The fourth value is the line the head and tail leave
 out between them, when the tail begins where the head ends and they cut
-one, and the fifth is the file's size."
+one, the fifth the file's size, and the sixth true when head, line and
+tail hold every complete line of the file."
   (handler-case
       (with-regular-file (stream stamp path)
         (let* ((size (stamp-size stamp))
@@ -283,7 +284,9 @@ one, and the fifth is the file's size."
                   (and tail
                        (<= size (+ head-bytes tail-bytes))
                        (boundary-line head tail))
-                  size)))
+                  size
+                  (or (<= size head-bytes)
+                      (and tail (<= size (+ head-bytes tail-bytes)))))))
     (error () nil)))
 
 (defun read-file-octets (path limit)

@@ -1,5 +1,5 @@
 {
-  "generated_at": "2026-11-02T18:01:01+0800",
+  "generated_at": "2026-11-02T18:54:57+0800",
   "repeats": 3,
   "host": {
     "system": "macOS-27.0.1-x86_64-i386-64bit",
@@ -21,7 +21,9 @@
     "kernel_program": "/Users/ryan/agents/lispm-kernel-bench/build/lispm-kernel",
     "fixture_files": 256,
     "filler_lines_per_file": 128,
-    "fixture_bytes": 19641636,
+    "long_filler_lines_per_file": 768,
+    "files_ending_a_turn": 128,
+    "fixture_bytes": 68636964,
     "terminals": 0,
     "visible_terminals": 0,
     "order": "elisp-first",
@@ -39,9 +41,9 @@
       "cancelled": 0,
       "peak-queued": 0,
       "outbox-peak": 0,
-      "heap": 40112752,
+      "heap": 40169168,
       "gc-milliseconds": 0,
-      "uptime-milliseconds": 257
+      "uptime-milliseconds": 268
     },
     "kernel_stats_after": {
       "requests": 0,
@@ -52,56 +54,56 @@
       "failed": 0,
       "cancelled": 0,
       "peak-queued": 1,
-      "outbox-peak": 37075,
-      "heap": 57836560,
-      "gc-milliseconds": 42,
-      "uptime-milliseconds": 386
+      "outbox-peak": 36919,
+      "heap": 61874912,
+      "gc-milliseconds": 77,
+      "uptime-milliseconds": 497
     }
   },
   "summary": {
     "elisp-cold": {
-      "elapsed_ms": 236.742,
-      "p50_ms": 0.041,
-      "p95_ms": 234.759,
-      "p99_ms": 234.759,
-      "max_ms": 241.681,
+      "elapsed_ms": 254.483,
+      "p50_ms": 0.282,
+      "p95_ms": 252.501,
+      "p99_ms": 252.501,
+      "max_ms": 252.501,
       "gcs": 13,
-      "gc_ms": 104.588,
+      "gc_ms": 110.994,
       "rows": 256
     },
     "kernel-cold": {
-      "elapsed_ms": 108.566,
-      "p50_ms": 0,
-      "p95_ms": 0.24,
-      "p99_ms": 5.381,
-      "max_ms": 6.034,
+      "elapsed_ms": 224.72,
+      "p50_ms": 0.082,
+      "p95_ms": 0.371,
+      "p99_ms": 0.802,
+      "max_ms": 5.353,
       "gcs": 0,
       "gc_ms": 0.0,
       "rows": 256
     },
     "elisp-warm": {
-      "elapsed_ms": 2.626,
-      "p50_ms": 0.003,
-      "p95_ms": 0.632,
-      "p99_ms": 0.632,
-      "max_ms": 0.66,
+      "elapsed_ms": 2.731,
+      "p50_ms": 0.03,
+      "p95_ms": 0.74,
+      "p99_ms": 0.74,
+      "max_ms": 0.74,
       "gcs": 0,
       "gc_ms": 0.0,
       "rows": 256
     },
     "kernel-warm": {
-      "elapsed_ms": 4.255,
-      "p50_ms": 0.068,
-      "p95_ms": 0.218,
-      "p99_ms": 0.218,
-      "max_ms": 0.314,
+      "elapsed_ms": 4.382,
+      "p50_ms": 0.202,
+      "p95_ms": 0.399,
+      "p99_ms": 0.399,
+      "max_ms": 0.399,
       "gcs": 0,
       "gc_ms": 0.0,
       "rows": 256
     }
   },
   "comparison": {
-    "cold_kernel_over_elisp": 2.18,
+    "cold_kernel_over_elisp": 1.13,
     "warm_kernel_over_elisp": 0.62,
     "note": "ratios above 1 mean the kernel finished in less time"
   },
@@ -113,7 +115,9 @@
         "kernel_program": "/Users/ryan/agents/lispm-kernel-bench/build/lispm-kernel",
         "fixture_files": 256,
         "filler_lines_per_file": 128,
-        "fixture_bytes": 19641636,
+        "long_filler_lines_per_file": 768,
+        "files_ending_a_turn": 128,
+        "fixture_bytes": 68636964,
         "terminals": 0,
         "visible_terminals": 0,
         "order": "elisp-first",
@@ -131,9 +135,9 @@
           "cancelled": 0,
           "peak-queued": 0,
           "outbox-peak": 0,
-          "heap": 40112752,
+          "heap": 40169168,
           "gc-milliseconds": 0,
-          "uptime-milliseconds": 257
+          "uptime-milliseconds": 268
         },
         "kernel_stats_after": {
           "requests": 0,
@@ -144,36 +148,36 @@
           "failed": 0,
           "cancelled": 0,
           "peak-queued": 1,
-          "outbox-peak": 37075,
-          "heap": 57836560,
-          "gc-milliseconds": 42,
-          "uptime-milliseconds": 386
+          "outbox-peak": 36919,
+          "heap": 61874912,
+          "gc-milliseconds": 77,
+          "uptime-milliseconds": 497
         }
       },
       "results": [
         {
           "mode": "elisp-cold",
-          "elapsed_ms": 243.63112449645996,
+          "elapsed_ms": 254.48298454284668,
           "probe": {
             "samples": 6,
-            "p50": 0.007007598876953083,
-            "p95": 241.6809539794922,
-            "p99": 241.6809539794922,
-            "max": 241.6809539794922
+            "p50": 0.26092338562011713,
+            "p95": 252.5011043548584,
+            "p99": 252.5011043548584,
+            "max": 252.5011043548584
           },
           "gcs": 13,
-          "gc_ms": 108.69900000000001,
+          "gc_ms": 110.99399999999999,
           "rows": 256
         },
         {
           "mode": "kernel-cold",
-          "elapsed_ms": 117.31791496276855,
+          "elapsed_ms": 216.37701988220215,
           "probe": {
-            "samples": 63,
-            "p50": 0,
-            "p95": 0.2230148315429687,
-            "p99": 6.033990859985352,
-            "max": 6.033990859985352
+            "samples": 112,
+            "p50": 0.028942108154296833,
+            "p95": 0.35795974731445307,
+            "p99": 0.7990341186523438,
+            "max": 4.953001022338867
           },
           "gcs": 0,
           "gc_ms": 0.0,
@@ -190,13 +194,13 @@
         },
         {
           "mode": "elisp-warm",
-          "elapsed_ms": 2.6540756225585938,
+          "elapsed_ms": 2.7310848236083984,
           "probe": {
             "samples": 6,
-            "p50": 0.002954483032226521,
-            "p95": 0.6597976684570312,
-            "p99": 0.6597976684570312,
-            "max": 0.6597976684570312
+            "p50": 0.005100250244140583,
+            "p95": 0.7399063110351562,
+            "p99": 0.7399063110351562,
+            "max": 0.7399063110351562
           },
           "gcs": 0,
           "gc_ms": 0.0,
@@ -204,13 +208,13 @@
         },
         {
           "mode": "kernel-warm",
-          "elapsed_ms": 2.9528141021728516,
+          "elapsed_ms": 4.4651031494140625,
           "probe": {
             "samples": 6,
-            "p50": 0.06804275512695308,
-            "p95": 0.21800804138183588,
-            "p99": 0.21800804138183588,
-            "max": 0.21800804138183588
+            "p50": 0.23207473754882807,
+            "p95": 0.32505798339843744,
+            "p99": 0.32505798339843744,
+            "max": 0.32505798339843744
           },
           "gcs": 0,
           "gc_ms": 0.0,
@@ -227,9 +231,9 @@
         }
       ],
       "process_resources": {
-        "wall_seconds": 1.004,
-        "user_cpu_seconds": 0.935,
-        "system_cpu_seconds": 0.224,
+        "wall_seconds": 1.518,
+        "user_cpu_seconds": 1.548,
+        "system_cpu_seconds": 0.295,
         "scope": "whole batch process: fixture creation, terminals and every case"
       }
     },
@@ -240,7 +244,9 @@
         "kernel_program": "/Users/ryan/agents/lispm-kernel-bench/build/lispm-kernel",
         "fixture_files": 256,
         "filler_lines_per_file": 128,
-        "fixture_bytes": 19641636,
+        "long_filler_lines_per_file": 768,
+        "files_ending_a_turn": 128,
+        "fixture_bytes": 68636964,
         "terminals": 0,
         "visible_terminals": 0,
         "order": "kernel-first",
@@ -258,9 +264,9 @@
           "cancelled": 0,
           "peak-queued": 0,
           "outbox-peak": 0,
-          "heap": 40112752,
+          "heap": 40169168,
           "gc-milliseconds": 0,
-          "uptime-milliseconds": 2
+          "uptime-milliseconds": 3
         },
         "kernel_stats_after": {
           "requests": 0,
@@ -271,22 +277,22 @@
           "failed": 0,
           "cancelled": 0,
           "peak-queued": 1,
-          "outbox-peak": 37075,
-          "heap": 62033856,
-          "gc-milliseconds": 34,
-          "uptime-milliseconds": 122
+          "outbox-peak": 36919,
+          "heap": 55238544,
+          "gc-milliseconds": 90,
+          "uptime-milliseconds": 247
         }
       },
       "results": [
         {
           "mode": "kernel-cold",
-          "elapsed_ms": 108.5660457611084,
+          "elapsed_ms": 231.4770221710205,
           "probe": {
-            "samples": 59,
-            "p50": 0,
-            "p95": 0.23994255065917963,
-            "p99": 4.849050521850586,
-            "max": 4.849050521850586
+            "samples": 120,
+            "p50": 0.10905075073242183,
+            "p95": 0.371072769165039,
+            "p99": 0.8021335601806641,
+            "max": 5.443904876708984
           },
           "gcs": 0,
           "gc_ms": 0.0,
@@ -303,27 +309,27 @@
         },
         {
           "mode": "elisp-cold",
-          "elapsed_ms": 232.44309425354004,
+          "elapsed_ms": 245.48602104187012,
           "probe": {
             "samples": 6,
-            "p50": 0.21610069274902338,
-            "p95": 230.45906829833984,
-            "p99": 230.45906829833984,
-            "max": 230.45906829833984
+            "p50": 0.28190422058105463,
+            "p95": 243.50604820251465,
+            "p99": 243.50604820251465,
+            "max": 243.50604820251465
           },
           "gcs": 12,
-          "gc_ms": 102.11099999999999,
+          "gc_ms": 104.575,
           "rows": 256
         },
         {
           "mode": "kernel-warm",
-          "elapsed_ms": 4.254817962646484,
+          "elapsed_ms": 4.381895065307617,
           "probe": {
-            "samples": 6,
-            "p50": 0.0711421966552734,
-            "p95": 0.210855484008789,
-            "p99": 0.210855484008789,
-            "max": 0.210855484008789
+            "samples": 7,
+            "p50": 0.10309028625488277,
+            "p95": 0.46691703796386713,
+            "p99": 0.46691703796386713,
+            "max": 0.46691703796386713
           },
           "gcs": 0,
           "gc_ms": 0.0,
@@ -340,13 +346,13 @@
         },
         {
           "mode": "elisp-warm",
-          "elapsed_ms": 2.6259422302246094,
+          "elapsed_ms": 2.6128292083740234,
           "probe": {
             "samples": 6,
-            "p50": 0.002000808715820271,
-            "p95": 0.6319026947021484,
-            "p99": 0.6319026947021484,
-            "max": 0.6319026947021484
+            "p50": 0.3729801177978515,
+            "p95": 0.6710033416748047,
+            "p99": 0.6710033416748047,
+            "max": 0.6710033416748047
           },
           "gcs": 0,
           "gc_ms": 0.0,
@@ -354,9 +360,9 @@
         }
       ],
       "process_resources": {
-        "wall_seconds": 0.958,
-        "user_cpu_seconds": 0.903,
-        "system_cpu_seconds": 0.196,
+        "wall_seconds": 1.521,
+        "user_cpu_seconds": 1.571,
+        "system_cpu_seconds": 0.293,
         "scope": "whole batch process: fixture creation, terminals and every case"
       }
     },
@@ -367,7 +373,9 @@
         "kernel_program": "/Users/ryan/agents/lispm-kernel-bench/build/lispm-kernel",
         "fixture_files": 256,
         "filler_lines_per_file": 128,
-        "fixture_bytes": 19641636,
+        "long_filler_lines_per_file": 768,
+        "files_ending_a_turn": 128,
+        "fixture_bytes": 68636964,
         "terminals": 0,
         "visible_terminals": 0,
         "order": "elisp-first",
@@ -385,9 +393,9 @@
           "cancelled": 0,
           "peak-queued": 0,
           "outbox-peak": 0,
-          "heap": 40112752,
+          "heap": 40169168,
           "gc-milliseconds": 0,
-          "uptime-milliseconds": 250
+          "uptime-milliseconds": 271
         },
         "kernel_stats_after": {
           "requests": 0,
@@ -398,36 +406,36 @@
           "failed": 0,
           "cancelled": 0,
           "peak-queued": 1,
-          "outbox-peak": 37075,
-          "heap": 59976432,
-          "gc-milliseconds": 32,
-          "uptime-milliseconds": 368
+          "outbox-peak": 36919,
+          "heap": 53899952,
+          "gc-milliseconds": 82,
+          "uptime-milliseconds": 508
         }
       },
       "results": [
         {
           "mode": "elisp-cold",
-          "elapsed_ms": 236.7420196533203,
+          "elapsed_ms": 257.28416442871094,
           "probe": {
             "samples": 6,
-            "p50": 0.04086303710937496,
-            "p95": 234.75918579101562,
-            "p99": 234.75918579101562,
-            "max": 234.75918579101562
+            "p50": 0.8831958770751953,
+            "p95": 255.30395317077637,
+            "p99": 255.30395317077637,
+            "max": 255.30395317077637
           },
           "gcs": 13,
-          "gc_ms": 104.588,
+          "gc_ms": 113.261,
           "rows": 256
         },
         {
           "mode": "kernel-cold",
-          "elapsed_ms": 106.0178279876709,
+          "elapsed_ms": 224.72000122070312,
           "probe": {
-            "samples": 57,
-            "p50": 0,
-            "p95": 0.2580623626708984,
-            "p99": 5.380962371826172,
-            "max": 5.380962371826172
+            "samples": 117,
+            "p50": 0.08210945129394527,
+            "p95": 0.4030208587646484,
+            "p99": 1.2439231872558594,
+            "max": 5.353067398071289
           },
           "gcs": 0,
           "gc_ms": 0.0,
@@ -444,13 +452,13 @@
         },
         {
           "mode": "elisp-warm",
-          "elapsed_ms": 2.5758743286132812,
+          "elapsed_ms": 2.783060073852539,
           "probe": {
             "samples": 6,
-            "p50": 0.002954483032226521,
-            "p95": 0.5830268859863281,
-            "p99": 0.5830268859863281,
-            "max": 0.5830268859863281
+            "p50": 0.029895782470703083,
+            "p95": 0.7930736541748047,
+            "p99": 0.7930736541748047,
+            "max": 0.7930736541748047
           },
           "gcs": 0,
           "gc_ms": 0.0,
@@ -458,13 +466,13 @@
         },
         {
           "mode": "kernel-warm",
-          "elapsed_ms": 5.412817001342773,
+          "elapsed_ms": 3.204822540283203,
           "probe": {
-            "samples": 7,
-            "p50": 0.01606750488281246,
-            "p95": 0.31409072875976557,
-            "p99": 0.31409072875976557,
-            "max": 0.31409072875976557
+            "samples": 6,
+            "p50": 0.2020339965820312,
+            "p95": 0.3989677429199218,
+            "p99": 0.3989677429199218,
+            "max": 0.3989677429199218
           },
           "gcs": 0,
           "gc_ms": 0.0,
@@ -481,9 +489,9 @@
         }
       ],
       "process_resources": {
-        "wall_seconds": 0.961,
-        "user_cpu_seconds": 0.912,
-        "system_cpu_seconds": 0.198,
+        "wall_seconds": 1.56,
+        "user_cpu_seconds": 1.57,
+        "system_cpu_seconds": 0.305,
         "scope": "whole batch process: fixture creation, terminals and every case"
       }
     }

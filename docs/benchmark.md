@@ -7,19 +7,27 @@ benchmark measures both, cold and warm, with and without the desktop's
 terminals drawing, to answer the question a design cannot: how long the
 scan takes, and how long Emacs stops answering while it runs.
 
-The result is what the kernel makes of the work. It reads the transcripts
-faster than Emacs does, and keeps Emacs's thread free while they are
-read: a cold scan finishes in about a tenth of a second, during which
-Emacs answers timers and keys as usual. The Elisp reader spends a quarter
-of a second on the same scan, and spends it not answering.
+The result is what the kernel makes of the work. It keeps Emacs's thread
+free while the transcripts are read: a cold scan takes two to three
+tenths of a second, during which Emacs answers timers and keys as usual.
+The Elisp reader takes as long or longer, and spends the whole time not
+answering. Whether the kernel also finishes first depends on how much of
+a transcript it must read: without terminals it does, by about a tenth;
+with them the two are about even.
 
 ## What is measured
 
-- **Workload.** 256 synthetic Codex transcripts, 19.6 MB in all. Each has
-  a `session_meta` line, a user message and 128 `response_item` filler
-  lines of 512 bytes. They are generated afresh in a temporary directory
-  for every batch Emacs, so no transcript of the user's is read and the
-  operating system's cache starts as empty as it can be made.
+- **Workload.** 256 synthetic Codex transcripts, 68.6 MB in all. Every
+  fourth is short and ends no turn, the next short and ends one, then a
+  long one that ends none, then a long one that does: 64 of each. All
+  have a `session_meta` line and a user message, then `response_item`
+  filler lines of 512 bytes, 128 of them or, in a long transcript, 768:
+  about 77 KB and 459 KB. So a short transcript's head and tail hold all
+  of it, while a long one's do not, and the kernel must read the end of a
+  long transcript whose tail tells of no turn. They are generated afresh
+  in a temporary directory for every batch Emacs, so no transcript of the
+  user's is read and the operating system's cache starts as empty as it
+  can be made.
 - **Readers.** `lispm-agent`'s own `lispm-agents-codex-sessions`, with its
   directory and index variables bound to the fixtures, and
   `lispm-kernel-scan-sessions` over the kernel's `scan-sessions` job,
@@ -27,7 +35,11 @@ of a second on the same scan, and spends it not answering.
   lists must be identical; a disagreement fails the run. The kernel's
   rows also carry `:turn-ended`, which lispm-agent's reader does not
   compute: the kernel tells it from the head and tail it has already
-  read, and reads no more of a transcript than the Elisp reader does.
+  read, and where they leave the end out and the tail tells of no turn,
+  from the transcript's last 256 KiB. Both readers read the head and the
+  tail of every transcript; the kernel reads 16.8 MB more, for the 64
+  long transcripts without a turn — 37.1 MB against 20.3 MB in all, 1.8
+  times the bytes.
 - **Cold and warm.** Cold is the first read of the fixtures in that Emacs,
   warm the second. The kernel prints its cache count in the scan summary:
   0 for cold, 256 for warm. The order alternates between repetitions, so
@@ -47,9 +59,9 @@ of a second on the same scan, and spends it not answering.
 - **Startup is not measured.** The kernel is pinged before the first case,
   so the cold kernel case does not include SBCL's start.
 - **Repetition.** Three batch Emacsen per configuration; the table gives
-  the median of each figure. Each batch process reports its own wall and
-  CPU time, but that covers fixture creation, terminals and all four
-  cases together, so it is not per-case CPU.
+  the median of each figure, the maximum's included. Each batch process
+  reports its own wall and CPU time, but that covers fixture creation,
+  terminals and all four cases together, so it is not per-case CPU.
 
 The machine is an Apple M1 Max (10 cores) running macOS 27.0.1, with
 Emacs 31.1 and SBCL 2.6.9. lispm-kernel is this branch's build, and
@@ -61,25 +73,26 @@ the figures.
 
 ## Results
 
-Medians of 3 runs, milliseconds. `rows` must equal 256 for a run to count.
+Medians of 3 runs, milliseconds. `rows` must equal 256 for a run to count;
+`max` is the median of the runs' longest timer waits.
 
 ### No terminals
 
 | case | elapsed | p50 | p95 | p99 | max | Emacs GCs |
 |---|---:|---:|---:|---:|---:|---:|
-| elisp-cold | 236.7 | 0.04 | 234.76 | 234.76 | 241.68 | 13 |
-| kernel-cold | 108.6 | 0.00 | 0.24 | 5.38 | 6.03 | 0 |
-| elisp-warm | 2.6 | 0.00 | 0.63 | 0.63 | 0.66 | 0 |
-| kernel-warm | 4.3 | 0.07 | 0.22 | 0.22 | 0.31 | 0 |
+| elisp-cold | 254.5 | 0.28 | 252.50 | 252.50 | 252.50 | 13 |
+| kernel-cold | 224.7 | 0.08 | 0.37 | 0.80 | 5.35 | 0 |
+| elisp-warm | 2.7 | 0.03 | 0.74 | 0.74 | 0.74 | 0 |
+| kernel-warm | 4.4 | 0.20 | 0.40 | 0.40 | 0.40 | 0 |
 
 ### Eight terminals
 
 | case | elapsed | p50 | p95 | p99 | max | Emacs GCs |
 |---|---:|---:|---:|---:|---:|---:|
-| elisp-cold | 256.3 | 0.24 | 254.36 | 254.36 | 304.17 | 11 |
-| kernel-cold | 146.3 | 0.00 | 1.08 | 9.22 | 12.12 | 0 |
-| elisp-warm | 2.3 | 0.05 | 0.35 | 0.35 | 0.99 | 0 |
-| kernel-warm | 5.5 | 0.02 | 0.38 | 0.38 | 0.86 | 0 |
+| elisp-cold | 275.4 | 0.17 | 273.37 | 273.37 | 273.37 | 11 |
+| kernel-cold | 284.6 | 0.02 | 0.89 | 2.09 | 6.98 | 0 |
+| elisp-warm | 2.3 | 0.19 | 0.66 | 0.66 | 0.66 | 0 |
+| kernel-warm | 19.7 | 0.00 | 0.92 | 8.29 | 8.29 | 1 |
 
 The generated reports are [session-benchmark.json](session-benchmark.json)
 and [session-benchmark-terminals.json](session-benchmark-terminals.json),
@@ -88,61 +101,65 @@ with every repetition's figures and the kernel's stats.
 ## Reading the table
 
 - **The Elisp reader stops Emacs for the whole scan.** Its p95 lateness
-  is the scan's own elapsed time: 235 ms without terminals, 254 ms with.
+  is the scan's own elapsed time: 253 ms without terminals, 273 with.
   The timer that should have run every 2 ms was held for a quarter of a
-  second, and Emacs's GC ran 11 to 13 times during it, 104 to 109 ms in
+  second, and Emacs's GC ran 11 to 13 times during it, 105 to 122 ms in
   all, on the same thread.
-- **The kernel does not stop Emacs.** Its p95 lateness is 0.24 ms without
-  terminals and 1.08 ms with them; p99 5.38 and 9.22 ms; the worst single
-  wait 6.0 and 12.1 ms. The kernel's own GC (32 to 42 ms) runs in the
+- **The kernel does not stop Emacs.** Its p95 lateness is 0.37 ms without
+  terminals and 0.89 ms with them; p99 0.80 and 2.09 ms; the worst single
+  wait 5.4 and 7.0 ms. The kernel's own GC (77 to 90 ms) runs in the
   kernel process, not in Emacs, and Emacs itself collected nothing during
-  the kernel's cold scan without terminals.
-- **The kernel also finishes first.** Cold, it took 109 ms against 237 ms
-  without terminals (2.18x), and 146 ms against 256 ms with them (1.75x).
-  It reads each transcript's head and tail once and parses them on four
-  threads; its turn state comes out of those same lines, so it returns a
-  field the Elisp reader does not compute without reading more of the
-  transcript. An earlier version of the kernel reopened every transcript
-  to look at its end for the turn, 2.2 times the bytes, and finished no
-  sooner than Emacs; the head-and-tail reuse is what the current figures
-  measure. With terminals, the kernel's result still waits for
-  frame-clock slices shared with terminal drawing; the shorter scan means
-  fewer of them.
+  the kernel's cold scan. In the kernel's warm case with terminals it
+  collected once, 9 ms, and its p99 reached 8.3 ms.
+- **The kernel finishes first without terminals, and is about level with
+  them.** Cold, without terminals, it took 225 ms against 254 (1.13x);
+  with them, 285 ms against 275 (0.97x). It reads each transcript's head
+  and tail once and parses them on four threads, but for the 64 long
+  transcripts whose tail tells of no turn it reads 256 KiB more to say
+  whether the turn ended: 37.1 MB against the Elisp reader's 20.3 MB.
+  With terminals, its completion also waits for frame-clock slices shared
+  with terminal drawing, and the longer read means more of them.
 - **Warm scans are cheap either way.** The Elisp reader's second read is
-  2.6 ms. The kernel's is 4.3 ms without terminals and 5.5 ms with them:
-  its cached rows are already in the kernel, and its completion waits for
-  an Emacs turn. A desktop that shows its cached session list and
+  2.7 ms without terminals and 2.3 ms with them. The kernel's is 4.4 and
+  19.7 ms: its cached rows are already in the kernel, and its completion
+  waits for an Emacs turn, which with terminals also carries the
+  terminals' output. Neither stops Emacs answering: its p95 lateness is
+  0.40 and 0.92 ms. A desktop that shows its cached session list and
   refreshes it in the background does not make the user wait for that
-  5.5 ms.
+  19.7 ms.
 - **The kernel's caches stay bounded.** For the cold scan: one request
-  accepted, peak queue 1, outbox peak 37 KB, kernel heap 57 to 62 MB,
-  32 to 42 ms of kernel GC. Eight terminals change the figure only
-  slightly.
+  accepted, peak queue 1, outbox peak 37 KB, kernel heap 54 to 62 MB
+  without terminals and 57 to 73 MB with them, 77 to 90 ms of kernel GC.
 
-So the kernel wins on both counts: it finishes a cold scan in 109 to
-146 ms where Emacs's own reader takes 237 to 256 ms, and it leaves
-Emacs's only thread answering timers throughout. The freeze the kernel
-exists to prevent is 235 to 254 ms of p95 lateness; the scan it replaces
-now also completes sooner.
+So the kernel's reason is the freeze it prevents: 253 to 273 ms of p95
+lateness becomes 0.4 to 0.9 ms, and Emacs answers timers throughout a
+scan that takes 0.2 to 0.3 s. Finishing first is a second claim, and this
+mix does not support it in every case: the kernel is about a tenth faster
+cold without terminals, and about level with them, where the turn state it
+returns costs reads the Elisp reader does not make and completion waits
+for frame-clock slices shared with terminal drawing.
 
 ## Limits
 
 - The transcripts are synthetic, with real Codex line shapes but
-  generated content.
+  generated content: a quarter short without a turn, a quarter short with
+  one, a quarter long without, a quarter long with.
 - Batch Emacs does not redisplay and takes no input. Terminal work here
   is the module reading output and updating its model, not painting a
   screen, and timer lateness is not input-to-paint.
 - Eight terminals writing 300 KiB/s each are a load, not a shell user.
 - Three repetitions on one machine; the medians hide variance and there
   are no confidence intervals. The kernel's terminal cases varied most:
-  across the three repetitions its cold scan ran 136 to 160 ms and its
-  warm scan 4 to 7 ms, because completion waits for frame-clock turns
-  shared with terminal drawing.
+  across the three repetitions its cold scan ran 271 to 287 ms and its
+  warm scan 6 to 38 ms, because completion waits for frame-clock turns
+  shared with terminal drawing, and the Elisp reader's terminal cold scan
+  varied almost as widely, 262 to 298 ms.
 - The kernel's process CPU and memory are outside Emacs's measured
   process. Its stats report heap and GC, but not per-case CPU.
-- Not measured: concurrent kernel jobs, cancellation, the fallback to the
-  Elisp reader when the kernel fails, and discovery through the desktop's
-  actual session list.
+- Not measured: what the Elisp reader would cost if it also computed the
+  turn state the kernel returns; concurrent kernel jobs, cancellation,
+  the fallback to the Elisp reader when the kernel fails, and discovery
+  through the desktop's actual session list.
 
 ## Reproducing it
 
