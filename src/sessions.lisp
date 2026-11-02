@@ -124,11 +124,13 @@ when the last `+turn-bytes+' do not tell, as `lispm-agents-tail-bytes'.")
   (and (stringp value) (not (blankp value)) value))
 
 (defun iso-timestamp-p (string)
-  "Return true when STRING is an ISO 8601 date and time in the forms agents
-write: `2026-10-21T01:02:03.456Z', each of the seconds, the fraction and
-the zone optional.  Emacs's `parse-iso8601-time-string' reads them, and
-the first one it reads is the session's start; one it cannot read is
-passed over, so a stamp that is no date tells nothing."
+  "Return true when STRING is an ISO 8601 date and time as agents write
+it: `2026-10-21T01:02:03.456Z', each of the seconds, the fraction and the
+zone optional.  Emacs's `parse-iso8601-time-string' reads every form this
+takes, and the first stamp of a transcript's head that it takes is the
+session's start; one it does not take — a stamp that is no date, or one in
+another of the forms that function reads, such as RFC 822's — is passed
+over."
   (labels ((digits-p (start count)
              (and (<= (+ start count) (length string))
                   (loop for index from start below (+ start count)
@@ -181,11 +183,11 @@ passed over, so a stamp that is no date tells nothing."
              ((and (>= length 13) (digits-p 0 4) (char= (char string 4) #\-))
               (and (digits-p 5 2) (char= (char string 7) #\-) (digits-p 8 2)
                    (< 10 length)
-                   (find (char string 10) "Tt ")
+                   (find (char string 10) "Tt")
                    (clock-p 11 t)))
              ;; 20261021T010203.
              ((and (>= length 11) (digits-p 0 8))
-              (and (find (char string 8) "Tt ")
+              (and (find (char string 8) "Tt")
                    (clock-p 9 nil)))
              (t nil))))))
 
@@ -304,8 +306,10 @@ transcript PATH that is not in its head, whose lines are HEAD, or nil.
 Lines are decoded one by one, so the head's lines are the first of
 those, and hold none."
   (checkpoint)
-  (first-line (make-lines (read-head-and-tail path +prompt-bytes+ 0))
-              #'codex-prompt :start (line-count head)))
+  (let ((read (read-head-and-tail path +prompt-bytes+ 0)))
+    (and read
+         (first-line (make-lines (transcript-read-head read))
+                     #'codex-prompt :start (line-count head)))))
 
 (defun codex-spawn-field (payload field)
   "Return nonblank FIELD from Codex metadata PAYLOAD or its spawn source."
@@ -578,15 +582,20 @@ interruption, ends a turn.  So `lispm-agents-claude-turn-ended-p'."
                  :ended
                  :working))))))
 
-(defun turn-ended (agent path &key head tail cut covered)
+(defun turn-ended (agent path &optional read)
   "Return true when the latest turn the end of AGENT's transcript PATH
 tells of has ended, false when it has not or none is told of there.
 The end is its last `+turn-bytes+', else its last `+end-bytes+': a record
-of a turn in the first is the last of the second too.  HEAD, TAIL, CUT
-and COVERED are what `read-head-and-tail' returned for PATH: when they
-hold every line of it, it is not read again; when they do not and TAIL
-tells of no turn, its end is read.  Without HEAD, it is read now."
-  (let ((turn (if (eq agent :codex) #'codex-turn #'claude-turn)))
+of a turn in the first is the last of the second too.  READ is the
+`transcript-read' of PATH: when it is covered, PATH is not read again;
+when it is not and its tail tells of no turn, its end is read.  Without
+READ, its end is read now."
+  (let ((turn (if (eq agent :codex) #'codex-turn #'claude-turn))
+        (head (and read (make-lines (transcript-read-head read))))
+        (tail (let ((tail (and read (transcript-read-tail read))))
+                (and tail (make-lines tail))))
+        (cut (and read (transcript-read-cut read)))
+        (covered (and read (transcript-read-covered read))))
     (labels ((look (lines)
                (and lines (first-line lines turn :from-end t)))
              (read-look (bytes)
@@ -662,15 +671,14 @@ tells of no turn, its end is read.  Without HEAD, it is read now."
 
 ;;;; Scanning
 
-(defun compact-session (session agent path &key head tail cut covered)
+(defun compact-session (session agent path &optional read)
   "Return SESSION, of AGENT's transcript PATH, compact, with whether its
-latest turn has ended.  HEAD, TAIL, CUT and COVERED are what
-`read-head-and-tail' returned for PATH."
+latest turn has ended.  READ is the `transcript-read' of PATH."
   (when session
     (make-session (ascii-compact (session-id session)) (ascii-compact (session-cwd session))
                   (ascii-compact (session-title session)) (ascii-compact (session-file session))
                   (session-mtime session) (ascii-compact (session-started session))
-                  (turn-ended agent path :head head :tail tail :cut cut :covered covered)
+                  (turn-ended agent path read)
                   (ascii-compact (session-parent session)))))
 
 (defun transcript-session (cache agent path)
@@ -683,19 +691,18 @@ latest turn has ended.  HEAD, TAIL, CUT and COVERED are what
         (multiple-value-bind (session found) (cached cache 'transcripts path stamp)
           (if found
               (cons :cached session)
-              (multiple-value-bind (head tail read-stamp cut size covered)
-                  (read-head-and-tail path +head-bytes+ +tail-bytes+)
-                (declare (ignore size))
-                (if (null read-stamp)
+              (let ((read (read-head-and-tail path +head-bytes+ +tail-bytes+)))
+                (if (null read)
                     (cons :skipped nil)
-                    (let* ((head-lines (make-lines head))
+                    (let* ((stamp (transcript-read-stamp read))
+                           (head-lines (make-lines (transcript-read-head read)))
+                           (tail (transcript-read-tail read))
                            (tail-lines (and tail (make-lines tail)))
                            (session (compact-session
                                      (funcall (if (eq agent :codex) #'codex-session #'claude-session)
-                                              path head-lines tail-lines read-stamp)
-                                     agent path :head head-lines :tail tail-lines
-                                     :cut cut :covered covered)))
-                      (store cache 'transcripts path read-stamp session)
+                                              path head-lines tail-lines stamp)
+                                     agent path read)))
+                      (store cache 'transcripts path stamp session)
                       (cons :read session)))))))))
 
 (defun truncate-title (title)

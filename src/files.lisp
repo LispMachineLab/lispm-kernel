@@ -250,6 +250,20 @@ stamp; return nil without running it when PATH is none."
                   ,@body)
              (if ,stream (close ,stream) (sb-posix:close ,fd))))))))
 
+(defstruct (transcript-read
+            (:constructor make-transcript-read (head tail stamp cut size covered))
+            (:copier nil))
+  "What `read-head-and-tail' read of a transcript: HEAD and TAIL, the
+lines of its head and tail, STAMP of the file, CUT, the line the two leave
+out between them, SIZE of the file, and COVERED, true when head, line and
+tail hold every complete line of it."
+  (head nil :read-only t)
+  (tail nil :read-only t)
+  (stamp nil :read-only t)
+  (cut nil :read-only t)
+  (size 0 :read-only t)
+  (covered nil :read-only t))
+
 (defun boundary-line (head tail)
   "Return the line HEAD and TAIL leave out between them, or nil when they
 leave out none.  HEAD ends, and TAIL begins, where one line is cut in
@@ -257,20 +271,23 @@ two, or where HEAD ends on a newline and TAIL begins on the next line."
   (let* ((start (let ((newline (position 10 head :from-end t)))
                   (if newline (1+ newline) 0)))
          (end (or (position 10 tail) (length tail)))
-         (line (concatenate 'string (octets-text head start (length head))
-                            (octets-text tail 0 end))))
+         ;; Joined before it is decoded, so a character the boundary cuts in
+         ;; two is still the one character the file holds.
+         (octets (concatenate '(vector (unsigned-byte 8))
+                              (subseq head start) (subseq tail 0 end)))
+         (line (octets-text octets 0 (length octets))))
     (and (plusp (length line)) line)))
 
 (defun read-head-and-tail (path head-bytes tail-bytes)
-  "Return the lines of the head and the tail of regular file PATH, and its
-stamp, or nil when it is none or cannot be read.
+  "Return a `transcript-read' of the head and tail of regular file PATH,
+or nil when it is none or cannot be read.
 The head is the first HEAD-BYTES, its last line left out when the file
 goes on; the tail, read only when the file is longer than HEAD-BYTES, is
 the last TAIL-BYTES after the head, its first line left out.  So lispm-agent
-reads a transcript.  The fourth value is the line the head and tail leave
-out between them, when the tail begins where the head ends and they cut
-one, the fifth the file's size, and the sixth true when head, line and
-tail hold every complete line of the file."
+reads a transcript.  Its cut is the line the head and tail leave out
+between them, when the tail begins where the head ends and they cut one,
+and it is covered when head, line and tail hold every complete line of the
+file."
   (handler-case
       (with-regular-file (stream stamp path)
         (let* ((size (stamp-size stamp))
@@ -278,15 +295,14 @@ tail hold every complete line of the file."
                (head (read-range stream 0 head-end))
                (tail (when (and (> size head-bytes) (plusp tail-bytes))
                        (read-range stream (max head-bytes (- size tail-bytes)) size))))
-          (values (octet-lines head :drop-last (< head-end size))
-                  (and tail (octet-lines tail :drop-first t))
-                  stamp
-                  (and tail
-                       (<= size (+ head-bytes tail-bytes))
-                       (boundary-line head tail))
-                  size
-                  (or (<= size head-bytes)
-                      (and tail (<= size (+ head-bytes tail-bytes)))))))
+          (make-transcript-read
+           (octet-lines head :drop-last (< head-end size))
+           (and tail (octet-lines tail :drop-first t))
+           stamp
+           (and tail (<= size (+ head-bytes tail-bytes)) (boundary-line head tail))
+           size
+           (or (<= size head-bytes)
+               (and tail (<= size (+ head-bytes tail-bytes)))))))
     (error () nil)))
 
 (defun read-file-octets (path limit)

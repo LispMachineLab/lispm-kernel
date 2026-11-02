@@ -55,8 +55,9 @@ test-emacs: $(PROGRAM)
 	$(if $(AGENTS),,@echo "No lispm-agent at $(LISPM_AGENT): the tests of the agents' sessions were skipped")
 
 compile:
-	$(EMACS_BATCH) --eval '(setq byte-compile-error-on-warn t)' -f batch-byte-compile lisp/*.el bench/*.el
+	$(EMACS_BATCH) --eval '(setq byte-compile-error-on-warn t)' -f batch-byte-compile lisp/*.el $(if $(AGENTS),bench/*.el)
 	/bin/rm -f lisp/*.elc bench/*.elc
+	$(if $(AGENTS),,@echo "No lispm-agent at $(LISPM_AGENT): the benchmark was not byte-compiled")
 
 bench: $(PROGRAM)
 	python3 scripts/bench-sessions.py --emacs $(EMACS) --make $(MAKE) \

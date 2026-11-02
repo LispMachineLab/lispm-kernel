@@ -394,7 +394,7 @@ tests do, rather than let the frame clock take the messages in."
                             (cons 'filler_lines_per_file filler-lines)
                             (cons 'long_filler_lines_per_file
                                   (* lispm-kernel-bench--long-factor filler-lines))
-                            (cons 'files_ending_a_turn (/ (+ count 1) 2))
+                            (cons 'files_ending_a_turn (/ count 2))
                             (cons 'fixture_bytes bytes)
                             (cons 'terminals terminal-count)
                             (cons 'visible_terminals (if (> terminal-count 0) 1 0))

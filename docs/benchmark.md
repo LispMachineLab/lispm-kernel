@@ -10,7 +10,7 @@ scan takes, and how long Emacs stops answering while it runs.
 The result is what the kernel makes of the work. It keeps Emacs's thread
 free while the transcripts are read: a cold scan takes two to three
 tenths of a second, during which Emacs answers timers and keys as usual.
-The Elisp reader takes as long or longer, and spends the whole time not
+The Elisp reader takes about as long, and spends the whole time not
 answering. Whether the kernel also finishes first depends on how much of
 a transcript it must read: without terminals it does, by about a tenth;
 with them the two are about even.
