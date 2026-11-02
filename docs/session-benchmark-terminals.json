@@ -1,0 +1,491 @@
+{
+  "generated_at": "2026-11-02T17:24:24+0800",
+  "repeats": 3,
+  "host": {
+    "system": "macOS-27.0.1-x86_64-i386-64bit",
+    "machine": "arm64",
+    "processor": "Apple M1 Max",
+    "cpus": 10,
+    "python": "3.8.2",
+    "python_machine": "x86_64",
+    "python_translated": true
+  },
+  "orders": [
+    "elisp-first",
+    "kernel-first",
+    "elisp-first"
+  ],
+  "environment": {
+    "emacs": "31.1",
+    "system": "aarch64-apple-darwin25.6.0",
+    "kernel_program": "/Users/ryan/agents/lispm-kernel-bench/build/lispm-kernel",
+    "fixture_files": 256,
+    "filler_lines_per_file": 128,
+    "fixture_bytes": 19641636,
+    "terminals": 8,
+    "visible_terminals": 1,
+    "order": "elisp-first",
+    "scheduler": "frame-clock",
+    "slice_seconds": 0.003,
+    "probe_interval_ms": 2.0,
+    "kind": "synthetic fixture; timer lateness is a proxy, not input-to-paint",
+    "kernel_stats_before": {
+      "requests": 0,
+      "queued": 0,
+      "accepted": 0,
+      "rejected": 0,
+      "success": 0,
+      "failed": 0,
+      "cancelled": 0,
+      "peak-queued": 0,
+      "outbox-peak": 0,
+      "heap": 40107056,
+      "gc-milliseconds": 0,
+      "uptime-milliseconds": 274
+    },
+    "kernel_stats_after": {
+      "requests": 0,
+      "queued": 0,
+      "accepted": 1,
+      "rejected": 0,
+      "success": 1,
+      "failed": 0,
+      "cancelled": 0,
+      "peak-queued": 1,
+      "outbox-peak": 37075,
+      "heap": 63270688,
+      "gc-milliseconds": 84,
+      "uptime-milliseconds": 620
+    }
+  },
+  "summary": {
+    "elisp-cold": {
+      "elapsed_ms": 250.015,
+      "p50_ms": 0.188,
+      "p95_ms": 248.031,
+      "p99_ms": 248.031,
+      "max_ms": 248.899,
+      "gcs": 11,
+      "gc_ms": 107.624,
+      "rows": 256
+    },
+    "kernel-cold": {
+      "elapsed_ms": 321.209,
+      "p50_ms": 0,
+      "p95_ms": 1.151,
+      "p99_ms": 3.427,
+      "max_ms": 9.219,
+      "gcs": 0,
+      "gc_ms": 0.0,
+      "rows": 256
+    },
+    "elisp-warm": {
+      "elapsed_ms": 2.308,
+      "p50_ms": 0.064,
+      "p95_ms": 0.317,
+      "p99_ms": 0.317,
+      "max_ms": 0.467,
+      "gcs": 0,
+      "gc_ms": 0.0,
+      "rows": 256
+    },
+    "kernel-warm": {
+      "elapsed_ms": 20.25,
+      "p50_ms": 0.023,
+      "p95_ms": 0.349,
+      "p99_ms": 0.349,
+      "max_ms": 0.391,
+      "gcs": 0,
+      "gc_ms": 0.0,
+      "rows": 256
+    }
+  },
+  "comparison": {
+    "cold_kernel_over_elisp": 0.78,
+    "warm_kernel_over_elisp": 0.11,
+    "note": "ratios above 1 mean the kernel finished in less time"
+  },
+  "runs": [
+    {
+      "environment": {
+        "emacs": "31.1",
+        "system": "aarch64-apple-darwin25.6.0",
+        "kernel_program": "/Users/ryan/agents/lispm-kernel-bench/build/lispm-kernel",
+        "fixture_files": 256,
+        "filler_lines_per_file": 128,
+        "fixture_bytes": 19641636,
+        "terminals": 8,
+        "visible_terminals": 1,
+        "order": "elisp-first",
+        "scheduler": "frame-clock",
+        "slice_seconds": 0.003,
+        "probe_interval_ms": 2.0,
+        "kind": "synthetic fixture; timer lateness is a proxy, not input-to-paint",
+        "kernel_stats_before": {
+          "requests": 0,
+          "queued": 0,
+          "accepted": 0,
+          "rejected": 0,
+          "success": 0,
+          "failed": 0,
+          "cancelled": 0,
+          "peak-queued": 0,
+          "outbox-peak": 0,
+          "heap": 40107056,
+          "gc-milliseconds": 0,
+          "uptime-milliseconds": 274
+        },
+        "kernel_stats_after": {
+          "requests": 0,
+          "queued": 0,
+          "accepted": 1,
+          "rejected": 0,
+          "success": 1,
+          "failed": 0,
+          "cancelled": 0,
+          "peak-queued": 1,
+          "outbox-peak": 37075,
+          "heap": 63270688,
+          "gc-milliseconds": 84,
+          "uptime-milliseconds": 620
+        }
+      },
+      "results": [
+        {
+          "mode": "elisp-cold",
+          "elapsed_ms": 250.0150203704834,
+          "probe": {
+            "samples": 6,
+            "p50": 0.187967300415039,
+            "p95": 248.0309944152832,
+            "p99": 248.0309944152832,
+            "max": 248.0309944152832
+          },
+          "gcs": 11,
+          "gc_ms": 107.88400000000001,
+          "rows": 256
+        },
+        {
+          "mode": "kernel-cold",
+          "elapsed_ms": 328.7391662597656,
+          "probe": {
+            "samples": 169,
+            "p50": 0,
+            "p95": 1.2398700714111328,
+            "p99": 2.948854446411133,
+            "max": 5.805109024047852
+          },
+          "gcs": 0,
+          "gc_ms": 0.0,
+          "rows": 256,
+          "summary": {
+            "files": 256,
+            "rows": 256,
+            "empty": 0,
+            "skipped": 0,
+            "cached": 0,
+            "truncated": false,
+            "turn-ended": true
+          }
+        },
+        {
+          "mode": "elisp-warm",
+          "elapsed_ms": 2.2308826446533203,
+          "probe": {
+            "samples": 5,
+            "p50": 0.009868621826171833,
+            "p95": 0.24113464355468744,
+            "p99": 0.24113464355468744,
+            "max": 0.24113464355468744
+          },
+          "gcs": 0,
+          "gc_ms": 0.0,
+          "rows": 256
+        },
+        {
+          "mode": "kernel-warm",
+          "elapsed_ms": 21.76213264465332,
+          "probe": {
+            "samples": 15,
+            "p50": 0,
+            "p95": 0.3908615112304687,
+            "p99": 0.3908615112304687,
+            "max": 0.3908615112304687
+          },
+          "gcs": 0,
+          "gc_ms": 0.0,
+          "rows": 256,
+          "summary": {
+            "files": 256,
+            "rows": 256,
+            "empty": 0,
+            "skipped": 0,
+            "cached": 256,
+            "truncated": false,
+            "turn-ended": true
+          }
+        }
+      ],
+      "process_resources": {
+        "wall_seconds": 1.312,
+        "user_cpu_seconds": 1.975,
+        "system_cpu_seconds": 2.272,
+        "scope": "whole batch process: fixture creation, terminals and every case"
+      }
+    },
+    {
+      "environment": {
+        "emacs": "31.1",
+        "system": "aarch64-apple-darwin25.6.0",
+        "kernel_program": "/Users/ryan/agents/lispm-kernel-bench/build/lispm-kernel",
+        "fixture_files": 256,
+        "filler_lines_per_file": 128,
+        "fixture_bytes": 19641636,
+        "terminals": 8,
+        "visible_terminals": 1,
+        "order": "kernel-first",
+        "scheduler": "frame-clock",
+        "slice_seconds": 0.003,
+        "probe_interval_ms": 2.0,
+        "kind": "synthetic fixture; timer lateness is a proxy, not input-to-paint",
+        "kernel_stats_before": {
+          "requests": 0,
+          "queued": 0,
+          "accepted": 0,
+          "rejected": 0,
+          "success": 0,
+          "failed": 0,
+          "cancelled": 0,
+          "peak-queued": 0,
+          "outbox-peak": 0,
+          "heap": 40107056,
+          "gc-milliseconds": 0,
+          "uptime-milliseconds": 12
+        },
+        "kernel_stats_after": {
+          "requests": 0,
+          "queued": 0,
+          "accepted": 1,
+          "rejected": 0,
+          "success": 1,
+          "failed": 0,
+          "cancelled": 0,
+          "peak-queued": 1,
+          "outbox-peak": 37075,
+          "heap": 57868608,
+          "gc-milliseconds": 77,
+          "uptime-milliseconds": 312
+        }
+      },
+      "results": [
+        {
+          "mode": "kernel-cold",
+          "elapsed_ms": 274.11794662475586,
+          "probe": {
+            "samples": 141,
+            "p50": 0,
+            "p95": 0.41899490356445307,
+            "p99": 7.414911270141602,
+            "max": 9.219024658203125
+          },
+          "gcs": 1,
+          "gc_ms": 10.194999999999995,
+          "rows": 256,
+          "summary": {
+            "files": 256,
+            "rows": 256,
+            "empty": 0,
+            "skipped": 0,
+            "cached": 0,
+            "truncated": false,
+            "turn-ended": true
+          }
+        },
+        {
+          "mode": "elisp-cold",
+          "elapsed_ms": 244.08292770385742,
+          "probe": {
+            "samples": 6,
+            "p50": 0.013921737670898396,
+            "p95": 242.10605430603027,
+            "p99": 242.10605430603027,
+            "max": 242.10605430603027
+          },
+          "gcs": 10,
+          "gc_ms": 96.35199999999999,
+          "rows": 256
+        },
+        {
+          "mode": "kernel-warm",
+          "elapsed_ms": 7.017850875854492,
+          "probe": {
+            "samples": 8,
+            "p50": 0.04014778137207027,
+            "p95": 0.34913825988769526,
+            "p99": 0.34913825988769526,
+            "max": 0.34913825988769526
+          },
+          "gcs": 0,
+          "gc_ms": 0.0,
+          "rows": 256,
+          "summary": {
+            "files": 256,
+            "rows": 256,
+            "empty": 0,
+            "skipped": 0,
+            "cached": 256,
+            "truncated": false,
+            "turn-ended": true
+          }
+        },
+        {
+          "mode": "elisp-warm",
+          "elapsed_ms": 2.3729801177978516,
+          "probe": {
+            "samples": 5,
+            "p50": 0.3589134216308593,
+            "p95": 0.46691703796386713,
+            "p99": 0.46691703796386713,
+            "max": 0.46691703796386713
+          },
+          "gcs": 0,
+          "gc_ms": 0.0,
+          "rows": 256
+        }
+      ],
+      "process_resources": {
+        "wall_seconds": 1.285,
+        "user_cpu_seconds": 1.981,
+        "system_cpu_seconds": 1.933,
+        "scope": "whole batch process: fixture creation, terminals and every case"
+      }
+    },
+    {
+      "environment": {
+        "emacs": "31.1",
+        "system": "aarch64-apple-darwin25.6.0",
+        "kernel_program": "/Users/ryan/agents/lispm-kernel-bench/build/lispm-kernel",
+        "fixture_files": 256,
+        "filler_lines_per_file": 128,
+        "fixture_bytes": 19641636,
+        "terminals": 8,
+        "visible_terminals": 1,
+        "order": "elisp-first",
+        "scheduler": "frame-clock",
+        "slice_seconds": 0.003,
+        "probe_interval_ms": 2.0,
+        "kind": "synthetic fixture; timer lateness is a proxy, not input-to-paint",
+        "kernel_stats_before": {
+          "requests": 0,
+          "queued": 0,
+          "accepted": 0,
+          "rejected": 0,
+          "success": 0,
+          "failed": 0,
+          "cancelled": 0,
+          "peak-queued": 0,
+          "outbox-peak": 0,
+          "heap": 40107056,
+          "gc-milliseconds": 0,
+          "uptime-milliseconds": 269
+        },
+        "kernel_stats_after": {
+          "requests": 0,
+          "queued": 0,
+          "accepted": 1,
+          "rejected": 0,
+          "success": 1,
+          "failed": 0,
+          "cancelled": 0,
+          "peak-queued": 1,
+          "outbox-peak": 37075,
+          "heap": 56107376,
+          "gc-milliseconds": 81,
+          "uptime-milliseconds": 607
+        }
+      },
+      "results": [
+        {
+          "mode": "elisp-cold",
+          "elapsed_ms": 250.88214874267578,
+          "probe": {
+            "samples": 6,
+            "p50": 0.23112106323242182,
+            "p95": 248.899076461792,
+            "p99": 248.899076461792,
+            "max": 248.899076461792
+          },
+          "gcs": 11,
+          "gc_ms": 107.624,
+          "rows": 256
+        },
+        {
+          "mode": "kernel-cold",
+          "elapsed_ms": 321.209192276001,
+          "probe": {
+            "samples": 165,
+            "p50": 0,
+            "p95": 1.15093994140625,
+            "p99": 3.4268836975097656,
+            "max": 7.418010711669922
+          },
+          "gcs": 0,
+          "gc_ms": 0.0,
+          "rows": 256,
+          "summary": {
+            "files": 256,
+            "rows": 256,
+            "empty": 0,
+            "skipped": 0,
+            "cached": 0,
+            "truncated": false,
+            "turn-ended": true
+          }
+        },
+        {
+          "mode": "elisp-warm",
+          "elapsed_ms": 2.307891845703125,
+          "probe": {
+            "samples": 5,
+            "p50": 0.06398963928222652,
+            "p95": 0.3171901702880859,
+            "p99": 0.3171901702880859,
+            "max": 0.3171901702880859
+          },
+          "gcs": 0,
+          "gc_ms": 0.0,
+          "rows": 256
+        },
+        {
+          "mode": "kernel-warm",
+          "elapsed_ms": 20.25008201599121,
+          "probe": {
+            "samples": 14,
+            "p50": 0.02298164367675777,
+            "p95": 0.3169517517089843,
+            "p99": 0.3169517517089843,
+            "max": 0.3169517517089843
+          },
+          "gcs": 0,
+          "gc_ms": 0.0,
+          "rows": 256,
+          "summary": {
+            "files": 256,
+            "rows": 256,
+            "empty": 0,
+            "skipped": 0,
+            "cached": 256,
+            "truncated": false,
+            "turn-ended": true
+          }
+        }
+      ],
+      "process_resources": {
+        "wall_seconds": 1.343,
+        "user_cpu_seconds": 1.983,
+        "system_cpu_seconds": 2.152,
+        "scope": "whole batch process: fixture creation, terminals and every case"
+      }
+    }
+  ]
+}

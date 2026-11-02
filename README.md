@@ -95,6 +95,7 @@ make                # build/lispm-kernel
 make test-lisp      # the kernel's own tests, in SBCL
 make test-emacs     # Emacs and the program, with lispm-agent beside (../lispm-agent/lisp)
 make compile        # byte-compile the Emacs Lisp, warnings failing it
+make bench          # session discovery, measured, see docs/benchmark.md
 ```
 
 From the REPL, for SLY or SLIME: `(push #p"/path/to/lispm-kernel/" asdf:*central-registry*)`,
