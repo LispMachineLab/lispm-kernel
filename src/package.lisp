@@ -60,6 +60,13 @@
            #:stamp=
            #:file-stamp
            #:directory-names
+           #:transcript-read
+           #:transcript-read-head
+           #:transcript-read-tail
+           #:transcript-read-stamp
+           #:transcript-read-cut
+           #:transcript-read-size
+           #:transcript-read-covered
            #:read-head-and-tail
            #:read-file-octets
            #:octet-lines

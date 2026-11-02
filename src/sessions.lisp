@@ -47,11 +47,14 @@
 ;;; latest turn has ended is told by the last record of a turn its end
 ;;; holds, as the agents' :ready read it in lispm-agents-codex.el and
 ;;; lispm-agents-claude.el: its last 16 KiB, or when they hold none, its
-;;; last 256 KiB, the line the start cuts left out.  Each transcript read is
-;;; kept with its stamp, so another scan reads only those that changed;
-;;; a complete scan forgets those it did not see.  Transcripts are read
-;;; on several threads at once.  Of the sessions of one id, the newest
-;;; transcript's is kept.
+;;; last 256 KiB, the line the start cuts left out.  The lines the head
+;;; and tail hold are looked in first, the line they leave out between
+;;; them too, so a transcript that they hold all of is read once; one
+;;; longer than them is read again only when its tail holds no turn.
+;;; Each transcript read is kept with its stamp, so another scan reads
+;;; only those that changed; a complete scan forgets those it did not
+;;; see.  Transcripts are read on several threads at once.  Of the
+;;; sessions of one id, the newest transcript's is kept.
 ;;;
 ;;; Sessions go to Emacs in chunks, lists of
 ;;;
@@ -119,6 +122,74 @@ when the last `+turn-bytes+' do not tell, as `lispm-agents-tail-bytes'.")
 (defun non-blank (value)
   "Return VALUE when it is a string that is not blank, else nil."
   (and (stringp value) (not (blankp value)) value))
+
+(defun iso-timestamp-p (string)
+  "Return true when STRING is an ISO 8601 date and time as agents write
+it: `2026-10-21T01:02:03.456Z', each of the seconds, the fraction and the
+zone optional.  Emacs's `parse-iso8601-time-string' reads every form this
+takes, and the first stamp of a transcript's head that it takes is the
+session's start; one it does not take — a stamp that is no date, or one in
+another of the forms that function reads, such as RFC 822's — is passed
+over."
+  (labels ((digits-p (start count)
+             (and (<= (+ start count) (length string))
+                  (loop for index from start below (+ start count)
+                        always (digit-char-p (char string index)))))
+           (digit-count (start)
+             (loop for index from start below (length string)
+                   while (digit-char-p (char string index))
+                   count 1))
+           (zone-p (start)
+             (let ((length (length string)))
+               (cond ((= start length) t)
+                     ((and (find (char string start) "Zz")
+                           (= (1+ start) length))
+                      t)
+                     ((find (char string start) "+-")
+                      (let ((rest (1+ start)))
+                        (or (and (= (+ rest 2) length) (digits-p rest 2))
+                            (and (= (+ rest 4) length) (digits-p rest 4))
+                            (and (= (+ rest 5) length)
+                                 (digits-p rest 2)
+                                 (char= (char string (+ rest 2)) #\:)
+                                 (digits-p (+ rest 3) 2)))))
+                     (t nil))))
+           (tail-p (start)
+             (let* ((length (length string))
+                    (after (if (and (< start length) (char= (char string start) #\.))
+                               (let ((count (digit-count (1+ start))))
+                                 (and (plusp count) (+ start 1 count)))
+                               start)))
+               (and after (zone-p after))))
+           (clock-p (start extended)
+             (if extended
+                 (let ((position start))
+                   (and (digits-p position 2)
+                        (progn (incf position 2)
+                               (dotimes (_ 2)
+                                 (when (and (< position (length string))
+                                            (char= (char string position) #\:))
+                                   (if (digits-p (1+ position) 2)
+                                       (incf position 3)
+                                       (return-from clock-p nil))))
+                               (tail-p position))))
+                 (let ((count (digit-count start)))
+                   (and (member count '(2 4 6))
+                        (tail-p (+ start count)))))))
+    (and (stringp string)
+         (let ((length (length string)))
+           (cond
+             ;; 2026-10-21T01:02:03, its clock from the hour up.
+             ((and (>= length 13) (digits-p 0 4) (char= (char string 4) #\-))
+              (and (digits-p 5 2) (char= (char string 7) #\-) (digits-p 8 2)
+                   (< 10 length)
+                   (find (char string 10) "Tt")
+                   (clock-p 11 t)))
+             ;; 20261021T010203.
+             ((and (>= length 11) (digits-p 0 8))
+              (and (find (char string 8) "Tt")
+                   (clock-p 9 nil)))
+             (t nil))))))
 
 ;;;; As lispm-agent reads transcripts
 
@@ -235,8 +306,10 @@ transcript PATH that is not in its head, whose lines are HEAD, or nil.
 Lines are decoded one by one, so the head's lines are the first of
 those, and hold none."
   (checkpoint)
-  (first-line (make-lines (read-head-and-tail path +prompt-bytes+ 0))
-              #'codex-prompt :start (line-count head)))
+  (let ((read (read-head-and-tail path +prompt-bytes+ 0)))
+    (and read
+         (first-line (make-lines (transcript-read-head read))
+                     #'codex-prompt :start (line-count head)))))
 
 (defun codex-spawn-field (payload field)
   "Return nonblank FIELD from Codex metadata PAYLOAD or its spawn source."
@@ -443,7 +516,8 @@ lines are HEAD and TAIL."
           (cwd (or (cwd head) (and tail (cwd tail))))
           ;; Later replies change mtime, but not when the session opened.
           (started (first-line head (lambda (object)
-                                      (non-blank (json-get object "timestamp")))))
+                                      (let ((stamp (json-get object "timestamp")))
+                                        (and (iso-timestamp-p stamp) stamp)))))
           (subagent (claude-subagent path)))
       (destructuring-bind (&optional session task parent) subagent
         (when (and cwd (or title task prompt))
@@ -508,20 +582,38 @@ interruption, ends a turn.  So `lispm-agents-claude-turn-ended-p'."
                  :ended
                  :working))))))
 
-(defun turn-ended (agent path)
+(defun turn-ended (agent path &optional read head-lines tail-lines)
   "Return true when the latest turn the end of AGENT's transcript PATH
 tells of has ended, false when it has not or none is told of there.
 The end is its last `+turn-bytes+', else its last `+end-bytes+': a record
-of a turn in the first is the last of the second too."
-  (let ((turn (if (eq agent :codex) #'codex-turn #'claude-turn)))
-    (flet ((look (bytes)
-             (multiple-value-bind (octets stamp cut) (read-file-octets path bytes)
-               (declare (ignore stamp))
-               (values (and octets
-                            (first-line (make-lines (octet-lines octets :drop-first cut)) turn :from-end t))
-                       cut))))
-      (multiple-value-bind (state cut) (look +turn-bytes+)
-        (eq :ended (if (or state (not cut)) state (look +end-bytes+)))))))
+of a turn in the first is the last of the second too.  READ is the
+`transcript-read' of PATH: when it is covered, PATH is not read again;
+when it is not and its tail tells of no turn, its end is read.  Without
+READ, its end is read now.  HEAD-LINES and TAIL-LINES, when given, are
+READ's head and tail already wrapped as `lines'."
+  (let ((turn (if (eq agent :codex) #'codex-turn #'claude-turn))
+        (head (or head-lines (and read (make-lines (transcript-read-head read)))))
+        (tail (or tail-lines
+                  (let ((tail (and read (transcript-read-tail read))))
+                    (and tail (make-lines tail)))))
+        (cut (and read (transcript-read-cut read)))
+        (covered (and read (transcript-read-covered read))))
+    (labels ((look (lines)
+               (and lines (first-line lines turn :from-end t)))
+             (read-look (bytes)
+               (multiple-value-bind (octets stamp cut) (read-file-octets path bytes)
+                 (declare (ignore stamp))
+                 (values (and octets
+                              (look (make-lines (octet-lines octets :drop-first cut))))
+                         cut))))
+      (if head
+          (let ((state (or (look tail)
+                           (look (and cut (make-lines (list cut)))))))
+            (cond (state (eq :ended state))
+                  (covered (eq :ended (look head)))
+                  (t (eq :ended (read-look +end-bytes+)))))
+          (multiple-value-bind (state cut) (read-look +turn-bytes+)
+            (eq :ended (if (or state (not cut)) state (read-look +end-bytes+))))))))
 
 ;;;; What is kept between scans
 
@@ -581,14 +673,17 @@ of a turn in the first is the last of the second too."
 
 ;;;; Scanning
 
-(defun compact-session (session agent path)
+(defun compact-session (session agent path &optional read head tail)
   "Return SESSION, of AGENT's transcript PATH, compact, with whether its
-latest turn has ended."
+latest turn has ended.  READ is the `transcript-read' of PATH; HEAD and
+TAIL its head and tail already wrapped as `lines', when the caller has
+them."
   (when session
     (make-session (ascii-compact (session-id session)) (ascii-compact (session-cwd session))
                   (ascii-compact (session-title session)) (ascii-compact (session-file session))
                   (session-mtime session) (ascii-compact (session-started session))
-                  (turn-ended agent path) (ascii-compact (session-parent session)))))
+                  (turn-ended agent path read head tail)
+                  (ascii-compact (session-parent session)))))
 
 (defun transcript-session (cache agent path)
   "Return what transcript PATH is, (STATUS . SESSION): STATUS is :read,
@@ -600,16 +695,18 @@ latest turn has ended."
         (multiple-value-bind (session found) (cached cache 'transcripts path stamp)
           (if found
               (cons :cached session)
-              (multiple-value-bind (head tail read-stamp)
-                  (read-head-and-tail path +head-bytes+ +tail-bytes+)
-                (if (null read-stamp)
+              (let ((read (read-head-and-tail path +head-bytes+ +tail-bytes+)))
+                (if (null read)
                     (cons :skipped nil)
-                    (let ((session (compact-session
-                                    (funcall (if (eq agent :codex) #'codex-session #'claude-session)
-                                             path (make-lines head) (and tail (make-lines tail))
-                                             read-stamp)
-                                    agent path)))
-                      (store cache 'transcripts path read-stamp session)
+                    (let* ((stamp (transcript-read-stamp read))
+                           (head-lines (make-lines (transcript-read-head read)))
+                           (tail (transcript-read-tail read))
+                           (tail-lines (and tail (make-lines tail)))
+                           (session (compact-session
+                                     (funcall (if (eq agent :codex) #'codex-session #'claude-session)
+                                              path head-lines tail-lines stamp)
+                                     agent path read head-lines tail-lines)))
+                      (store cache 'transcripts path stamp session)
                       (cons :read session)))))))))
 
 (defun truncate-title (title)
