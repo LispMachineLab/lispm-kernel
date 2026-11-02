@@ -101,13 +101,13 @@ with every repetition's figures and the kernel's stats.
   without terminals (2.18x), and 146 ms against 256 ms with them (1.75x).
   It reads each transcript's head and tail once and parses them on four
   threads; its turn state comes out of those same lines, so it returns a
-  field the Elisp reader does not compute without reading more. An earlier
-  version of the kernel reopened every transcript to look at its end for
-  the turn, 2.2 times the bytes, and finished no sooner than Emacs; the
-  head-and-tail reuse is what the current figures measure. With terminals,
-  the kernel's result still waits for frame-clock slices shared with
-  terminal drawing, but the scan is now short enough that it waits for a
-  few frames rather than tens.
+  field the Elisp reader does not compute without reading more of the
+  transcript. An earlier version of the kernel reopened every transcript
+  to look at its end for the turn, 2.2 times the bytes, and finished no
+  sooner than Emacs; the head-and-tail reuse is what the current figures
+  measure. With terminals, the kernel's result still waits for
+  frame-clock slices shared with terminal drawing; the shorter scan means
+  fewer of them.
 - **Warm scans are cheap either way.** The Elisp reader's second read is
   2.6 ms. The kernel's is 4.3 ms without terminals and 5.5 ms with them:
   its cached rows are already in the kernel, and its completion waits for
