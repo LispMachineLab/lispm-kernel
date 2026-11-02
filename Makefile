@@ -24,7 +24,7 @@ LISPM_UI ?= ../lispm-ui
 LISPM_DESKTOP ?= ../lispm-desktop/lisp
 # The session benchmark, see docs/benchmark.md.  BENCH_TERMINALS=8
 # measures discovery while the desktop's terminals draw.
-BENCH_REPEATS ?= 3
+BENCH_REPEATS ?= 4
 BENCH_TERMINALS ?= 0
 BENCH_OUTPUT ?= docs/session-benchmark.json
 SBCL_RUN = $(SBCL) --non-interactive --no-sysinit --no-userinit

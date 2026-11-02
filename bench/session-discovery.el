@@ -374,6 +374,15 @@ tests do, rather than let the frame clock take the messages in."
                 (unless (= (plist-get result :rows) count)
                   (error "%s read %d sessions, not %d"
                          mode (plist-get result :rows) count))
+                ;; A cold scan must find nothing cached and a warm one all of
+                ;; it; otherwise the "warm" figures are another cold read.
+                (when kernel-p
+                  (let* ((summary (plist-get result :summary))
+                         (cached (and summary (plist-get summary :cached)))
+                         (wanted (if cold-p 0 count)))
+                    (unless (eql cached wanted)
+                      (error "%s cached %s sessions, not %d"
+                             mode cached wanted))))
                 (push (cons mode result) results)))))
         (setq results (nreverse results))
         ;; Both readers must have read the same sessions.

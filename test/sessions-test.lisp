@@ -292,6 +292,42 @@
         (is (string= "review (Kant)" (getf child :title)))
         (is (string= "2026-10-21T01:00:00Z" (getf child :started)))))))
 
+(deftest sessions-stamp-grammar ()
+  "Every form the kernel takes is one Emacs's reader takes too, and the
+forms it refuses are passed over, so the first stamp it takes is the
+session's start.  The accepted forms are also checked against
+`parse-iso8601-time-string' in test/lispm-kernel-desktop-test.el; the
+kernel may take fewer forms than Emacs, as it does 2026-10-21T010203."
+  (dolist (stamp '("2026-10-21T01:02:03Z"
+                   "2026-10-21T01:02:03.456Z"
+                   "2026-10-21T01:02:03.456789+08:00"
+                   "2026-10-21T01:02:03+0800"
+                   "2026-10-21T01:02:03+08"
+                   "2026-10-21T01:02:03-05:30"
+                   "2026-10-21T01:02:03"
+                   "2026-10-21T01:02Z"
+                   "2026-10-21T01Z"
+                   "20261021T010203Z"
+                   "20261021T0102"
+                   "20261021T01"
+                   "2026-10-21t01:02:03z"
+                   "2026-10-21T01:02:03.1Z"
+                   ;; No range check, as none in Emacs's reader either.
+                   "2026-10-21T25:02:03Z"
+                   "2026-10-21T01:60:00Z"
+                   "2026-02-30T01:00:00Z"
+                   "2026-13-45T99:99:99Z"
+                   "2026-10-21T01:02:03+24:00"))
+    (is (lispm-kernel/sessions::iso-timestamp-p stamp)))
+  (dolist (stamp '("not a time"
+                   "2026-10-21 01:02:03Z"
+                   "2026-10-21T01:02:03+8"
+                   "2026-10-21T01:02:03,5Z"
+                   "2026-10-21T01:02:03. Z"
+                   "2026-10-21T01:02:03+08:0"
+                   "2026-1-21T01:02:03Z"))
+    (is (not (lispm-kernel/sessions::iso-timestamp-p stamp)))))
+
 (defun claude-said (stop-reason)
   (format nil "{\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"stop_reason\":~A,\"content\":[{\"type\":\"text\",\"text\":\"done\"}]}}"
           (if stop-reason (json-string stop-reason) "null")))

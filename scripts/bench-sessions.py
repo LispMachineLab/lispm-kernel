@@ -5,8 +5,9 @@
 
 Each repetition runs one batch Emacs which generates the fixtures and reads
 them four ways: lispm-agent's reader and the kernel, each cold then warm.
-Repetitions alternate the order, so neither reader always finds the files
-in the operating system's cache.
+Repetitions alternate the order and come in pairs, so each reader reads the
+files first, with the operating system's cache cold, as often as the other;
+an odd number would give one reader the cold cache in most repetitions.
 """
 
 import argparse
@@ -178,7 +179,7 @@ def print_table(summary):
 
 def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--repeats", type=int, default=3)
+    parser.add_argument("--repeats", type=int, default=4)
     parser.add_argument("--terminals", type=int, default=0,
                         help="terminals writing at once, one shown")
     parser.add_argument("--count", type=int, default=256,
@@ -199,8 +200,9 @@ def parse_args():
 
 def main():
     args = parse_args()
-    if args.repeats < 1:
-        sys.exit("--repeats must be at least 1")
+    if args.repeats < 2 or args.repeats % 2:
+        sys.exit("--repeats must be an even number of at least 2, so each "
+                 "reader reads the fixtures first as often as the other")
     program = build_program(args)
     load_path = emacs_paths(args)
     runs = []

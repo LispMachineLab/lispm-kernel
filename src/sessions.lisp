@@ -582,18 +582,20 @@ interruption, ends a turn.  So `lispm-agents-claude-turn-ended-p'."
                  :ended
                  :working))))))
 
-(defun turn-ended (agent path &optional read)
+(defun turn-ended (agent path &optional read head-lines tail-lines)
   "Return true when the latest turn the end of AGENT's transcript PATH
 tells of has ended, false when it has not or none is told of there.
 The end is its last `+turn-bytes+', else its last `+end-bytes+': a record
 of a turn in the first is the last of the second too.  READ is the
 `transcript-read' of PATH: when it is covered, PATH is not read again;
 when it is not and its tail tells of no turn, its end is read.  Without
-READ, its end is read now."
+READ, its end is read now.  HEAD-LINES and TAIL-LINES, when given, are
+READ's head and tail already wrapped as `lines'."
   (let ((turn (if (eq agent :codex) #'codex-turn #'claude-turn))
-        (head (and read (make-lines (transcript-read-head read))))
-        (tail (let ((tail (and read (transcript-read-tail read))))
-                (and tail (make-lines tail))))
+        (head (or head-lines (and read (make-lines (transcript-read-head read)))))
+        (tail (or tail-lines
+                  (let ((tail (and read (transcript-read-tail read))))
+                    (and tail (make-lines tail)))))
         (cut (and read (transcript-read-cut read)))
         (covered (and read (transcript-read-covered read))))
     (labels ((look (lines)
@@ -671,14 +673,16 @@ READ, its end is read now."
 
 ;;;; Scanning
 
-(defun compact-session (session agent path &optional read)
+(defun compact-session (session agent path &optional read head tail)
   "Return SESSION, of AGENT's transcript PATH, compact, with whether its
-latest turn has ended.  READ is the `transcript-read' of PATH."
+latest turn has ended.  READ is the `transcript-read' of PATH; HEAD and
+TAIL its head and tail already wrapped as `lines', when the caller has
+them."
   (when session
     (make-session (ascii-compact (session-id session)) (ascii-compact (session-cwd session))
                   (ascii-compact (session-title session)) (ascii-compact (session-file session))
                   (session-mtime session) (ascii-compact (session-started session))
-                  (turn-ended agent path read)
+                  (turn-ended agent path read head tail)
                   (ascii-compact (session-parent session)))))
 
 (defun transcript-session (cache agent path)
@@ -701,7 +705,7 @@ latest turn has ended.  READ is the `transcript-read' of PATH."
                            (session (compact-session
                                      (funcall (if (eq agent :codex) #'codex-session #'claude-session)
                                               path head-lines tail-lines stamp)
-                                     agent path read)))
+                                     agent path read head-lines tail-lines)))
                       (store cache 'transcripts path stamp session)
                       (cons :read session)))))))))
 
