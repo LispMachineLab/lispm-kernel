@@ -47,11 +47,14 @@
 ;;; latest turn has ended is told by the last record of a turn its end
 ;;; holds, as the agents' :ready read it in lispm-agents-codex.el and
 ;;; lispm-agents-claude.el: its last 16 KiB, or when they hold none, its
-;;; last 256 KiB, the line the start cuts left out.  Each transcript read is
-;;; kept with its stamp, so another scan reads only those that changed;
-;;; a complete scan forgets those it did not see.  Transcripts are read
-;;; on several threads at once.  Of the sessions of one id, the newest
-;;; transcript's is kept.
+;;; last 256 KiB, the line the start cuts left out.  The lines the head
+;;; and tail hold are looked in first, the line they leave out between
+;;; them too, so a transcript that they hold all of is read once; one
+;;; longer than them is read again only when its tail holds no turn.
+;;; Each transcript read is kept with its stamp, so another scan reads
+;;; only those that changed; a complete scan forgets those it did not
+;;; see.  Transcripts are read on several threads at once.  Of the
+;;; sessions of one id, the newest transcript's is kept.
 ;;;
 ;;; Sessions go to Emacs in chunks, lists of
 ;;;
@@ -508,20 +511,32 @@ interruption, ends a turn.  So `lispm-agents-claude-turn-ended-p'."
                  :ended
                  :working))))))
 
-(defun turn-ended (agent path)
+(defun turn-ended (agent path &key head tail cut size)
   "Return true when the latest turn the end of AGENT's transcript PATH
 tells of has ended, false when it has not or none is told of there.
 The end is its last `+turn-bytes+', else its last `+end-bytes+': a record
-of a turn in the first is the last of the second too."
+of a turn in the first is the last of the second too.  HEAD, TAIL, CUT
+and SIZE are what `read-head-and-tail' returned for PATH; with them, it
+is read again only when they do not hold all of it and TAIL tells of no
+turn.  Without HEAD, it is read now."
   (let ((turn (if (eq agent :codex) #'codex-turn #'claude-turn)))
-    (flet ((look (bytes)
-             (multiple-value-bind (octets stamp cut) (read-file-octets path bytes)
-               (declare (ignore stamp))
-               (values (and octets
-                            (first-line (make-lines (octet-lines octets :drop-first cut)) turn :from-end t))
-                       cut))))
-      (multiple-value-bind (state cut) (look +turn-bytes+)
-        (eq :ended (if (or state (not cut)) state (look +end-bytes+)))))))
+    (labels ((look (lines)
+               (and lines (first-line lines turn :from-end t)))
+             (read-look (bytes)
+               (multiple-value-bind (octets stamp cut) (read-file-octets path bytes)
+                 (declare (ignore stamp))
+                 (values (and octets
+                              (look (make-lines (octet-lines octets :drop-first cut))))
+                         cut))))
+      (if head
+          (let ((state (or (look tail)
+                           (look (and cut (make-lines (list cut)))))))
+            (cond (state (eq :ended state))
+                  ((and size (> size (+ +head-bytes+ +tail-bytes+)))
+                   (eq :ended (read-look +end-bytes+)))
+                  (t (eq :ended (look head)))))
+          (multiple-value-bind (state cut) (read-look +turn-bytes+)
+            (eq :ended (if (or state (not cut)) state (read-look +end-bytes+))))))))
 
 ;;;; What is kept between scans
 
@@ -581,14 +596,16 @@ of a turn in the first is the last of the second too."
 
 ;;;; Scanning
 
-(defun compact-session (session agent path)
+(defun compact-session (session agent path &key head tail cut size)
   "Return SESSION, of AGENT's transcript PATH, compact, with whether its
-latest turn has ended."
+latest turn has ended.  HEAD, TAIL, CUT and SIZE are what
+`read-head-and-tail' returned for PATH."
   (when session
     (make-session (ascii-compact (session-id session)) (ascii-compact (session-cwd session))
                   (ascii-compact (session-title session)) (ascii-compact (session-file session))
                   (session-mtime session) (ascii-compact (session-started session))
-                  (turn-ended agent path) (ascii-compact (session-parent session)))))
+                  (turn-ended agent path :head head :tail tail :cut cut :size size)
+                  (ascii-compact (session-parent session)))))
 
 (defun transcript-session (cache agent path)
   "Return what transcript PATH is, (STATUS . SESSION): STATUS is :read,
@@ -600,15 +617,17 @@ latest turn has ended."
         (multiple-value-bind (session found) (cached cache 'transcripts path stamp)
           (if found
               (cons :cached session)
-              (multiple-value-bind (head tail read-stamp)
+              (multiple-value-bind (head tail read-stamp cut size)
                   (read-head-and-tail path +head-bytes+ +tail-bytes+)
                 (if (null read-stamp)
                     (cons :skipped nil)
-                    (let ((session (compact-session
-                                    (funcall (if (eq agent :codex) #'codex-session #'claude-session)
-                                             path (make-lines head) (and tail (make-lines tail))
-                                             read-stamp)
-                                    agent path)))
+                    (let* ((head-lines (make-lines head))
+                           (tail-lines (and tail (make-lines tail)))
+                           (session (compact-session
+                                     (funcall (if (eq agent :codex) #'codex-session #'claude-session)
+                                              path head-lines tail-lines read-stamp)
+                                     agent path :head head-lines :tail tail-lines
+                                     :cut cut :size size)))
                       (store cache 'transcripts path read-stamp session)
                       (cons :read session)))))))))
 

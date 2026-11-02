@@ -345,6 +345,35 @@
         (is (equal '(("aborted" t) ("complete" t) ("none" nil) ("started" nil))
                    (mapcar (lambda (row) (list (getf row :id) (getf row :turn-ended))) rows)))))))
 
+(deftest sessions-turn-ended-reads-what-the-scan-read ()
+  "A transcript the head and tail hold is not read again for its turn."
+  (lispm-kernel/sessions:clear-caches)
+  (with-directory (directory)
+    (let ((root (path directory "projects")))
+      (labels ((prompt () (claude-user "prompt" :cwd "/c"))
+               (claude (name &rest lines)
+                 (apply #'write-file (path root (format nil "p/~A.jsonl" name)) (prompt) lines))
+               (filler (count)
+                 (let ((line (first (system-lines 1))))
+                   (make-list count :initial-element line))))
+        (let ((line (first (system-lines 1))))
+          ;; A turn in the head, none in the tail: the head and tail hold all.
+          (apply #'claude "head" (append (list (claude-said "end_turn")) (filler 700)))
+          ;; A turn cut in two at the head's end: neither holds it whole.
+          (let* ((step (1+ (length line)))
+                 (count (floor (- 65536 (length (prompt)) 1) step)))
+            (apply #'claude "cut" (append (filler count)
+                                          (list (format nil "{\"type\":\"assistant\",\"pad\":\"~A\",\"message\":{\"stop_reason\":\"end_turn\",\"content\":[]}}"
+                                                        (make-string 2000 :initial-element #\z)))
+                                          (filler 5))))
+          ;; Longer than head and tail, its turn only in the head: read again.
+          (apply #'claude "long" (append (list (claude-said "end_turn")) (filler 850)))
+          ;; No turn at all, in a transcript the head and tail hold.
+          (apply #'claude "none" (filler 700))))
+      (let ((rows (scan-rows :claude root)))
+        (is (equal '(("cut" t) ("head" t) ("long" t) ("none" nil))
+                   (mapcar (lambda (row) (list (getf row :id) (getf row :turn-ended))) rows)))))))
+
 (deftest sessions-lines-emacs-refuses ()
   (lispm-kernel/sessions:clear-caches)
   (with-directory (directory)

@@ -186,6 +186,12 @@ are left out; the third is nil when PATH could not be listed at all."
 
 ;;;; Reading
 
+(defun octets-text (octets start end)
+  "Return OCTETS from START to END, decoded as UTF-8.
+Invalid UTF-8 reads as U+FFFD."
+  (sb-ext:octets-to-string octets :start start :end end
+                                  :external-format '(:utf-8 :replacement #\REPLACEMENT_CHARACTER)))
+
 (defun octet-lines (octets &key (start 0) (end (length octets)) drop-first drop-last)
   "Return the lines of OCTETS between START and END, decoded as UTF-8.
 Invalid UTF-8 reads as U+FFFD.  DROP-FIRST leaves out the text up to the
@@ -203,9 +209,7 @@ END.  Empty lines are left out."
           (return))
         (let ((stop (or newline end)))
           (when (< position stop)
-            (push (sb-ext:octets-to-string octets :start position :end stop
-                                                  :external-format '(:utf-8 :replacement #\REPLACEMENT_CHARACTER))
-                  lines))
+            (push (octets-text octets position stop) lines))
           (if newline
               (setf position (1+ newline))
               (return)))))
@@ -246,13 +250,26 @@ stamp; return nil without running it when PATH is none."
                   ,@body)
              (if ,stream (close ,stream) (sb-posix:close ,fd))))))))
 
+(defun boundary-line (head tail)
+  "Return the line HEAD and TAIL leave out between them, or nil when they
+leave out none.  HEAD ends, and TAIL begins, where one line is cut in
+two, or where HEAD ends on a newline and TAIL begins on the next line."
+  (let* ((start (let ((newline (position 10 head :from-end t)))
+                  (if newline (1+ newline) 0)))
+         (end (or (position 10 tail) (length tail)))
+         (line (concatenate 'string (octets-text head start (length head))
+                            (octets-text tail 0 end))))
+    (and (plusp (length line)) line)))
+
 (defun read-head-and-tail (path head-bytes tail-bytes)
   "Return the lines of the head and the tail of regular file PATH, and its
 stamp, or nil when it is none or cannot be read.
 The head is the first HEAD-BYTES, its last line left out when the file
 goes on; the tail, read only when the file is longer than HEAD-BYTES, is
 the last TAIL-BYTES after the head, its first line left out.  So lispm-agent
-reads a transcript."
+reads a transcript.  The fourth value is the line the head and tail leave
+out between them, when the tail begins where the head ends and they cut
+one, and the fifth is the file's size."
   (handler-case
       (with-regular-file (stream stamp path)
         (let* ((size (stamp-size stamp))
@@ -262,7 +279,11 @@ reads a transcript."
                        (read-range stream (max head-bytes (- size tail-bytes)) size))))
           (values (octet-lines head :drop-last (< head-end size))
                   (and tail (octet-lines tail :drop-first t))
-                  stamp)))
+                  stamp
+                  (and tail
+                       (<= size (+ head-bytes tail-bytes))
+                       (boundary-line head tail))
+                  size)))
     (error () nil)))
 
 (defun read-file-octets (path limit)
