@@ -302,6 +302,29 @@ latest turn ended as lispm-agent's :ready reads it; return them without."
         (should (equal (lispm-kernel-desktop-test--read 'codex) '((:id "remote"))))
         (should called)))))
 
+(ert-deftest lispm-kernel-desktop-remote-ssh-host-runtime-reads-sessions ()
+  (lispm-kernel-desktop-test--with-trees
+    (let* ((host "/ssh:dev@example.com:")
+           (local-claude lispm-agents-claude-projects-directory)
+           (lispm-agents-claude-projects-directory (concat host local-claude))
+           (lispm-kernel-desktop-host-command-function
+            (lambda (h)
+              (and (equal h host) (list lispm-kernel-test-program)))))
+      (lispm-kernel-desktop-test--with-desktop
+        (lispm-kernel-sessions-mode 1)
+        (should (eq (lispm-kernel-desktop-test--read 'claude) 'pending))
+        (let ((host-runtime (lispm-kernel-desktop-runtime lispm-agents-claude-projects-directory)))
+          (should (lispm-kernel-live-p host-runtime))
+          (should (equal host (lispm-kernel-runtime-host host-runtime)))
+          (should (lispm-kernel-test--wait
+                   host-runtime
+                   (lambda () (not (eq (lispm-kernel-desktop-test--read 'claude) 'pending)))))
+          (let ((sessions (lispm-kernel-desktop-test--read 'claude)))
+            (should (= 4 (length sessions)))
+            (dolist (s sessions)
+              (should (string-prefix-p host (plist-get s :cwd)))
+              (should (string-prefix-p host (plist-get s :file))))))))))
+
 (ert-deftest lispm-kernel-desktop-restarts-a-kernel-that-dies-at-once-after-a-while ()
   "A kernel that exits soon after it started is started again only after a
 while, twice as long each time in a row, up to the limit; restarting it

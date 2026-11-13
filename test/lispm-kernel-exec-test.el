@@ -243,5 +243,64 @@ holding FOO and BAR; return a function that does, given a callback."
               (should (string-match-p "hello kernel" (apply #'concat (nreverse chunks)))))))
       (delete-directory dir t))))
 
+(ert-deftest lispm-kernel-remote-ssh-host-exec-and-search-files ()
+  (should (equal "/ssh:dev@example.com:" (lispm-kernel-ssh-host "/ssh:dev@example.com:/tmp/work")))
+  (should (equal "/scp:dev@example.com#2222:" (lispm-kernel-ssh-host "/scp:dev@example.com#2222:/tmp/work")))
+  (should-not (lispm-kernel-ssh-host "/sudo::/etc/hosts"))
+  (should-not (lispm-kernel-ssh-host "/tmp/local"))
+  (should (equal "x86_64-unknown-linux-gnu" (lispm-kernel-program-uname-target "Linux\n" "x86_64\n")))
+  (should (equal "aarch64-apple-darwin" (lispm-kernel-program-uname-target "Darwin" "arm64")))
+  (should (equal '("ssh" "-T" "-o" "BatchMode=yes" "-p" "2222" "-l" "dev" "--" "example.com")
+                 (lispm-kernel-program-ssh-args "/ssh:dev@example.com#2222:/tmp")))
+  (let* ((dir (make-temp-file "lispm-kernel-remote-test" t))
+         (host "/ssh:dev@example.com:")
+         (remote-dir (concat host (file-name-as-directory dir)))
+         (runtime (lispm-kernel-start (list lispm-kernel-test-program) host)))
+    (unwind-protect
+        (progn
+          (should (lispm-kernel-test--wait runtime (lambda () (lispm-kernel-runtime-hello runtime))))
+          (let ((lispm-kernel-exec-runtime-function
+                 (lambda (&optional target-dir)
+                   (and (lispm-kernel-same-host-p runtime target-dir) runtime))))
+            ;; Remote `exec' strips the TRAMP prefix for :cwd, resolves bare commands
+            ;; on the remote host via :search t, and merges dynamic env overrides.
+            (let ((default-directory remote-dir)
+                  (process-environment (cons "LISPM_REMOTE_VAR=ok" process-environment)))
+              (pcase-let ((`(,exit ,output ,said)
+                           (lispm-kernel-exec-test--run
+                            runtime #'lispm-kernel-exec
+                            "sh" '("-c" "printf '%s|%s' \"$PWD\" \"$LISPM_REMOTE_VAR\""))))
+                (should (eql 0 exit))
+                (should (equal (concat (directory-file-name dir) "|ok") output))
+                (should (equal "" said))))
+            ;; Remote `search-files' strips the TRAMP prefix on input and re-attaches
+            ;; it to returned `:file' paths and `:open-files' markers.
+            (let ((local-a (expand-file-name "a.txt" dir))
+                  (local-b (expand-file-name "b.txt" dir))
+                  (remote-a (concat remote-dir "a.txt"))
+                  (remote-b (concat remote-dir "b.txt"))
+                  (search-got nil))
+              (with-temp-file local-a (insert "remote match line\n"))
+              (with-temp-file local-b (insert "modified on remote\n"))
+              (should (functionp
+                       (lispm-kernel-search-files
+                        (list remote-dir)
+                        "remote"
+                        nil
+                        (lambda (res) (setq search-got res))
+                        :open-files (list remote-b))))
+              (should (lispm-kernel-test--wait runtime (lambda () search-got)))
+              (let ((items (plist-get search-got :items)))
+                (should (equal (list :file remote-a :matches '((1 "remote match line")))
+                               (assoc-default remote-a
+                                              (mapcar (lambda (it) (cons (plist-get it :file) it))
+                                                      items))))
+                (should (equal (list :file remote-b :open t)
+                               (assoc-default remote-b
+                                              (mapcar (lambda (it) (cons (plist-get it :file) it))
+                                                      items))))))))
+      (lispm-kernel-stop runtime)
+      (delete-directory dir t))))
+
 (provide 'lispm-kernel-exec-test)
 ;;; lispm-kernel-exec-test.el ends here

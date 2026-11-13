@@ -105,20 +105,42 @@ no error."
        (ignore-errors (close stream)))
      :name "lispm-kernel exec input")))
 
-(defun exec-environment (env)
-  "Return ENV as run-program takes an environment, or the kernel's own for nil."
-  (if env
-      (progn (check-type env list)
-             (dolist (entry env env)
-               (unless (and (stringp entry) (find #\= entry))
-                 (error "An environment entry is NAME=VALUE, not ~S" entry))))
-      (sb-ext:posix-environ)))
+(defun environment-name (entry)
+  "Return the variable name before #\\= in ENTRY."
+  (let ((pos (position #\= entry)))
+    (if pos (subseq entry 0 pos) entry)))
 
-(defun run-streaming-program (program args &key cwd env stdin timeout search combine-error)
+(defun exec-environment (env &optional inherit)
+  "Return ENV as run-program takes an environment, or the kernel's own for nil.
+When INHERIT is non-nil, merge ENV over the kernel's own environment."
+  (cond ((null env)
+         (sb-ext:posix-environ))
+        (t
+         (check-type env list)
+         (dolist (entry env)
+           (unless (and (stringp entry) (find #\= entry))
+             (error "An environment entry is NAME=VALUE, not ~S" entry)))
+         (if (not inherit)
+             env
+             (let ((seen (make-hash-table :test #'equal))
+                   (merged nil))
+               (dolist (entry env)
+                 (let ((name (environment-name entry)))
+                   (unless (gethash name seen)
+                     (setf (gethash name seen) t)
+                     (push entry merged))))
+               (dolist (entry (sb-ext:posix-environ))
+                 (let ((name (environment-name entry)))
+                   (unless (gethash name seen)
+                     (setf (gethash name seen) t)
+                     (push entry merged))))
+               (nreverse merged))))))
+
+(defun run-streaming-program (program args &key cwd env env-inherit stdin timeout search combine-error)
   "Run PROGRAM with ARGS, emitting UTF-8 stdout chunks and returning how it ended."
   (let* ((process (sb-ext:run-program program args
                                       :search search :wait nil :directory cwd
-                                      :environment (exec-environment env)
+                                      :environment (exec-environment env env-inherit)
                                       :input (if stdin :stream nil)
                                       :output :stream
                                       :error (if combine-error :output :stream)
@@ -197,17 +219,20 @@ no error."
   "Run PROGRAM with ARGS in CWD, its environment ENV, reading STDIN, at most
 TIMEOUT seconds; emit its standard output and return how it ended.
 INPUT is a plist of them."
-  (destructuring-bind (&key program args cwd env stdin timeout combine-error) input
+  (destructuring-bind (&key program args cwd env env-inherit stdin timeout combine-error search) input
     (check-type program string)
     (check-type args list)
     (dolist (arg args) (check-type arg string))
     (check-type cwd (or null string))
     (check-type stdin (or null string))
     (check-type timeout (or null (integer 1 86400)))
-    (unless (and (plusp (length program)) (char= (char program 0) #\/))
+    (unless (and (plusp (length program))
+                 (or search (char= (char program 0) #\/)))
       (error "The program to run is a file, not ~S" program))
     (run-streaming-program program args
-                           :cwd cwd :env env :stdin stdin :timeout timeout
+                           :cwd cwd :env env :env-inherit (and env-inherit t)
+                           :stdin stdin :timeout timeout
+                           :search (and search t)
                            :combine-error (and combine-error t))))
 
 (defparameter *http-status-marker* (format nil "~%__LISPM_HTTP_STATUS__:")
@@ -251,7 +276,7 @@ INPUT is a plist of them."
 INPUT is (:url URL :headers HEADERS :body BODY :curl CURL :connect-timeout INT
 :speed-time INT :max-time INT :env ENV)."
   (destructuring-bind (&key url headers (body "") (curl "curl")
-                            (connect-timeout 30) (speed-time 120) (max-time 900) env)
+                            (connect-timeout 30) (speed-time 600) (max-time 900) env)
       input
     (check-type url string)
     (check-type headers list)
