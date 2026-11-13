@@ -73,12 +73,12 @@ Nil lets it run for ever."
        (fboundp 'lispm-kernel-desktop-runtime)
        (lispm-kernel-desktop-runtime)))
 
-(defun lispm-kernel-exec--runtime ()
-  "Return a runtime whose kernel runs and knows the `exec' job, or nil."
+(defun lispm-kernel-exec--runtime (&optional job)
+  "Return a runtime whose kernel runs and knows JOB (by default `:exec'), or nil."
   (when-let* ((runtime (and lispm-kernel-exec-runtime-function
                             (funcall lispm-kernel-exec-runtime-function))))
     (and (lispm-kernel-live-p runtime)
-         (memq :exec (plist-get (lispm-kernel-runtime-hello runtime) :jobs))
+         (memq (or job :exec) (plist-get (lispm-kernel-runtime-hello runtime) :jobs))
          runtime)))
 
 (defun lispm-kernel-exec--environment (directory)
@@ -103,33 +103,53 @@ name alone removing it, and PWD, DIRECTORY."
 
 ;;;; In Emacs
 
-(cl-defun lispm-kernel-exec-locally (program args callback &key input)
+(cl-defun lispm-kernel-exec-locally (program args callback &key input timeout on-output combine-error)
   "Run PROGRAM with ARGS as a process of Emacs's own, in the background.
-CALLBACK, ARGS and INPUT are as `lispm-kernel-exec' has them."
+CALLBACK, ARGS, INPUT, TIMEOUT, ON-OUTPUT and COMBINE-ERROR are as
+`lispm-kernel-exec' has them."
   (let ((output (generate-new-buffer " *lispm-kernel-exec*" t))
-        (errors (generate-new-buffer " *lispm-kernel-exec errors*" t))
-        stderr)
+        (errors (unless combine-error (generate-new-buffer " *lispm-kernel-exec errors*" t)))
+        stderr timer)
     (condition-case err
         (let ((process
                (make-process
                 :name program :buffer output :command (cons program args)
                 :connection-type 'pipe :noquery t :coding 'utf-8
-                :stderr (setq stderr (make-pipe-process :name (concat program " errors") :buffer errors
-                                                        :noquery t :coding 'utf-8 :sentinel #'ignore))
+                :stderr (and errors
+                             (setq stderr (make-pipe-process :name (concat program " errors") :buffer errors
+                                                             :noquery t :coding 'utf-8 :sentinel #'ignore)))
+                :filter (and on-output
+                             (lambda (proc chunk)
+                               (when (buffer-live-p (process-buffer proc))
+                                 (with-current-buffer (process-buffer proc)
+                                   (goto-char (point-max))
+                                   (insert chunk)))
+                               (lispm-kernel-exec--call on-output chunk)))
                 :sentinel
                 (lambda (process _event)
                   (when (and (not (process-live-p process)) (buffer-live-p output))
-                    ;; What it said last, read before its pipe goes.
-                    (while (accept-process-output stderr 0 nil t))
-                    (delete-process stderr)
-                    (let ((exit (if (eq (process-status process) 'exit)
-                                    (process-exit-status process)
-                                  (format "%s ended by signal %s" program (process-exit-status process))))
+                    (when timer (cancel-timer timer))
+                    (when stderr
+                      ;; What it said last, read before its pipe goes.
+                      (while (accept-process-output stderr 0 nil t))
+                      (delete-process stderr))
+                    (let ((exit (cond ((process-get process 'timed-out)
+                                       (format "%s did not finish in %ss" program timeout))
+                                      ((eq (process-status process) 'exit)
+                                       (process-exit-status process))
+                                      (t (format "%s ended by signal %s" program (process-exit-status process)))))
                           (printed (with-current-buffer output (buffer-string)))
-                          (said (with-current-buffer errors (buffer-string))))
+                          (said (if errors (with-current-buffer errors (buffer-string)) "")))
                       (kill-buffer output)
-                      (kill-buffer errors)
+                      (when errors (kill-buffer errors))
                       (lispm-kernel-exec--call callback exit printed said)))))))
+          (when timeout
+            (setq timer
+                  (run-at-time timeout nil
+                               (lambda ()
+                                 (when (process-live-p process)
+                                   (process-put process 'timed-out t)
+                                   (ignore-errors (kill-process process)))))))
           ;; A program may be gone before it is sent its input, or the
           ;; end of it, as one reading none, as diff, may be: its
           ;; sentinel then says how it went, later.
@@ -137,9 +157,10 @@ CALLBACK, ARGS and INPUT are as `lispm-kernel-exec' has them."
             (when input
               (process-send-string process input))
             (process-send-eof process)))
-      (error (when (process-live-p stderr) (delete-process stderr))
+      (error (when timer (cancel-timer timer))
+             (when (process-live-p stderr) (delete-process stderr))
              (kill-buffer output)
-             (kill-buffer errors)
+             (when errors (kill-buffer errors))
              ;; Never before the caller has its answer back.
              (run-at-time 0 nil #'lispm-kernel-exec--call callback (error-message-string err) "" "")))
     nil))
@@ -159,12 +180,14 @@ and VALUE, OUTPUT what it printed meanwhile."
     (_ (lispm-kernel-exec--call callback (format "%s: %s" program (if value (list status value) status))
                                 output ""))))
 
-(cl-defun lispm-kernel-exec--submit (program args callback fallback &key input)
+(cl-defun lispm-kernel-exec--submit (program args callback fallback
+                                     &key input timeout on-output combine-error)
   "Have the kernel run PROGRAM with ARGS, then call CALLBACK; return
-non-nil when it took it, nil when it cannot: no kernel knowing the job,
-the program not found, or a directory not on this computer.  A kernel
-that turns the request away later, as when full, leaves it to FALLBACK,
-called as `lispm-kernel-exec' is, where the program was asked for."
+a zero-argument cancellation function when it took it, nil when it
+cannot: no kernel knowing the job, the program not found, or a directory
+not on this computer.  A kernel that turns the request away later, as
+when full, leaves it to FALLBACK, called as `lispm-kernel-exec' is,
+where the program was asked for."
   (when-let* ((runtime (lispm-kernel-exec--runtime))
               ((not (file-remote-p default-directory)))
               (directory (expand-file-name default-directory))
@@ -172,33 +195,49 @@ called as `lispm-kernel-exec' is, where the program was asked for."
               (file (executable-find program))
               ((file-name-absolute-p file)))
     (let ((environment process-environment)
-          (chunks nil))
+          (effective-timeout (or timeout lispm-kernel-exec-timeout))
+          (chunks nil)
+          (aborted nil)
+          id)
       (condition-case nil
           (progn
-            (lispm-kernel-submit
-             runtime 'exec
-             (list :program (expand-file-name file) :args args :cwd (directory-file-name directory)
-                   :env (lispm-kernel-exec--environment directory) :stdin input
-                   :timeout lispm-kernel-exec-timeout)
-             :owner lispm-kernel-exec--owner
-             ;; The kernel stops the program first, and says so.
-             :timeout (and lispm-kernel-exec-timeout (+ lispm-kernel-exec-timeout 10))
-             :on-result
-             (lambda (kind value)
-               (pcase kind
-                 ('chunk (push value chunks))
-                 ('rejected
-                  (let ((default-directory directory)
-                        (process-environment environment))
-                    (apply fallback program args callback (and input (list :input input)))))
-                 (_ (lispm-kernel-exec--finish program callback kind value
-                                               (apply #'concat (nreverse chunks)))))))
-            t)
+            (setq id
+                  (lispm-kernel-submit
+                   runtime 'exec
+                   (list :program (expand-file-name file) :args args :cwd (directory-file-name directory)
+                         :env (lispm-kernel-exec--environment directory) :stdin input
+                         :timeout effective-timeout
+                         :combine-error (and combine-error t))
+                   :owner lispm-kernel-exec--owner
+                   ;; The kernel stops the program first, and says so.
+                   :timeout (and effective-timeout (+ effective-timeout 10))
+                   :on-result
+                   (lambda (kind value)
+                     (unless aborted
+                       (pcase kind
+                         ('chunk
+                          (push value chunks)
+                          (when on-output
+                            (lispm-kernel-exec--call on-output value)))
+                         ('rejected
+                          (let ((default-directory directory)
+                                (process-environment environment)
+                                (keys nil))
+                            (when combine-error (setq keys (plist-put keys :combine-error combine-error)))
+                            (when on-output (setq keys (plist-put keys :on-output on-output)))
+                            (when timeout (setq keys (plist-put keys :timeout timeout)))
+                            (when input (setq keys (plist-put keys :input input)))
+                            (apply fallback program args callback keys)))
+                         (_ (lispm-kernel-exec--finish program callback kind value
+                                                       (apply #'concat (nreverse chunks)))))))))
+            (lambda ()
+              (setq aborted t)
+              (lispm-kernel-cancel runtime id)))
         ;; The kernel went away meanwhile, or ARGS cannot go to it.
         (error nil)))))
 
 ;;;###autoload
-(cl-defun lispm-kernel-exec (program args callback &key input)
+(cl-defun lispm-kernel-exec (program args callback &key input timeout on-output combine-error)
   "Run PROGRAM with ARGS in the kernel, then call CALLBACK with how it went.
 CALLBACK gets the exit code, an integer, or a string saying why PROGRAM
 did not run or exit, then what it printed to its standard output and its
@@ -209,19 +248,122 @@ when given, else nothing.  ARGS are strings.  Where no kernel knowing
 the `exec' job runs, see `lispm-kernel-exec-runtime-function', or
 PROGRAM or `default-directory' is not on this computer, Emacs runs it,
 `lispm-kernel-exec-locally'.  The kernel stops a program that takes longer
-than `lispm-kernel-exec-timeout'."
-  (unless (lispm-kernel-exec--submit program args callback #'lispm-kernel-exec-locally :input input)
-    (lispm-kernel-exec-locally program args callback :input input))
+than TIMEOUT (by default `lispm-kernel-exec-timeout')."
+  (unless (lispm-kernel-exec--submit program args callback #'lispm-kernel-exec-locally
+                                     :input input :timeout timeout
+                                     :on-output on-output :combine-error combine-error)
+    (lispm-kernel-exec-locally program args callback
+                               :input input :timeout timeout
+                               :on-output on-output :combine-error combine-error))
   nil)
+
+;;;; HTTP streaming and parallel file search in the kernel
+
+(cl-defun lispm-kernel-http-stream (url headers body on-chunk on-finish &key curl fallback)
+  "POST BODY to URL with HEADERS in the kernel's `http-stream' job.
+ON-CHUNK is called with each UTF-8 text chunk as it arrives; ON-FINISH
+is called once at the end with the complete output (or stderr if output
+is empty).  When the kernel rejects the request for capacity and
+FALLBACK is given, call FALLBACK with no arguments.  Return a
+zero-argument cancellation function when the kernel took the request, or
+nil when it cannot."
+  (when-let* ((runtime (lispm-kernel-exec--runtime :http-stream)))
+    (let ((chunks nil)
+          (aborted nil)
+          (fallback-proc nil)
+          id)
+      (condition-case nil
+          (progn
+            (setq id
+                  (lispm-kernel-submit
+                   runtime 'http-stream
+                   (list :url url :headers headers :body body
+                         :curl (or (and curl (executable-find curl)) curl "curl")
+                         :env (lispm-kernel-exec--environment
+                               (if (file-remote-p default-directory)
+                                   temporary-file-directory
+                                 (expand-file-name default-directory))))
+                   :owner lispm-kernel-exec--owner
+                   :timeout 920
+                   :on-result
+                   (lambda (kind value)
+                     (unless aborted
+                       (pcase kind
+                         ('chunk
+                          (push value chunks)
+                          (when on-chunk
+                            (lispm-kernel-exec--call on-chunk value)))
+                         ((and 'rejected (guard fallback))
+                          (setq fallback-proc (funcall fallback)))
+                         ('success
+                          (let ((output (apply #'concat (nreverse chunks)))
+                                (stderr (plist-get value :stderr)))
+                            (lispm-kernel-exec--call
+                             on-finish
+                             (if (and (string-empty-p output) (stringp stderr))
+                                 stderr
+                               output))))
+                         (_
+                          (let ((output (apply #'concat (nreverse chunks))))
+                            (lispm-kernel-exec--call
+                             on-finish
+                             (if (string-empty-p output)
+                                 (format "http-stream %s: %s" kind (or value ""))
+                               output)))))))))
+            (lambda ()
+              (setq aborted t)
+              (if (processp fallback-proc)
+                  (progn
+                    (process-put fallback-proc 'lispm-aborted t)
+                    (ignore-errors (delete-process fallback-proc)))
+                (lispm-kernel-cancel runtime id))))
+        (error nil)))))
+
+(cl-defun lispm-kernel-search-files (files pattern case-fold callback
+                                     &key glob glob-dir open-files
+                                     max-file-size max-matches)
+  "Search local FILES for PATTERN in the kernel's `search-files' job.
+Call CALLBACK with (:items ITEMS :large LARGE) on success, or (:error WHY)
+if the job fails or is rejected.  Return a zero-argument cancellation
+function when the kernel took the request, or nil when it cannot."
+  (when-let* ((runtime (lispm-kernel-exec--runtime :search-files))
+              ((cl-every (lambda (f) (and (stringp f) (not (file-remote-p f)))) files)))
+    (let ((aborted nil)
+          id)
+      (condition-case nil
+          (progn
+            (setq id
+                  (lispm-kernel-submit
+                   runtime 'search-files
+                   (list :files files
+                         :pattern pattern
+                         :case-fold (and case-fold t)
+                         :glob glob
+                         :glob-dir glob-dir
+                         :open-files open-files
+                         :max-file-size (or max-file-size 1048576)
+                         :max-matches (or max-matches 200))
+                   :owner lispm-kernel-exec--owner
+                   :timeout 120
+                   :on-result
+                   (lambda (kind value)
+                     (unless aborted
+                       (pcase kind
+                         ('chunk nil)
+                         ('success (lispm-kernel-exec--call callback value))
+                         (_ (lispm-kernel-exec--call callback (list :error (or value kind)))))))))
+            (lambda ()
+              (setq aborted t)
+              (lispm-kernel-cancel runtime id)))
+        (error nil)))))
 
 ;;;; lispm-agent's programs
 
 (defun lispm-kernel-exec--around (original program args callback &rest keys)
   "Run PROGRAM with ARGS in the kernel, else as ORIGINAL would, a
 `lispm-exec-function' that CALLBACK and KEYS are for."
-  (unless (apply #'lispm-kernel-exec--submit program args callback original keys)
-    (apply original program args callback keys))
-  nil)
+  (or (apply #'lispm-kernel-exec--submit program args callback original keys)
+      (apply original program args callback keys)))
 
 (defun lispm-kernel-exec--hook ()
   "Advise `lispm-exec-function' while the mode is on and it is there."

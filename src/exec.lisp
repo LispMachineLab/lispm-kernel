@@ -114,11 +114,90 @@ no error."
                  (error "An environment entry is NAME=VALUE, not ~S" entry))))
       (sb-ext:posix-environ)))
 
+(defun run-streaming-program (program args &key cwd env stdin timeout search combine-error)
+  "Run PROGRAM with ARGS, emitting UTF-8 stdout chunks and returning how it ended."
+  (let* ((process (sb-ext:run-program program args
+                                      :search search :wait nil :directory cwd
+                                      :environment (exec-environment env)
+                                      :input (if stdin :stream nil)
+                                      :output :stream
+                                      :error (if combine-error :output :stream)
+                                      :external-format '(:utf-8 :replacement #\?)))
+         (feeder (and stdin (feed process stdin)))
+         (deadline (and timeout (+ (get-internal-real-time) (* timeout internal-time-units-per-second))))
+         (output (make-array (+ *exec-read-octets* 3) :element-type '(unsigned-byte 8)))
+         (errors (make-array 4096 :element-type '(unsigned-byte 8)))
+         (kept (make-array 0 :element-type '(unsigned-byte 8) :adjustable t :fill-pointer 0))
+         (output-fd (sb-sys:fd-stream-fd (sb-ext:process-output process)))
+         (error-fd (and (not combine-error)
+                        (sb-ext:process-error process)
+                        (sb-sys:fd-stream-fd (sb-ext:process-error process))))
+         (carried 0))
+    (unwind-protect
+         (flet ((take-output (timeout)
+                  ;; Emit what came, keeping a UTF-8 sequence cut short for
+                  ;; the next; return nil at the end, :none when nothing came.
+                  (let ((count (read-some output-fd output carried timeout)))
+                    (cond ((null count) :none)
+                          ((zerop count)
+                           (when (plusp carried)
+                             (emit (utf-8-text output 0 carried)))
+                           nil)
+                          (t (let* ((end (+ carried count))
+                                    (whole (complete-utf-8-end output end)))
+                               (when (plusp whole)
+                                 (emit (utf-8-text output 0 whole)))
+                               (replace output output :start2 whole :end2 end)
+                               (setf carried (- end whole))
+                               t)))))
+                (take-errors ()
+                  ;; Keep the last of what came; return nil at the end.
+                  (let ((count (read-some error-fd errors 0 0)))
+                    (cond ((null count) :none)
+                          ((zerop count) nil)
+                          (t (loop for index below count
+                                   do (vector-push-extend (aref errors index) kept))
+                             (when (> (length kept) (* 2 *exec-stderr-limit*))
+                               (let ((cut (- (length kept) *exec-stderr-limit*)))
+                                 (replace kept kept :start2 cut)
+                                 (setf (fill-pointer kept) *exec-stderr-limit*)))
+                             t)))))
+           (let ((output-open t) (errors-open (and error-fd t)))
+             ;; Until both ends are reached, or the program exited and
+             ;; printed nothing more: what it started may hold them.
+             (loop while (or output-open errors-open)
+                   do (checkpoint)
+                      (when (and deadline (> (get-internal-real-time) deadline))
+                        (error "~A did not finish in ~D seconds" program timeout))
+                      (let* ((alive (sb-ext:process-alive-p process))
+                             (wait (if alive *exec-poll-seconds* 0))
+                             (out (if output-open (take-output wait) :none))
+                             (err (if errors-open (take-errors) :none)))
+                        (unless out (setf output-open nil))
+                        (unless err (setf errors-open nil))
+                        (when (and (eq out :none) (eq err :none))
+                          (cond ((not alive) (return))
+                                ((not output-open) (sleep *exec-poll-seconds*)))))))
+           (loop while (sb-ext:process-alive-p process)
+                 do (checkpoint)
+                    (when (and deadline (> (get-internal-real-time) deadline))
+                      (error "~A did not finish in ~D seconds" program timeout))
+                    (sleep *exec-poll-seconds*))
+           (let ((stderr (let ((start (max 0 (- (length kept) *exec-stderr-limit*))))
+                           (utf-8-text kept start (length kept)))))
+             (if (eq (sb-ext:process-status process) :signaled)
+                 (list :signal (sb-ext:process-exit-code process) :stderr stderr)
+                 (list :exit (sb-ext:process-exit-code process) :stderr stderr))))
+      (stop-process process)
+      (when feeder
+        (sb-thread:join-thread feeder :default nil :timeout 5))
+      (sb-ext:process-close process))))
+
 (define-job (exec :class :io) (input)
   "Run PROGRAM with ARGS in CWD, its environment ENV, reading STDIN, at most
 TIMEOUT seconds; emit its standard output and return how it ended.
 INPUT is a plist of them."
-  (destructuring-bind (&key program args cwd env stdin timeout) input
+  (destructuring-bind (&key program args cwd env stdin timeout combine-error) input
     (check-type program string)
     (check-type args list)
     (dolist (arg args) (check-type arg string))
@@ -127,75 +206,76 @@ INPUT is a plist of them."
     (check-type timeout (or null (integer 1 86400)))
     (unless (and (plusp (length program)) (char= (char program 0) #\/))
       (error "The program to run is a file, not ~S" program))
-    (let* ((process (sb-ext:run-program program args
-                                        :search nil :wait nil :directory cwd
-                                        :environment (exec-environment env)
-                                        :input (if stdin :stream nil) :output :stream :error :stream
-                                        :external-format '(:utf-8 :replacement #\?)))
-           (feeder (and stdin (feed process stdin)))
-           (deadline (and timeout (+ (get-internal-real-time) (* timeout internal-time-units-per-second))))
-           (output (make-array (+ *exec-read-octets* 3) :element-type '(unsigned-byte 8)))
-           (errors (make-array 4096 :element-type '(unsigned-byte 8)))
-           (kept (make-array 0 :element-type '(unsigned-byte 8) :adjustable t :fill-pointer 0))
-           (output-fd (sb-sys:fd-stream-fd (sb-ext:process-output process)))
-           (error-fd (sb-sys:fd-stream-fd (sb-ext:process-error process)))
-           (carried 0))
+    (run-streaming-program program args
+                           :cwd cwd :env env :stdin stdin :timeout timeout
+                           :combine-error (and combine-error t))))
+
+(defparameter *http-status-marker* (format nil "~%__LISPM_HTTP_STATUS__:")
+  "Separator curl prints before the HTTP status code.")
+
+(defun curl-header-config (headers)
+  "Return curl's --config input sending HEADERS, a list of \"Name: value\" strings."
+  (with-output-to-string (out)
+    (dolist (header headers)
+      (check-type header string)
+      (write-string "header = \"" out)
+      (loop for char across header
+            do (when (or (char= char #\\) (char= char #\"))
+                 (write-char #\\ out))
+               (write-char char out))
+      (write-string "\"" out)
+      (terpri out))))
+
+(defun temporary-request-file (body)
+  "Write BODY, a UTF-8 string, to a new temporary file and return its native path."
+  (let* ((base (string-right-trim "/" (or (sb-posix:getenv "TMPDIR") "/tmp")))
+         (template (concatenate 'string base "/lispm-http-XXXXXX")))
+    (multiple-value-bind (fd path) (sb-posix:mkstemp template)
+      (let ((ok nil))
+        (unwind-protect
+             (let ((stream (sb-sys:make-fd-stream fd :output t :element-type '(unsigned-byte 8)
+                                                     :buffering :full)))
+               (unwind-protect
+                    (progn
+                      (write-sequence (sb-ext:string-to-octets body :external-format :utf-8) stream)
+                      (finish-output stream)
+                      (setf ok t)
+                      path)
+                 (close stream)))
+          (unless ok
+            (ignore-errors (sb-posix:close fd))
+            (ignore-errors (sb-posix:unlink path))))))))
+
+(define-job (http-stream :class :io) (input)
+  "POST BODY to URL with HEADERS using curl, streaming the response as chunks.
+INPUT is (:url URL :headers HEADERS :body BODY :curl CURL :connect-timeout INT
+:speed-time INT :max-time INT :env ENV)."
+  (destructuring-bind (&key url headers (body "") (curl "curl")
+                            (connect-timeout 30) (speed-time 120) (max-time 900) env)
+      input
+    (check-type url string)
+    (check-type headers list)
+    (check-type body string)
+    (check-type curl string)
+    (check-type connect-timeout (integer 1 3600))
+    (check-type speed-time (integer 1 86400))
+    (check-type max-time (integer 1 86400))
+    (let ((file (temporary-request-file body)))
       (unwind-protect
-           (flet ((take-output (timeout)
-                    ;; Emit what came, keeping a UTF-8 sequence cut short for
-                    ;; the next; return nil at the end, :none when nothing came.
-                    (let ((count (read-some output-fd output carried timeout)))
-                      (cond ((null count) :none)
-                            ((zerop count)
-                             (when (plusp carried)
-                               (emit (utf-8-text output 0 carried)))
-                             nil)
-                            (t (let* ((end (+ carried count))
-                                      (whole (complete-utf-8-end output end)))
-                                 (when (plusp whole)
-                                   (emit (utf-8-text output 0 whole)))
-                                 (replace output output :start2 whole :end2 end)
-                                 (setf carried (- end whole))
-                                 t)))))
-                  (take-errors ()
-                    ;; Keep the last of what came; return nil at the end.
-                    (let ((count (read-some error-fd errors 0 0)))
-                      (cond ((null count) :none)
-                            ((zerop count) nil)
-                            (t (loop for index below count
-                                     do (vector-push-extend (aref errors index) kept))
-                               (when (> (length kept) (* 2 *exec-stderr-limit*))
-                                 (let ((cut (- (length kept) *exec-stderr-limit*)))
-                                   (replace kept kept :start2 cut)
-                                   (setf (fill-pointer kept) *exec-stderr-limit*)))
-                               t)))))
-             (let ((output-open t) (errors-open t))
-               ;; Until both ends are reached, or the program exited and
-               ;; printed nothing more: what it started may hold them.
-               (loop while (or output-open errors-open)
-                     do (checkpoint)
-                        (when (and deadline (> (get-internal-real-time) deadline))
-                          (error "~A did not finish in ~D seconds" program timeout))
-                        (let* ((alive (sb-ext:process-alive-p process))
-                               (wait (if alive *exec-poll-seconds* 0))
-                               (out (if output-open (take-output wait) :none))
-                               (err (if errors-open (take-errors) :none)))
-                          (unless out (setf output-open nil))
-                          (unless err (setf errors-open nil))
-                          (when (and (eq out :none) (eq err :none))
-                            (cond ((not alive) (return))
-                                  ((not output-open) (sleep *exec-poll-seconds*)))))))
-             (loop while (sb-ext:process-alive-p process)
-                   do (checkpoint)
-                      (when (and deadline (> (get-internal-real-time) deadline))
-                        (error "~A did not finish in ~D seconds" program timeout))
-                      (sleep *exec-poll-seconds*))
-             (let ((stderr (let ((start (max 0 (- (length kept) *exec-stderr-limit*))))
-                             (utf-8-text kept start (length kept)))))
-               (if (eq (sb-ext:process-status process) :signaled)
-                   (list :signal (sb-ext:process-exit-code process) :stderr stderr)
-                   (list :exit (sb-ext:process-exit-code process) :stderr stderr))))
-        (stop-process process)
-        (when feeder
-          (sb-thread:join-thread feeder :default nil :timeout 5))
-        (sb-ext:process-close process)))))
+           (run-streaming-program
+            curl
+            (list "--silent" "--show-error" "--no-buffer"
+                  "-H" "Expect:"
+                  "--connect-timeout" (princ-to-string connect-timeout)
+                  "--speed-limit" "1"
+                  "--speed-time" (princ-to-string speed-time)
+                  "--max-time" (princ-to-string max-time)
+                  "--config" "-"
+                  "--data-binary" (concatenate 'string "@" file)
+                  "--write-out" (concatenate 'string *http-status-marker* "%{http_code}" (string #\Newline))
+                  url)
+            :env env
+            :stdin (curl-header-config headers)
+            :timeout (+ max-time 15)
+            :search (not (and (plusp (length curl)) (char= (char curl 0) #\/))))
+        (ignore-errors (sb-posix:unlink file))))))

@@ -69,6 +69,8 @@
            #:transcript-read-covered
            #:read-head-and-tail
            #:read-file-octets
+           #:with-regular-file
+           #:read-range
            #:octet-lines
            #:native-stat-p))
 
