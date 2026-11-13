@@ -154,3 +154,39 @@ b
       (send kernel (shell 1 "i=0; while [ $i -lt 100 ]; do printf x >&2; i=$((i+1)); done; printf END >&2"))
       (let ((result (fourth (done-of 1 (answered collector 1)))))
         (is (equal "xxxxxxxEND" (getf result :stderr)))))))
+
+(deftest http-stream-feeds-headers-and-body-and-cleans-temp-file ()
+  (with-directory (directory)
+    (let ((fake-curl (write-file (path directory "fake-curl")
+                                 "#!/bin/sh"
+                                 "cfg=$(cat)"
+                                 "for arg in \"$@\"; do"
+                                 "  case \"$arg\" in"
+                                 "    @*) file=${arg#@} ;;"
+                                 "  esac"
+                                 "done"
+                                 "printf 'CFG:%s|BODY:%s|FILE:%s\\n' \"$cfg\" \"$(cat \"$file\")\" \"$file\""
+                                 "printf '\\n__LISPM_HTTP_STATUS__:200\\n'")))
+      (sb-posix:chmod fake-curl #o755)
+      (with-kernel (kernel collector)
+        (send kernel
+              (message-string
+               `(submit 1 http-stream
+                        (:url "https://api.example.com/v1/messages"
+                         :headers ("x-api-key: secret\"key" "content-type: application/json")
+                         :body "{\"model\":\"demo\"}"
+                         :curl ,fake-curl))))
+        (let* ((messages (answered collector 1))
+               (out (output-of 1 messages))
+               (done (done-of 1 messages))
+               (file-pos (search "|FILE:" out))
+               (status-pos (search "__LISPM_HTTP_STATUS__:200" out))
+               (temp-path (and file-pos status-pos
+                               (string-trim '(#\Newline #\Return)
+                                            (subseq out (+ file-pos 6) status-pos)))))
+          (is (equal '(:done 1 :success (:exit 0 :stderr "")) done))
+          (is (search "header = \"x-api-key: secret\\\"key\"" out))
+          (is (search "|BODY:{\"model\":\"demo\"}|" out))
+          (is status-pos)
+          ;; Temporary request body file is removed once curl finishes.
+          (is (and temp-path (not (probe-file (sb-ext:parse-native-namestring temp-path))))))))))

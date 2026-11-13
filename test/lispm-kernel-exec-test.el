@@ -175,5 +175,73 @@ holding FOO and BAR; return a function that does, given a callback."
       (lispm-kernel-exec-mode -1)
       (if had (setq lispm-exec-function old) (makunbound 'lispm-exec-function)))))
 
+(ert-deftest lispm-kernel-exec-streams-on-output ()
+  (lispm-kernel-exec-test--with (runtime _local)
+    (let ((default-directory temporary-file-directory)
+          (chunks nil)
+          (local-chunks nil))
+      (pcase-let ((`(,exit ,output ,said)
+                   (lispm-kernel-exec-test--run
+                    runtime
+                    (lambda (cb)
+                      (lispm-kernel-exec "sh" '("-c" "printf 'one\n'; printf 'two\n'; printf 'err' >&2")
+                                         cb
+                                         :on-output (lambda (c) (push c chunks)))))))
+        (should (eql 0 exit))
+        (should (equal "one\ntwo\n" output))
+        (should (equal "err" said))
+        (should (equal "one\ntwo\n" (apply #'concat (nreverse chunks)))))
+      (let ((heard nil))
+        (lispm-kernel-exec-locally "sh" '("-c" "printf 'alpha\n'")
+                                   (lambda (&rest got) (setq heard got))
+                                   :on-output (lambda (c) (push c local-chunks)))
+        (let ((deadline (+ (float-time) 5)))
+          (while (and (not heard) (< (float-time) deadline))
+            (accept-process-output nil 0.01)))
+        (should (equal '(0 "alpha\n" "") heard))
+        (should (equal "alpha\n" (apply #'concat (nreverse local-chunks))))))))
+
+(ert-deftest lispm-kernel-http-stream-and-search-files ()
+  (let ((dir (make-temp-file "lispm-kernel-search-test" t)))
+    (unwind-protect
+        (lispm-kernel-exec-test--with (runtime _local)
+          (let ((file-a (expand-file-name "a.txt" dir))
+                (file-b (expand-file-name "b.txt" dir)))
+            (with-temp-file file-a (insert "hello kernel\nsecond line\n"))
+            (with-temp-file file-b (insert "open buffer on disk\n"))
+            (let ((search-got nil))
+              (should (functionp
+                       (lispm-kernel-search-files
+                        (list (file-name-as-directory dir))
+                        "kernel"
+                        nil
+                        (lambda (res) (setq search-got res))
+                        :open-files (list file-b))))
+              (should (lispm-kernel-test--wait runtime (lambda () search-got)))
+              (should (equal 0 (plist-get search-got :large)))
+              (let ((items (plist-get search-got :items)))
+                (should (equal (list :file file-a
+                                     :matches '((1 "hello kernel")))
+                               (assoc-default file-a
+                                              (mapcar (lambda (it) (cons (plist-get it :file) it))
+                                                      items))))
+                (should (equal (list :file file-b :open t)
+                               (assoc-default file-b
+                                              (mapcar (lambda (it) (cons (plist-get it :file) it))
+                                                      items))))))
+            (let ((http-got nil)
+                  (chunks nil))
+              (should (functionp
+                       (lispm-kernel-http-stream
+                        (concat "file://" (file-truename file-a))
+                        '("X-Test: 1")
+                        "{}"
+                        (lambda (c) (push c chunks))
+                        (lambda (out) (setq http-got out)))))
+              (should (lispm-kernel-test--wait runtime (lambda () http-got)))
+              (should (string-match-p "hello kernel" http-got))
+              (should (string-match-p "hello kernel" (apply #'concat (nreverse chunks)))))))
+      (delete-directory dir t))))
+
 (provide 'lispm-kernel-exec-test)
 ;;; lispm-kernel-exec-test.el ends here
