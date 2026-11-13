@@ -54,7 +54,7 @@
 (defvar lispm-kernel-sessions-mode)
 (defvar lispm-kernel-exec-mode)
 (defvar lispm-exec-function)
-(declare-function lispm-kernel-desktop-runtime "lispm-kernel-desktop" ())
+(declare-function lispm-kernel-desktop-runtime "lispm-kernel-desktop" (&optional directory))
 
 (defcustom lispm-kernel-exec-timeout 300
   "Seconds a program the kernel runs may take before it is stopped.
@@ -67,17 +67,25 @@ Nil lets it run for ever."
 (defconst lispm-kernel-exec--owner 4
   "The owner of the kernel's requests for programs, after package.el's.")
 
-(defun lispm-kernel-exec--sessions-runtime ()
-  "Return the agents' kernel while `lispm-kernel-sessions-mode' runs it."
+(defun lispm-kernel-exec--sessions-runtime (&optional directory)
+  "Return the agents' kernel for DIRECTORY in `lispm-kernel-sessions-mode'."
   (and (bound-and-true-p lispm-kernel-sessions-mode)
        (fboundp 'lispm-kernel-desktop-runtime)
-       (lispm-kernel-desktop-runtime)))
+       (condition-case nil
+           (lispm-kernel-desktop-runtime directory)
+         (wrong-number-of-arguments
+          (and (not (and directory (file-remote-p directory)))
+               (lispm-kernel-desktop-runtime))))))
 
-(defun lispm-kernel-exec--runtime (&optional job)
-  "Return a runtime whose kernel runs and knows JOB (by default `:exec'), or nil."
+(defun lispm-kernel-exec--runtime (&optional job directory)
+  "Return a runtime for DIRECTORY whose kernel runs and knows JOB, or nil."
   (when-let* ((runtime (and lispm-kernel-exec-runtime-function
-                            (funcall lispm-kernel-exec-runtime-function))))
+                            (condition-case nil
+                                (funcall lispm-kernel-exec-runtime-function directory)
+                              (wrong-number-of-arguments
+                               (funcall lispm-kernel-exec-runtime-function))))))
     (and (lispm-kernel-live-p runtime)
+         (or (null directory) (lispm-kernel-same-host-p runtime directory))
          (memq (or job :exec) (plist-get (lispm-kernel-runtime-hello runtime) :jobs))
          runtime)))
 
@@ -88,6 +96,24 @@ name alone removing it, and PWD, DIRECTORY."
   (let ((seen (make-hash-table :test #'equal))
         (entries (list (concat "PWD=" (directory-file-name directory)))))
     (puthash "PWD" t seen)
+    (dolist (entry process-environment)
+      (let* ((equals (string-search "=" entry))
+             (name (if equals (substring entry 0 equals) entry)))
+        (unless (gethash name seen)
+          (puthash name t seen)
+          (when equals (push entry entries)))))
+    (nreverse entries)))
+
+(defconst lispm-kernel-exec--host-variables
+  '("PATH" "HOME" "USER" "LOGNAME" "SHELL" "TMPDIR" "PWD" "OLDPWD" "SHLVL" "_")
+  "Environment variables owned by the host running the kernel.")
+
+(defun lispm-kernel-exec--remote-environment (local-directory)
+  "Return environment overrides for a remote kernel in LOCAL-DIRECTORY."
+  (let ((seen (make-hash-table :test #'equal))
+        (entries (list (concat "PWD=" (directory-file-name local-directory)))))
+    (dolist (name lispm-kernel-exec--host-variables)
+      (puthash name t seen))
     (dolist (entry process-environment)
       (let* ((equals (string-search "=" entry))
              (name (if equals (substring entry 0 equals) entry)))
@@ -185,56 +211,76 @@ and VALUE, OUTPUT what it printed meanwhile."
   "Have the kernel run PROGRAM with ARGS, then call CALLBACK; return
 a zero-argument cancellation function when it took it, nil when it
 cannot: no kernel knowing the job, the program not found, or a directory
-not on this computer.  A kernel that turns the request away later, as
-when full, leaves it to FALLBACK, called as `lispm-kernel-exec' is,
-where the program was asked for."
-  (when-let* ((runtime (lispm-kernel-exec--runtime))
-              ((not (file-remote-p default-directory)))
-              (directory (expand-file-name default-directory))
-              ((file-directory-p directory))
-              (file (executable-find program))
-              ((file-name-absolute-p file)))
-    (let ((environment process-environment)
-          (effective-timeout (or timeout lispm-kernel-exec-timeout))
-          (chunks nil)
-          (aborted nil)
-          id)
-      (condition-case nil
-          (progn
-            (setq id
-                  (lispm-kernel-submit
-                   runtime 'exec
-                   (list :program (expand-file-name file) :args args :cwd (directory-file-name directory)
-                         :env (lispm-kernel-exec--environment directory) :stdin input
-                         :timeout effective-timeout
-                         :combine-error (and combine-error t))
-                   :owner lispm-kernel-exec--owner
-                   ;; The kernel stops the program first, and says so.
-                   :timeout (and effective-timeout (+ effective-timeout 10))
-                   :on-result
-                   (lambda (kind value)
-                     (unless aborted
-                       (pcase kind
-                         ('chunk
-                          (push value chunks)
-                          (when on-output
-                            (lispm-kernel-exec--call on-output value)))
-                         ('rejected
-                          (let ((default-directory directory)
-                                (process-environment environment)
-                                (keys nil))
-                            (when combine-error (setq keys (plist-put keys :combine-error combine-error)))
-                            (when on-output (setq keys (plist-put keys :on-output on-output)))
-                            (when timeout (setq keys (plist-put keys :timeout timeout)))
-                            (when input (setq keys (plist-put keys :input input)))
-                            (apply fallback program args callback keys)))
-                         (_ (lispm-kernel-exec--finish program callback kind value
-                                                       (apply #'concat (nreverse chunks)))))))))
-            (lambda ()
-              (setq aborted t)
-              (lispm-kernel-cancel runtime id)))
-        ;; The kernel went away meanwhile, or ARGS cannot go to it.
-        (error nil)))))
+without a running kernel for its host.  A kernel that turns the request
+away later, as when full, leaves it to FALLBACK, called as
+`lispm-kernel-exec' is, where the program was asked for."
+  (let* ((directory (expand-file-name default-directory))
+         (remote (file-remote-p directory))
+         (runtime (lispm-kernel-exec--runtime :exec directory))
+         (local-cwd (and runtime (directory-file-name (lispm-kernel-local-path directory))))
+         (local-program (and runtime (stringp program)
+                             (or (not (file-remote-p program))
+                                 (equal (file-remote-p program) remote))
+                             (lispm-kernel-local-path program)))
+         (search (and remote local-program (not (string-search "/" local-program)) t))
+         (file (and runtime
+                    (if remote
+                        (and (stringp local-program)
+                             (not (string-empty-p local-program))
+                             (if search
+                                 local-program
+                               (expand-file-name local-program local-cwd)))
+                      (and (file-directory-p directory)
+                           (when-let* ((found (executable-find program)))
+                             (and (file-name-absolute-p found)
+                                  (expand-file-name found))))))))
+    (when (and runtime file)
+      (let ((environment process-environment)
+            (effective-timeout (or timeout lispm-kernel-exec-timeout))
+            (chunks nil)
+            (aborted nil)
+            id)
+        (condition-case nil
+            (progn
+              (setq id
+                    (lispm-kernel-submit
+                     runtime 'exec
+                     (list :program file :args args :cwd local-cwd
+                           :env (if remote
+                                    (lispm-kernel-exec--remote-environment local-cwd)
+                                  (lispm-kernel-exec--environment directory))
+                           :env-inherit (and remote t)
+                           :search search
+                           :stdin input
+                           :timeout effective-timeout
+                           :combine-error (and combine-error t))
+                     :owner lispm-kernel-exec--owner
+                     ;; The kernel stops the program first, and says so.
+                     :timeout (and effective-timeout (+ effective-timeout 10))
+                     :on-result
+                     (lambda (kind value)
+                       (unless aborted
+                         (pcase kind
+                           ('chunk
+                            (push value chunks)
+                            (when on-output
+                              (lispm-kernel-exec--call on-output value)))
+                           ('rejected
+                            (let ((default-directory directory)
+                                  (process-environment environment)
+                                  (keys nil))
+                              (when combine-error (setq keys (plist-put keys :combine-error combine-error)))
+                              (when on-output (setq keys (plist-put keys :on-output on-output)))
+                              (when timeout (setq keys (plist-put keys :timeout timeout)))
+                              (when input (setq keys (plist-put keys :input input)))
+                              (apply fallback program args callback keys)))
+                           (_ (lispm-kernel-exec--finish program callback kind value
+                                                         (apply #'concat (nreverse chunks)))))))))
+              (lambda ()
+                (setq aborted t)
+                (lispm-kernel-cancel runtime id)))
+          ;; The kernel went away meanwhile, or ARGS cannot go to it.
+          (error nil))))))
 
 ;;;###autoload
 (cl-defun lispm-kernel-exec (program args callback &key input timeout on-output combine-error)
@@ -279,6 +325,7 @@ nil when it cannot."
                    runtime 'http-stream
                    (list :url url :headers headers :body body
                          :curl (or (and curl (executable-find curl)) curl "curl")
+                         :speed-time 600
                          :env (lispm-kernel-exec--environment
                                (if (file-remote-p default-directory)
                                    temporary-file-directory
@@ -319,43 +366,63 @@ nil when it cannot."
                 (lispm-kernel-cancel runtime id))))
         (error nil)))))
 
+(defun lispm-kernel-exec--search-result (runtime value)
+  "Re-attach RUNTIME's host prefix to file paths in search-files VALUE."
+  (if (not (and (lispm-kernel-runtime-p runtime) (lispm-kernel-runtime-host runtime)))
+      value
+    (let ((items (mapcar (lambda (item)
+                           (let ((copy (copy-sequence item)))
+                             (when-let* ((file (plist-get copy :file)))
+                               (setq copy (plist-put copy :file (lispm-kernel-host-path runtime file))))
+                             copy))
+                         (plist-get value :items))))
+      (list :items items :large (plist-get value :large)))))
+
 (cl-defun lispm-kernel-search-files (files pattern case-fold callback
                                      &key glob glob-dir open-files
                                      max-file-size max-matches)
-  "Search local FILES for PATTERN in the kernel's `search-files' job.
+  "Search FILES for PATTERN in the kernel's `search-files' job.
 Call CALLBACK with (:items ITEMS :large LARGE) on success, or (:error WHY)
 if the job fails or is rejected.  Return a zero-argument cancellation
 function when the kernel took the request, or nil when it cannot."
-  (when-let* ((runtime (lispm-kernel-exec--runtime :search-files))
-              ((cl-every (lambda (f) (and (stringp f) (not (file-remote-p f)))) files)))
-    (let ((aborted nil)
-          id)
-      (condition-case nil
-          (progn
-            (setq id
-                  (lispm-kernel-submit
-                   runtime 'search-files
-                   (list :files files
-                         :pattern pattern
-                         :case-fold (and case-fold t)
-                         :glob glob
-                         :glob-dir glob-dir
-                         :open-files open-files
-                         :max-file-size (or max-file-size 1048576)
-                         :max-matches (or max-matches 200))
-                   :owner lispm-kernel-exec--owner
-                   :timeout 120
-                   :on-result
-                   (lambda (kind value)
-                     (unless aborted
-                       (pcase kind
-                         ('chunk nil)
-                         ('success (lispm-kernel-exec--call callback value))
-                         (_ (lispm-kernel-exec--call callback (list :error (or value kind)))))))))
-            (lambda ()
-              (setq aborted t)
-              (lispm-kernel-cancel runtime id)))
-        (error nil)))))
+  (when (and (consp files) (stringp (car files)))
+    (let ((host (file-remote-p (car files))))
+      (when-let* (((cl-every (lambda (f) (and (stringp f) (equal (file-remote-p f) host))) files))
+                  (runtime (lispm-kernel-exec--runtime :search-files (car files))))
+        (let ((aborted nil)
+              (local-files (mapcar #'lispm-kernel-local-path files))
+              (local-open (mapcar #'lispm-kernel-local-path
+                                  (cl-remove-if-not
+                                   (lambda (f) (and (stringp f) (equal (file-remote-p f) host)))
+                                   open-files)))
+              id)
+          (condition-case nil
+              (progn
+                (setq id
+                      (lispm-kernel-submit
+                       runtime 'search-files
+                       (list :files local-files
+                             :pattern pattern
+                             :case-fold (and case-fold t)
+                             :glob glob
+                             :glob-dir glob-dir
+                             :open-files local-open
+                             :max-file-size (or max-file-size 1048576)
+                             :max-matches (or max-matches 200))
+                       :owner lispm-kernel-exec--owner
+                       :timeout 120
+                       :on-result
+                       (lambda (kind value)
+                         (unless aborted
+                           (pcase kind
+                             ('chunk nil)
+                             ('success (lispm-kernel-exec--call
+                                        callback (lispm-kernel-exec--search-result runtime value)))
+                             (_ (lispm-kernel-exec--call callback (list :error (or value kind)))))))))
+                (lambda ()
+                  (setq aborted t)
+                  (lispm-kernel-cancel runtime id)))
+            (error nil)))))))
 
 ;;;; lispm-agent's programs
 

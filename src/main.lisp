@@ -46,7 +46,7 @@
 
 (defun stream-sink (stream)
   "Return a sink writing messages to STREAM, one per line.  When Emacs no
-longer reads them, the kernel ends."
+longer reads them, the kernel stops its work and ends."
   (lambda (messages)
     (handler-case
         (progn
@@ -55,6 +55,9 @@ longer reads them, the kernel ends."
             (write-char #\Newline stream))
           (finish-output stream))
       (error ()
+        (ignore-errors
+          (when *kernel*
+            (stop-kernel *kernel* :timeout 2)))
         (sb-ext:exit :code 0 :abort t)))))
 
 (defun main ()
@@ -74,10 +77,12 @@ longer reads them, the kernel ends."
                                :cpu-workers *cpu-workers* :io-workers *io-workers*)))
     (setf *kernel* kernel)
     (outbox-put (kernel-outbox kernel) (message-string (hello)))
-    (handler-case
-        (loop for line = (read-line input nil nil)
-              while line
-              until (eq (handle-line kernel line) :quit))
-      (error (condition)
-        (format *error-output* "lispm-kernel: ~A~%" (condition-text condition))))
+    (unwind-protect
+         (handler-case
+             (loop for line = (read-line input nil nil)
+                   while line
+                   until (eq (handle-line kernel line) :quit))
+           (error (condition)
+             (format *error-output* "lispm-kernel: ~A~%" (condition-text condition))))
+      (ignore-errors (stop-kernel kernel :timeout 2)))
     (sb-ext:exit :code 0 :abort t)))

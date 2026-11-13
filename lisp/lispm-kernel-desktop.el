@@ -118,6 +118,18 @@ root and index, and their own reader.")
 
 (defvar lispm-kernel-desktop--runtime nil)
 
+(defcustom lispm-kernel-desktop-remote-hosts t
+  "Non-nil to stage and run a kernel on each single-hop SSH host accessed."
+  :type 'boolean :group 'lispm-kernel)
+
+(defvar lispm-kernel-desktop--hosts (make-hash-table :test #'equal)
+  "Per remote SSH host prefix, a plist (:runtime :staging :early-exits
+:restart-at :last-error).")
+
+(defvar lispm-kernel-desktop-host-command-function nil
+  "When non-nil, called with HOST (a TRAMP prefix) to return the command
+or program to start its kernel, or nil to stage and run over SSH.")
+
 (defvar lispm-kernel-desktop--cache (make-hash-table :test #'eq)
   "Per agent, a plist (:root :generation :sessions :known :time :turns
 :request :started :retry-timer).  :known is non-nil once sessions were
@@ -255,11 +267,98 @@ downloaded or built, it starts once that is done."
                    (or lispm-kernel-desktop--restart-at (float-time)))))
           (t (list 'getting (and (lispm-kernel-program-busy-p) lispm-kernel-program-progress))))))
 
-(defun lispm-kernel-desktop-runtime ()
-  "Return the agents' kernel while `lispm-kernel-sessions-mode' runs it,
-else nil.  One that exited is started again, as the session readers have
-it."
-  (and lispm-kernel-sessions-mode (lispm-kernel-desktop--runtime)))
+(defun lispm-kernel-desktop--host-delay (early-exits)
+  "Return backoff seconds for a host kernel with EARLY-EXITS in a row."
+  (min lispm-kernel-desktop-restart-limit
+       (* lispm-kernel-desktop-restart-seconds
+          (expt 2 (min 30 (max 0 (1- early-exits)))))))
+
+(defun lispm-kernel-desktop--start-host (host command)
+  "Start a kernel for remote SSH HOST using COMMAND and store it."
+  (let* ((state (gethash host lispm-kernel-desktop--hosts))
+         (old (plist-get state :runtime)))
+    (when old (lispm-kernel-stop old))
+    (condition-case err
+        (let ((runtime (lispm-kernel-start command host)))
+          (puthash host (list :runtime runtime :staging nil
+                              :early-exits (or (plist-get state :early-exits) 0)
+                              :restart-at nil :last-error nil)
+                   lispm-kernel-desktop--hosts)
+          (when (fboundp 'lispm-agents-sessions-arrived)
+            (lispm-agents-sessions-arrived))
+          runtime)
+      (error
+       (let ((exits (1+ (or (plist-get state :early-exits) 0))))
+         (puthash host (list :runtime nil :staging nil
+                             :early-exits exits
+                             :restart-at (+ (float-time) (lispm-kernel-desktop--host-delay exits))
+                             :last-error err)
+                  lispm-kernel-desktop--hosts)
+         nil)))))
+
+(defun lispm-kernel-desktop--host-runtime (host)
+  "Return the running kernel for SSH HOST, starting or staging it if needed."
+  (when (and host (lispm-kernel-ssh-host host))
+    (let* ((state (gethash host lispm-kernel-desktop--hosts))
+           (runtime (plist-get state :runtime)))
+      (cond
+       ((and runtime (lispm-kernel-live-p runtime))
+        runtime)
+       ((plist-get state :staging)
+        nil)
+       (t
+        (when (and runtime (not (plist-get state :restart-at)))
+          (let* ((exited (or (lispm-kernel-runtime-exited-at runtime) (float-time)))
+                 (early (< (- exited (lispm-kernel-runtime-started runtime))
+                           lispm-kernel-desktop-restart-seconds))
+                 (exits (if early (1+ (or (plist-get state :early-exits) 0)) 0)))
+            (setq state (list :runtime runtime :staging nil
+                              :early-exits exits
+                              :restart-at (if early (+ exited (lispm-kernel-desktop--host-delay exits)) exited)
+                              :last-error (lispm-kernel-why-not-running runtime)))
+            (puthash host state lispm-kernel-desktop--hosts)))
+        (when (or (null (plist-get state :restart-at))
+                  (>= (float-time) (plist-get state :restart-at)))
+          (cond
+           ((when-let* ((command (and lispm-kernel-desktop-host-command-function
+                                      (funcall lispm-kernel-desktop-host-command-function host))))
+              (lispm-kernel-desktop--start-host host command)))
+           ((and lispm-kernel-desktop-remote-hosts
+                 (null lispm-kernel-desktop-program))
+            (puthash host (plist-put (copy-sequence state) :staging t)
+                     lispm-kernel-desktop--hosts)
+            (lispm-kernel-program-stage-ssh
+             host
+             (lambda (command problem)
+               (if (not (and lispm-kernel-sessions-mode command))
+                   (let ((exits (1+ (or (plist-get state :early-exits) 0))))
+                     (puthash host (list :runtime nil :staging nil
+                                         :early-exits exits
+                                         :restart-at (+ (float-time)
+                                                        (lispm-kernel-desktop--host-delay exits))
+                                         :last-error (or problem "staging failed"))
+                              lispm-kernel-desktop--hosts))
+                 (lispm-kernel-desktop--start-host host command))))
+            nil))))))))
+
+(defun lispm-kernel-desktop--root-runtime (root &optional check-mode)
+  "Return the running kernel for ROOT, or nil when none runs for its host."
+  (when (and (stringp root)
+             (or (file-remote-p root) (file-directory-p root)))
+    (if check-mode
+        (lispm-kernel-desktop-runtime root)
+      (if (file-remote-p root)
+          (lispm-kernel-desktop--host-runtime (lispm-kernel-ssh-host root))
+        (lispm-kernel-desktop--runtime)))))
+
+(defun lispm-kernel-desktop-runtime (&optional directory)
+  "Return the agents' kernel for DIRECTORY while `lispm-kernel-sessions-mode'
+runs it, else nil.  One that exited is started again, as the session
+readers have it."
+  (and lispm-kernel-sessions-mode
+       (if (and (stringp directory) (file-remote-p directory))
+           (lispm-kernel-desktop--host-runtime (lispm-kernel-ssh-host directory))
+         (lispm-kernel-desktop--runtime))))
 
 ;;;; Reading
 
@@ -327,7 +426,7 @@ Return the entry, or nil when its generation has moved on."
                      (lispm-kernel-desktop--arrived agent generation sessions summary))
                    :owner (lispm-kernel-desktop--spec agent :owner) :generation generation
                    :index (let ((index (lispm-kernel-desktop--value agent :index)))
-                            (and (stringp index) (not (file-remote-p index)) index))
+                            (and (stringp index) (lispm-kernel-same-host-p runtime index) index))
                    :timeout lispm-kernel-desktop-scan-timeout
                    :fallback (lispm-kernel-desktop--spec agent :read))))
     (lispm-kernel-desktop--update agent generation :request (or request 'fallback)
@@ -337,7 +436,8 @@ Return the entry, or nil when its generation has moved on."
   "Have AGENT's sessions of GENERATION read again after the kernel was full."
   (when (and lispm-kernel-sessions-mode
              (lispm-kernel-desktop--update agent generation :request nil :retry-timer nil))
-    (when-let* ((runtime (lispm-kernel-desktop--runtime)))
+    (when-let* ((root (lispm-kernel-desktop--value agent :root))
+                (runtime (lispm-kernel-desktop--root-runtime root)))
       (lispm-kernel-desktop--scan runtime agent))))
 
 (defun lispm-kernel-desktop--stale-p (entry)
@@ -353,11 +453,11 @@ Return the entry, or nil when its generation has moved on."
 
 (defun lispm-kernel-desktop--read (agent)
   "Return AGENT's sessions as the kernel read them last, or `pending' before.
-A missing or stale reading starts another in the background.  A remote or
-missing root, or no kernel running, is read the agents' own way."
-  (let ((root (lispm-kernel-desktop--value agent :root))
-        (runtime (lispm-kernel-desktop--runtime)))
-    (if (or (null runtime) (not (stringp root)) (file-remote-p root) (not (file-directory-p root)))
+A missing or stale reading starts another in the background.  A missing
+root, or no kernel running for its host, is read the agents' own way."
+  (let* ((root (lispm-kernel-desktop--value agent :root))
+         (runtime (lispm-kernel-desktop--root-runtime root)))
+    (if (null runtime)
         (funcall (lispm-kernel-desktop--spec agent :read))
       (let ((entry (lispm-kernel-desktop--entry runtime agent root)))
         (when (lispm-kernel-desktop--stale-p entry)
@@ -385,9 +485,9 @@ lispm-agent reads."
 any age, see `lispm-kernel-desktop--fresh', `pending' before the first
 such, or nil.  A stale reading starts another, which says so when it
 comes, see `lispm-agents-sessions-arrived'."
-  (let ((root (lispm-kernel-desktop--value agent :root))
-        (runtime (lispm-kernel-desktop-runtime)))
-    (when (and runtime (stringp root) (not (file-remote-p root)) (file-directory-p root))
+  (let* ((root (lispm-kernel-desktop--value agent :root))
+         (runtime (lispm-kernel-desktop--root-runtime root t)))
+    (when runtime
       (let ((entry (lispm-kernel-desktop--entry runtime agent root)))
         (when (lispm-kernel-desktop--stale-p entry)
           (lispm-kernel-desktop--scan runtime agent))
@@ -401,9 +501,9 @@ comes, see `lispm-agents-sessions-arrived'."
 anew, at most `lispm-kernel-desktop-wait-seconds'; nil when none comes.
 While it waits, only the kernel's messages are taken in, no timer
 running."
-  (let ((root (lispm-kernel-desktop--value agent :root))
-        (runtime (lispm-kernel-desktop-runtime)))
-    (when (and runtime (stringp root) (not (file-remote-p root)) (file-directory-p root))
+  (let* ((root (lispm-kernel-desktop--value agent :root))
+         (runtime (lispm-kernel-desktop--root-runtime root t)))
+    (when runtime
       (let ((entry (lispm-kernel-desktop--entry runtime agent root)))
         (or (lispm-kernel-desktop--fresh agent)
             ;; Not while the kernel's messages are taken in: none more would be.
@@ -452,18 +552,25 @@ agents' own way.  This is on `lispm-agents-session-lookup-functions'."
 (defun lispm-kernel-desktop-invalidate ()
   "Read the sessions anew: supersede readings under way, keep showing the old.
 This is on `lispm-agents-reread-sessions-hook'."
-  (when-let* ((runtime lispm-kernel-desktop--runtime))
-    (dolist (spec lispm-kernel-desktop--agents)
-      (let* ((agent (car spec))
-             (entry (gethash agent lispm-kernel-desktop--cache)))
-        (when entry
-          (let ((generation (1+ (plist-get entry :generation))))
-            (lispm-kernel-desktop--forget-timer entry)
-            (lispm-kernel-supersede runtime (plist-get (cdr spec) :owner) generation)
-            (puthash agent (list :root (plist-get entry :root) :generation generation
-                                 :sessions (plist-get entry :sessions)
-                                 :known (plist-get entry :known))
-                     lispm-kernel-desktop--cache)))))))
+  (dolist (spec lispm-kernel-desktop--agents)
+    (let* ((agent (car spec))
+           (entry (gethash agent lispm-kernel-desktop--cache))
+           (root (and entry (plist-get entry :root)))
+           (runtime (and root
+                         (if (file-remote-p root)
+                             (plist-get (gethash (lispm-kernel-ssh-host root)
+                                                 lispm-kernel-desktop--hosts)
+                                        :runtime)
+                           lispm-kernel-desktop--runtime))))
+      (when entry
+        (let ((generation (1+ (plist-get entry :generation))))
+          (lispm-kernel-desktop--forget-timer entry)
+          (when runtime
+            (lispm-kernel-supersede runtime (plist-get (cdr spec) :owner) generation))
+          (puthash agent (list :root root :generation generation
+                               :sessions (plist-get entry :sessions)
+                               :known (plist-get entry :known))
+                   lispm-kernel-desktop--cache))))))
 
 ;;;; The mode
 
@@ -528,6 +635,11 @@ program is built or downloaded; signal when impossible."
   (remove-hook 'lispm-agents-reread-sessions-hook #'lispm-kernel-desktop-invalidate)
   (when lispm-kernel-desktop--runtime
     (lispm-kernel-stop lispm-kernel-desktop--runtime))
+  (maphash (lambda (_ state)
+             (when-let* ((runtime (plist-get state :runtime)))
+               (lispm-kernel-stop runtime)))
+           lispm-kernel-desktop--hosts)
+  (clrhash lispm-kernel-desktop--hosts)
   (setq lispm-kernel-desktop--runtime nil
         lispm-kernel-desktop--restart-at nil)
   (maphash (lambda (_ entry) (lispm-kernel-desktop--forget-timer entry))

@@ -219,11 +219,11 @@ SBCL built, as after an update."
   "Return the directory downloaded programs are kept in, by version."
   (expand-file-name "prebuilt" lispm-kernel-program-source-directory))
 
-(defun lispm-kernel-program--prebuilt-file ()
+(defun lispm-kernel-program--prebuilt-file (&optional target)
   "Return where the program downloaded for the sources is kept, whether it
-is there or not, or nil when none is published for this computer or
-there are no sources to name its version."
-  (when-let* ((target (lispm-kernel-program--target))
+is there or not, for TARGET (by default this computer's), or nil when none
+is published for it or there are no sources to name its version."
+  (when-let* ((target (or target (lispm-kernel-program--target)))
               (version (lispm-kernel-program-source-version)))
     (expand-file-name (concat "lispm-kernel-" target)
                       (expand-file-name version (lispm-kernel-program--prebuilt-directory)))))
@@ -627,6 +627,163 @@ the next release."
       (error (message "%s" (error-message-string error))
              (kill-emacs 1)))
     (kill-emacs 0)))
+
+;;;; Staging verified programs to remote SSH hosts
+
+(declare-function tramp-dissect-file-name "tramp" (name &optional nodefault))
+(declare-function tramp-file-name-user "tramp" (vec))
+(declare-function tramp-file-name-port "tramp" (vec))
+(declare-function tramp-file-name-host "tramp" (vec))
+
+(defun lispm-kernel-program-uname-target (sysname machine)
+  "Return the prebuilt target for SYSNAME (`uname -s') and MACHINE (`uname -m')."
+  (let ((sys (string-trim (or sysname "")))
+        (arch (string-trim (or machine ""))))
+    (cond ((and (string= sys "Darwin") (member arch '("arm64" "aarch64")))
+           "aarch64-apple-darwin")
+          ((and (string= sys "Darwin") (string= arch "x86_64"))
+           "x86_64-apple-darwin")
+          ((and (string= sys "Linux") (member arch '("x86_64" "amd64")))
+           "x86_64-unknown-linux-gnu")
+          ((and (string= sys "Linux") (member arch '("aarch64" "arm64")))
+           "aarch64-unknown-linux-gnu"))))
+
+(defun lispm-kernel-program-ssh-args (host)
+  "Return the non-interactive `ssh' command prefix for HOST, a TRAMP prefix."
+  (when (lispm-kernel-ssh-host host)
+    (require 'tramp)
+    (let* ((vec (tramp-dissect-file-name host))
+           (user (tramp-file-name-user vec))
+           (port (tramp-file-name-port vec))
+           (hostname (tramp-file-name-host vec))
+           (hostname (if (and (string-prefix-p "[" hostname) (string-suffix-p "]" hostname))
+                         (substring hostname 1 -1)
+                       hostname)))
+      (append (list "ssh" "-T" "-o" "BatchMode=yes")
+              (and (stringp port) (not (string-empty-p port)) (list "-p" port))
+              (and (stringp user) (not (string-empty-p user)) (list "-l" user))
+              (list "--" hostname)))))
+
+(defun lispm-kernel-program-download-target (target callback)
+  "Ensure the verified prebuilt program for TARGET is in the local cache.
+Call CALLBACK with (FILE nil) on success, or (nil PROBLEM) on failure."
+  (let ((file (lispm-kernel-program--prebuilt-file target))
+        (sha256 (lispm-kernel-program--pinned-sha256 target)))
+    (cond
+     ((and file (file-executable-p file))
+      (funcall callback file nil))
+     ((and (equal target (lispm-kernel-program--target))
+           (lispm-kernel-program-file))
+      (funcall callback (lispm-kernel-program-file) nil))
+     ((not (and file sha256 (executable-find "curl") (executable-find "gzip")))
+      (funcall callback nil (format "no pinned program for %s can be downloaded" target)))
+     (t
+      (let* ((asset (lispm-kernel-program--asset target))
+             (url (format "%s/kernel-program-%s/%s"
+                          (string-trim-right lispm-kernel-program-prebuilt-url "/+")
+                          (lispm-kernel-program-source-version) asset))
+             (directory (make-temp-file "lispm-kernel-target" t))
+             (compressed (expand-file-name asset directory))
+             (buffer (generate-new-buffer " *lispm-kernel target download*" t)))
+        (cl-labels
+            ((finish (result problem)
+               (delete-directory directory t)
+               (when (buffer-live-p buffer) (kill-buffer buffer))
+               (funcall callback result problem))
+             (unpacked (ok)
+               (condition-case err
+                   (if (not ok)
+                       (finish nil (format "could not unpack %s" asset))
+                     (lispm-kernel-program--install (file-name-sans-extension compressed) file)
+                     (finish file nil))
+                 (error (finish nil (error-message-string err)))))
+             (downloaded (ok)
+               (cond ((not ok)
+                      (finish nil (format "could not download %s" url)))
+                     ((not (equal (lispm-kernel-program--sha256 compressed) sha256))
+                      (finish nil (format "%s SHA-256 mismatch against pinned sum" asset)))
+                     (t
+                      (lispm-kernel-program--run "lispm-kernel target unpack" buffer
+                                                 (list "gzip" "-d" "-f" compressed)
+                                                 #'unpacked)))))
+          (lispm-kernel-program--run "lispm-kernel target download" buffer
+                                     (list "curl" "--fail" "--silent" "--show-error" "--location"
+                                           "--retry" "2" "--output" compressed url)
+                                     #'downloaded)))))))
+
+(defun lispm-kernel-program--remote-sha256-script (remote-path sha256)
+  "Shell script returning 0 when REMOTE-PATH is executable and has SHA256."
+  (format
+   "f=%s; [ -x \"$f\" ] || exit 1; if command -v sha256sum >/dev/null 2>&1; then got=$(sha256sum \"$f\" | awk '{print $1}'); elif command -v shasum >/dev/null 2>&1; then got=$(shasum -a 256 \"$f\" | awk '{print $1}'); else exit 1; fi; [ \"$got\" = %s ]"
+   remote-path (shell-quote-argument sha256)))
+
+(defun lispm-kernel-program--remote-install-script (remote-dir remote-path sha256)
+  "Return a shell script installing stdin to REMOTE-PATH in REMOTE-DIR
+after verifying its SHA-256 matches SHA256."
+  (format
+   "set -e; mkdir -p %s; tmp=%s.part.$$; trap 'rm -f \"$tmp\"' EXIT; cat > \"$tmp\"; if command -v sha256sum >/dev/null 2>&1; then got=$(sha256sum \"$tmp\" | awk '{print $1}'); elif command -v shasum >/dev/null 2>&1; then got=$(shasum -a 256 \"$tmp\" | awk '{print $1}'); else exit 1; fi; [ \"$got\" = %s ]; chmod 755 \"$tmp\"; mv -f \"$tmp\" %s; trap - EXIT"
+   remote-dir remote-path (shell-quote-argument sha256) remote-path))
+
+(defun lispm-kernel-program-stage-ssh (host callback)
+  "Stage a SHA-256 verified kernel program to SSH HOST in the background.
+Call CALLBACK with (COMMAND nil) where COMMAND is the `ssh' command list
+to run the remote kernel, or (nil PROBLEM) when it cannot be staged."
+  (let ((ssh-args (lispm-kernel-program-ssh-args host)))
+    (if (not (and ssh-args (executable-find "ssh")))
+        (funcall callback nil (format "%s is not a supported SSH host" host))
+      (let ((probe-buf (generate-new-buffer " *lispm-kernel ssh probe*" t)))
+        (lispm-kernel-program--run
+         "lispm-kernel ssh probe" probe-buf
+         (append ssh-args (list "uname -s; uname -m"))
+         (lambda (ok)
+           (let ((lines (and (buffer-live-p probe-buf)
+                             (split-string (with-current-buffer probe-buf (buffer-string))
+                                           "[\r\n]+" t "[ \t]+"))))
+             (when (buffer-live-p probe-buf) (kill-buffer probe-buf))
+             (let ((target (and ok (>= (length lines) 2)
+                                (lispm-kernel-program-uname-target (nth 0 lines) (nth 1 lines)))))
+               (if (not target)
+                   (funcall callback nil (format "unsupported remote platform on %s: %S" host lines))
+                 (lispm-kernel-program-download-target
+                  target
+                  (lambda (local-file problem)
+                    (if (not local-file)
+                        (funcall callback nil problem)
+                      (let* ((sha256 (lispm-kernel-program--sha256 local-file))
+                             (version (or (lispm-kernel-program-source-version)
+                                          (substring sha256 0 16)))
+                             (remote-dir "$HOME/.cache/lispm/kernel")
+                             (remote-path (format "%s/lispm-kernel-%s" remote-dir version))
+                             (exec-cmd (append ssh-args (list (format "exec %s" remote-path))))
+                             (check-buf (generate-new-buffer " *lispm-kernel ssh check*" t)))
+                        (lispm-kernel-program--run
+                         "lispm-kernel ssh check" check-buf
+                         (append ssh-args
+                                 (list (lispm-kernel-program--remote-sha256-script remote-path sha256)))
+                         (lambda (verified)
+                           (when (buffer-live-p check-buf) (kill-buffer check-buf))
+                           (if verified
+                               (funcall callback exec-cmd nil)
+                             (let ((stage-buf (generate-new-buffer " *lispm-kernel ssh stage*" t)))
+                               (lispm-kernel-program--run
+                                "lispm-kernel ssh stage" stage-buf
+                                (list "sh" "-c"
+                                      (format "cat %s | %s %s"
+                                              (shell-quote-argument local-file)
+                                              (mapconcat #'shell-quote-argument ssh-args " ")
+                                              (shell-quote-argument
+                                               (lispm-kernel-program--remote-install-script
+                                                remote-dir remote-path sha256))))
+                                (lambda (staged)
+                                  (let ((err (and (buffer-live-p stage-buf)
+                                                  (with-current-buffer stage-buf
+                                                    (string-trim (buffer-string))))))
+                                    (when (buffer-live-p stage-buf) (kill-buffer stage-buf))
+                                    (if staged
+                                        (funcall callback exec-cmd nil)
+                                      (funcall callback nil
+                                               (format "could not stage lispm-kernel to %s: %s"
+                                                       host (or err ""))))))))))))))))))))))))
 
 (provide 'lispm-kernel-program)
 ;;; lispm-kernel-program.el ends here

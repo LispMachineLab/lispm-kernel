@@ -4,7 +4,7 @@
 
 ;; Author: Ryan.K
 ;; URL: https://github.com/LispMachineLab/lispm-kernel
-;; Version: 0.7.0
+;; Version: 0.8.0
 ;; Package-Requires: ((emacs "30.1"))
 ;; SPDX-License-Identifier: AGPL-3.0-or-later
 
@@ -85,7 +85,7 @@ timer does.  It calls `lispm-kernel-dispatch' later, with
 (cl-defstruct (lispm-kernel-runtime (:constructor lispm-kernel--make-runtime)
                                     (:copier nil))
   "A kernel process and what Emacs keeps of its requests."
-  process stderr program hello
+  process stderr program host hello
   (started (float-time))
   (next-id 0)
   ;; Lines received and not yet handled: INCOMING newest first, READY oldest first.
@@ -104,27 +104,85 @@ timer does.  It calls `lispm-kernel-dispatch' later, with
   "A request waiting for its final word."
   callback owner generation deadline)
 
+;;;; Remote hosts and paths
+
+(declare-function tramp-dissect-file-name "tramp" (name &optional nodefault))
+(declare-function tramp-file-name-method "tramp" (vec))
+(declare-function tramp-file-name-host "tramp" (vec))
+(declare-function tramp-file-name-hop "tramp" (vec))
+
+(defconst lispm-kernel-ssh-methods '("ssh" "scp" "sshx" "scpx")
+  "TRAMP methods that connect directly to an SSH host.")
+
+(defun lispm-kernel-ssh-host (path)
+  "Return the TRAMP prefix of PATH when it names a single-hop SSH host, else nil."
+  (when-let* (((stringp path))
+              (prefix (file-remote-p path)))
+    (require 'tramp)
+    (with-demoted-errors "lispm-kernel-ssh-host: %S"
+      (let* ((vec (tramp-dissect-file-name path))
+             (method (tramp-file-name-method vec))
+             (host (tramp-file-name-host vec))
+             (hop (and (fboundp 'tramp-file-name-hop) (tramp-file-name-hop vec))))
+        (and (member method lispm-kernel-ssh-methods)
+             (null hop)
+             (stringp host)
+             (not (string-empty-p host))
+             prefix)))))
+
+(defun lispm-kernel-same-host-p (runtime path)
+  "Return non-nil when PATH belongs to the same host as RUNTIME."
+  (and runtime
+       (equal (lispm-kernel-runtime-host runtime)
+              (and (stringp path) (file-remote-p path)))))
+
+(defun lispm-kernel-local-path (path)
+  "Return PATH without its TRAMP remote prefix, if any."
+  (if (and (stringp path) (file-remote-p path))
+      (file-remote-p path 'localname)
+    path))
+
+(defun lispm-kernel-host-path (runtime path)
+  "Return PATH on RUNTIME's host, adding RUNTIME's TRAMP prefix when remote."
+  (let ((host (if (lispm-kernel-runtime-p runtime)
+                  (lispm-kernel-runtime-host runtime)
+                runtime)))
+    (if (and (stringp host) (stringp path) (not (file-remote-p path)))
+        (concat host path)
+      path)))
+
 ;;;; Starting and stopping
 
-(defun lispm-kernel-start (program)
+(defun lispm-kernel-start (program &optional host)
   "Run the kernel PROGRAM and return its runtime.
-Its standard error goes to the buffer \" *lispm-kernel*\"."
-  (unless (and (stringp program) (file-executable-p program))
-    (error "No kernel program to run: %S" program))
-  (let* ((runtime (lispm-kernel--make-runtime :program program))
-         (default-directory (expand-file-name "~/"))
-         (buffer (get-buffer-create " *lispm-kernel*"))
-         (stderr (make-pipe-process :name "lispm-kernel stderr" :buffer buffer :noquery t
-                                    :coding 'utf-8-unix
-                                    :filter #'lispm-kernel--stderr-filter)))
-    (setf (lispm-kernel-runtime-stderr runtime) stderr
-          (lispm-kernel-runtime-process runtime)
-          (make-process :name "lispm-kernel" :command (list program) :connection-type 'pipe
-                        :noquery t :coding 'utf-8-unix :stderr stderr
-                        :filter (lambda (_process string) (lispm-kernel--filter runtime string))
-                        :sentinel (lambda (process _event) (lispm-kernel--sentinel runtime process))))
-    (push runtime lispm-kernel--runtimes)
-    runtime))
+PROGRAM is an executable file, or a command list (EXECUTABLE . ARGS) such
+as an SSH command running the kernel on HOST (a TRAMP remote prefix, or
+nil for this computer).  Its standard error goes to the buffer
+\" *lispm-kernel*\" (or \" *lispm-kernel HOST*\" when HOST is given)."
+  (let ((command (if (consp program) program (and (stringp program) (list program)))))
+    (unless (and (consp command)
+                 (cl-every #'stringp command)
+                 (if (consp program)
+                     (if (file-name-absolute-p (car command))
+                         (file-executable-p (car command))
+                       (executable-find (car command)))
+                   (file-executable-p (car command))))
+      (error "No kernel program to run: %S" program))
+    (let* ((runtime (lispm-kernel--make-runtime :program program :host host))
+           (default-directory (expand-file-name "~/"))
+           (buffer (get-buffer-create (if host (format " *lispm-kernel %s*" host) " *lispm-kernel*")))
+           (stderr (make-pipe-process :name "lispm-kernel stderr" :buffer buffer :noquery t
+                                      :coding 'utf-8-unix
+                                      :filter #'lispm-kernel--stderr-filter)))
+      (setf (lispm-kernel-runtime-stderr runtime) stderr
+            (lispm-kernel-runtime-process runtime)
+            (make-process :name (if host (format "lispm-kernel<%s>" host) "lispm-kernel")
+                          :command command :connection-type 'pipe
+                          :noquery t :coding 'utf-8-unix :stderr stderr
+                          :filter (lambda (_process string) (lispm-kernel--filter runtime string))
+                          :sentinel (lambda (process _event) (lispm-kernel--sentinel runtime process))))
+      (push runtime lispm-kernel--runtimes)
+      runtime)))
 
 (defun lispm-kernel--stderr-filter (process string)
   "Keep the last 64 KiB of what the kernel PROCESS says on its standard error."

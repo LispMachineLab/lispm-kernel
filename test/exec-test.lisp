@@ -190,3 +190,32 @@ b
           (is status-pos)
           ;; Temporary request body file is removed once curl finishes.
           (is (and temp-path (not (probe-file (sb-ext:parse-native-namestring temp-path))))))))))
+
+(deftest exec-searches-path-and-merges-environment-when-asked ()
+  (with-kernel (kernel collector)
+    (send kernel
+          (message-string
+           '(submit 1 exec (:program "sh"
+                            :args ("-c" "printf '%s|%s' \"$LISPM_TEST_OVERRIDE\" \"${PATH:+present}\"")
+                            :env ("LISPM_TEST_OVERRIDE=custom")
+                            :env-inherit t
+                            :search t))))
+    (let ((messages (answered collector 1)))
+      (is (equal '(:done 1 :success (:exit 0 :stderr "")) (done-of 1 messages)))
+      (is (equal "custom|present" (output-of 1 messages))))))
+
+(deftest stop-kernel-stops-running-exec-process-groups ()
+  (let* ((collector (make-collector))
+         (kernel (lispm-kernel:start-kernel (collector-sink collector))))
+    (unwind-protect
+         (progn
+           (send kernel (shell 1 "sleep 30 & echo $!; wait"))
+           (let ((pid (parse-integer
+                       (output-of 1 (await collector
+                                           (lambda (messages)
+                                             (find #\Newline (output-of 1 messages))))))))
+             (is (process-there-p pid))
+             (lispm-kernel:stop-kernel kernel :timeout 2)
+             (sleep 0.1)
+             (is (not (process-there-p pid)))))
+      (ignore-errors (lispm-kernel:stop-kernel kernel :timeout 1)))))

@@ -43,9 +43,10 @@
 (require 'lispm-kernel)
 (require 'parse-time)
 
-(defun lispm-kernel-sessions--session (agent row)
+(defun lispm-kernel-sessions--session (agent row &optional runtime)
   "Return the session of AGENT the kernel sent as ROW, or nil when ROW is
-not one."
+not one.  When RUNTIME has a remote host, re-attach its TRAMP prefix to
+`:cwd' and `:file'."
   (let ((id (plist-get row :id))
         (cwd (plist-get row :cwd))
         (title (plist-get row :title))
@@ -59,10 +60,13 @@ not one."
             (parent (when-let* ((parent (plist-get row :parent))
                                 ((stringp parent)))
                       (list :parent parent))))
-        (append (list :agent agent :id id :cwd cwd :title title
+        (append (list :agent agent :id id
+                      :cwd (lispm-kernel-host-path runtime cwd)
+                      :title title
                       :started (when-let* ((stamp (plist-get row :started)))
                                  (ignore-errors (float-time (parse-iso8601-time-string stamp))))
-                      :file file :time time)
+                      :file (lispm-kernel-host-path runtime file)
+                      :time time)
                 turn parent)))))
 
 (cl-defun lispm-kernel-scan-sessions (runtime agent root callback
@@ -107,7 +111,7 @@ Return the request's id, or nil when the kernel is not running."
            (pcase kind
              ('chunk
               (dolist (row value)
-                (when-let* ((session (lispm-kernel-sessions--session agent row)))
+                (when-let* ((session (lispm-kernel-sessions--session agent row runtime)))
                   (push session rows))))
              ('success
               ;; Sorted as the agents' list sorts, those of one time in the
@@ -121,8 +125,10 @@ Return the request's id, or nil when the kernel is not running."
           (progn (fail 'kernel-not-running) nil)
         (condition-case error
             (lispm-kernel-submit runtime 'scan-sessions
-                                 `(:agent ,agent :root ,(expand-file-name root)
-                                          ,@(and index (list :index (expand-file-name index))))
+                                 `(:agent ,agent :root ,(lispm-kernel-local-path (expand-file-name root))
+                                          ,@(and index
+                                                 (lispm-kernel-same-host-p runtime index)
+                                                 (list :index (lispm-kernel-local-path (expand-file-name index)))))
                                  :owner owner :generation generation :timeout timeout
                                  :on-result #'result)
           ;; The kernel went away between asking whether it runs and asking it.
