@@ -4,7 +4,7 @@
 
 ;; Author: Ryan.K
 ;; URL: https://github.com/LispMachineLab/lispm-kernel
-;; Version: 0.8.0
+;; Version: 0.8.1
 ;; Package-Requires: ((emacs "30.1"))
 ;; SPDX-License-Identifier: AGPL-3.0-or-later
 
@@ -274,8 +274,15 @@ that the message holding it is at most 64 deep."
 
 (defun lispm-kernel--plain (datum)
   "Return DATUM with its strings' text properties left out, which the
-kernel cannot read."
-  (cond ((stringp datum) (substring-no-properties datum))
+kernel cannot read, and any unibyte UTF-8 strings (such as the output of
+`json-serialize') decoded into multibyte characters so `prin1-to-string'
+does not emit raw octal byte escapes that the kernel's wire reader
+replaces with U+FFFD."
+  (cond ((stringp datum)
+         (let ((s (substring-no-properties datum)))
+           (if (multibyte-string-p s)
+               s
+             (decode-coding-string s 'utf-8))))
         ((proper-list-p datum) (mapcar #'lispm-kernel--plain datum))
         ((and (vectorp datum) (not (stringp datum))) (vconcat (mapcar #'lispm-kernel--plain datum)))
         (t datum)))

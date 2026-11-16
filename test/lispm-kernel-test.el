@@ -100,7 +100,17 @@ return the last."
     (should (equal (lispm-kernel-test--collect runtime 'echo `(a 'b #'c ,(propertize "/tmp/x" 'face 'bold)))
                    '((success (:a (:quote :b) (:function :c) "/tmp/x")))))
     (should-not (text-properties-at 0 (nth 3 (cadr (car (lispm-kernel-test--collect
-                                                         runtime 'echo (list 1 2 3 (propertize "p" 'face 'bold))))))))))
+                                                         runtime 'echo (list 1 2 3 (propertize "p" 'face 'bold))))))))
+    ;; Unibyte UTF-8 strings (as returned by `json-serialize') are decoded into
+    ;; multibyte characters before `prin1-to-string', so non-ASCII text does not
+    ;; become raw octal byte escapes replaced with U+FFFD by the wire reader.
+    (let* ((unibyte-json (json-serialize '((prompt . "我要你画一个蚂蚁骑自行车的网页图")
+                                           (greeting . "你好 λ→∀"))))
+           (roundtripped (cadr (car (lispm-kernel-test--collect runtime 'echo unibyte-json))))
+           (parsed (json-parse-string roundtripped :object-type 'alist)))
+      (should-not (multibyte-string-p unibyte-json))
+      (should (equal (alist-get 'prompt parsed) "我要你画一个蚂蚁骑自行车的网页图"))
+      (should (equal (alist-get 'greeting parsed) "你好 λ→∀")))))
 
 (defun lispm-kernel-test--nested (depth)
   "Return a list holding a list, DEPTH deep."

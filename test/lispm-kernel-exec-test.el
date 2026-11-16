@@ -235,7 +235,7 @@ holding FOO and BAR; return a function that does, given a callback."
                        (lispm-kernel-http-stream
                         (concat "file://" (file-truename file-a))
                         '("X-Test: 1")
-                        "{}"
+                        (json-serialize '((prompt . "你好") (detail . "画一个蚂蚁骑自行车的网页图")))
                         (lambda (c) (push c chunks))
                         (lambda (out) (setq http-got out)))))
               (should (lispm-kernel-test--wait runtime (lambda () http-got)))
