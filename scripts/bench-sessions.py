@@ -36,16 +36,14 @@ def emacs_paths(args):
     paths = {
         "agent": args.agent or os.environ.get("LISPM_AGENT_LISP")
         or ROOT.parent / "lispm-agent" / "lisp",
-        "kit": args.kit or os.environ.get("LISPM_KIT") or ROOT.parent / "lispm-kit",
         "ui": args.ui or os.environ.get("LISPM_UI") or ROOT.parent / "lispm-ui",
         "desktop": args.desktop or os.environ.get("LISPM_DESKTOP_LISP")
         or ROOT.parent / "lispm-desktop" / "lisp",
     }
     agent = existing_directory(paths["agent"], "lispm-agent lisp directory "
                                "(set LISPM_AGENT_LISP or --agent)")
-    kit = existing_directory(paths["kit"], "LISPM Kit checkout")
     ui = existing_directory(paths["ui"], "LISPM UI checkout")
-    load_path = [ROOT / "lisp", agent, kit, ui]
+    load_path = [ROOT / "lisp", agent, ui]
     if args.terminals > 0:
         load_path.append(existing_directory(paths["desktop"], "LISPM Desktop lisp directory"))
     elif Path(paths["desktop"]).is_dir():

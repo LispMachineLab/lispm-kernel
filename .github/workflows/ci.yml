@@ -43,12 +43,7 @@ jobs:
         with:
           repository: LispMachineLab/lispm-agent
           path: .ci/lispm-agent
-      # LispM Kit, whose engine translates the agent's words, and LispM UI,
-      # which asks for it.
-      - uses: actions/checkout@v7
-        with:
-          repository: LispMachineLab/lispm-kit
-          path: .ci/lispm-kit
+      # LispM UI (including Kit), which translates the agent's words and asks for it.
       - uses: actions/checkout@v7
         with:
           repository: LispMachineLab/lispm-ui
@@ -59,6 +54,6 @@ jobs:
       - name: Install SBCL
         run: sudo apt-get update && sudo apt-get install -y sbcl
       - name: Byte-compile
-        run: make compile LISPM_AGENT=.ci/lispm-agent/lisp LISPM_KIT=.ci/lispm-kit LISPM_UI=.ci/lispm-ui
+        run: make compile LISPM_AGENT=.ci/lispm-agent/lisp LISPM_UI=.ci/lispm-ui
       - name: Test
-        run: make test-emacs LISPM_AGENT=.ci/lispm-agent/lisp LISPM_KIT=.ci/lispm-kit LISPM_UI=.ci/lispm-ui
+        run: make test-emacs LISPM_AGENT=.ci/lispm-agent/lisp LISPM_UI=.ci/lispm-ui
