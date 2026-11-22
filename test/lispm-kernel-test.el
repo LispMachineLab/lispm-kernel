@@ -129,11 +129,11 @@ return the last."
 
 (ert-deftest lispm-kernel-refuses-what-cannot-go ()
   (lispm-kernel-test--with-runtime runtime
-    (should-error (lispm-kernel-submit runtime 'echo 1.5))
-    (should-error (lispm-kernel-submit runtime 'echo (intern "a b")))
-    (should-error (lispm-kernel-submit runtime 'echo '(1 . 2)))
-    (should-error (lispm-kernel-submit runtime 'echo (make-hash-table)))
-    (should-error (lispm-kernel-submit runtime 'echo nil :priority 1000))
+    (should-error (lispm-kernel-submit runtime 'echo 1.5) :type 'lispm-kernel-wire-error)
+    (should-error (lispm-kernel-submit runtime 'echo (intern "a b")) :type 'lispm-kernel-wire-error)
+    (should-error (lispm-kernel-submit runtime 'echo '(1 . 2)) :type 'lispm-kernel-wire-error)
+    (should-error (lispm-kernel-submit runtime 'echo (make-hash-table)) :type 'lispm-kernel-wire-error)
+    (should-error (lispm-kernel-submit runtime 'echo nil :priority 1000) :type 'lispm-kernel-wire-error)
     ;; Symbols the kernel would read as numbers, or escaped.
     (dolist (symbol (list '1+ '1- 'e1 (intern "-2") (intern "?x") (intern "a.b") (intern "")))
       (should-error (lispm-kernel-submit runtime 'echo (list symbol))))
@@ -272,10 +272,13 @@ return the last."
 
 (ert-deftest lispm-kernel-ping ()
   (lispm-kernel-test--with-runtime runtime
-    (let (pong)
-      (lispm-kernel-ping runtime (lambda (data) (setq pong data)) 1 "two" :three)
-      (should (lispm-kernel-test--wait runtime (lambda () pong)))
-      (should (equal pong '(1 "two" :three))))))
+    (let (pongs)
+      (lispm-kernel-ping runtime (lambda (data) (push data pongs)) 1 "two" :three)
+      (lispm-kernel-ping runtime (lambda (data) (push data pongs)) 4 "five")
+      (should (lispm-kernel-test--wait runtime (lambda () (= (length pongs) 2))))
+      (should (equal (nreverse pongs) '((1 "two" :three) (4 "five"))))
+      (should-not (lispm-kernel-runtime-waiters runtime))
+      (should-not (lispm-kernel-runtime-waiters-tail runtime)))))
 
 (ert-deftest lispm-kernel-unload-stops-kernels ()
   (let ((runtime (lispm-kernel-start lispm-kernel-test-program)))

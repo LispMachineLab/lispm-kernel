@@ -452,8 +452,10 @@ kernel may take fewer forms than Emacs, as it does 2026-10-21T010203."
 
 (deftest sessions-refuse-what-is-no-directory ()
   (with-directory (directory)
-    (signals error (lispm-kernel/sessions:scan :codex (path directory "missing") :emit #'identity))
-    (signals error (lispm-kernel/sessions:scan :claude (write-file (path directory "f") "") :emit #'identity))))
+    (signals lispm-kernel/sessions:scan-error
+      (lispm-kernel/sessions:scan :codex (path directory "missing") :emit #'identity))
+    (signals lispm-kernel/sessions:scan-error
+      (lispm-kernel/sessions:scan :claude (write-file (path directory "f") "") :emit #'identity))))
 
 (deftest sessions-scan-stops-when-cancelled ()
   (lispm-kernel/sessions:clear-caches)
@@ -486,3 +488,31 @@ kernel may take fewer forms than Emacs, as it does 2026-10-21T010203."
           (is (eql 8 (getf (fourth (done-of 1 messages)) :rows)))
           (is (eq :failed (third (done-of 2 messages))))
           (is (eq :failed (third (done-of 3 messages)))))))))
+
+(deftest sessions-overlapping-scan-preserves-newer-entries ()
+  (lispm-kernel/sessions:clear-caches)
+  (with-directory (directory)
+    (let* ((root (lispm-kernel/sessions::normalize-root (path directory "projects")))
+           (f1 (write-file (path root "p/one.jsonl") (claude-user "one" :cwd "/c/1")))
+           (stale-snapshot (lispm-kernel/sessions::agent-cache :claude root))
+           (stale-seen (make-hash-table :test 'equal)))
+      (setf (gethash f1 stale-seen) t)
+      ;; A faster overlapping scan discovers `two.jsonl' and commits first.
+      (let ((f2 (write-file (path root "p/two.jsonl") (claude-user "two" :cwd "/c/2"))))
+        (multiple-value-bind (rows summary) (scan-rows :claude root)
+          (is (= 2 (length rows)))
+          (is (= 0 (getf summary :cached))))
+        ;; Now the slower scan commits against `stale-snapshot' (epoch 0) whose `seen'
+        ;; table lacks `two.jsonl'; `two.jsonl' must NOT be swept from `P_cache'.
+        (lispm-kernel/sessions::commit-agent-cache
+         :claude root (lispm-kernel/sessions::cache-epoch stale-snapshot)
+         '() '() nil stale-seen nil)
+        (let ((after (lispm-kernel/sessions::agent-cache :claude root)))
+          (is (nth-value 1 (lispm-kernel/sessions::cached
+                            after 'lispm-kernel/sessions::transcripts f2 (file-stamp f2)))))
+        ;; Non-blocking clear (as invoked by `P_scheduler') still orders FIFO before next scan.
+        (lispm-kernel/sessions:clear-caches :wait nil)
+        (multiple-value-bind (rows summary) (scan-rows :claude root)
+          (is (= 2 (length rows)))
+          (is (= 0 (getf summary :cached))))))))
+

@@ -28,6 +28,24 @@
 
 (in-package #:lispm-kernel/files)
 
+(declaim (ftype (function (t t) boolean) stamp=)
+         (ftype (function () boolean) native-stat-p)
+         (ftype (function (string &key (:follow t)) (or null stamp)) file-stamp)
+         (ftype (function (string) (values list fixnum boolean)) directory-names)
+         (ftype (function ((simple-array (unsigned-byte 8) (*))
+                           &key (:start fixnum) (:end fixnum) (:drop-first t) (:drop-last t))
+                          list)
+                octet-lines)
+         (ftype (function (stream (integer 0) (integer 0)) (simple-array (unsigned-byte 8) (*)))
+                read-range)
+         (ftype (function (string (integer 0) (integer 0)) (or null transcript-read))
+                read-head-and-tail)
+         (ftype (function (string (integer 0))
+                          (values (or null (simple-array (unsigned-byte 8) (*)))
+                                  (or null stamp)
+                                  boolean))
+                read-file-octets))
+
 (defstruct (stamp (:constructor make-stamp (kind size mtime ctime inode device))
                   (:copier nil))
   "What one version of a file is."
@@ -40,7 +58,7 @@
 
 (defun stamp= (a b)
   "Return true when stamps A and B are of one version of a file."
-  (and a b
+  (and (stamp-p a) (stamp-p b)
        (eq (stamp-kind a) (stamp-kind b))
        (= (stamp-size a) (stamp-size b))
        (= (stamp-mtime a) (stamp-mtime b))
@@ -71,19 +89,18 @@
   "Where struct stat keeps what a stamp needs here, or nil when unknown.")
 
 ;;; Intel macOS names the stat of 64-bit inodes, the layout above, apart.
-(defmacro define-stat-call (name c-name argument-type)
-  `(defun ,name (argument buffer)
-     (sb-alien:alien-funcall
-      (sb-alien:extern-alien ,c-name (function sb-alien:int ,argument-type
-                                               sb-alien:system-area-pointer))
-      argument buffer)))
-
-(define-stat-call %stat #+(and darwin x86-64) "stat$INODE64" #-(and darwin x86-64) "stat"
-  sb-alien:c-string)
-(define-stat-call %lstat #+(and darwin x86-64) "lstat$INODE64" #-(and darwin x86-64) "lstat"
-  sb-alien:c-string)
-(define-stat-call %fstat #+(and darwin x86-64) "fstat$INODE64" #-(and darwin x86-64) "fstat"
-  sb-alien:int)
+(macrolet ((define-stat-call (name c-name argument-type)
+             `(defun ,name (argument buffer)
+                (sb-alien:alien-funcall
+                 (sb-alien:extern-alien ,c-name (function sb-alien:int ,argument-type
+                                                          sb-alien:system-area-pointer))
+                 argument buffer))))
+  (define-stat-call %stat #+(and darwin x86-64) "stat$INODE64" #-(and darwin x86-64) "stat"
+    sb-alien:c-string)
+  (define-stat-call %lstat #+(and darwin x86-64) "lstat$INODE64" #-(and darwin x86-64) "lstat"
+    sb-alien:c-string)
+  (define-stat-call %fstat #+(and darwin x86-64) "fstat$INODE64" #-(and darwin x86-64) "fstat"
+    sb-alien:int))
 
 (defun layout-stamp (buffer)
   "Return the stamp in BUFFER, a struct stat laid out as `*stat-layout*'."
@@ -126,18 +143,19 @@ until first used, then t or nil.")
 (defun check-native-stat ()
   "Return true when the native stat reads what sb-posix reads of /."
   (and *stat-layout*
-       (ignore-errors
-        (let ((native (call-stamp #'%stat "/"))
-              (posix (posix-stamp (sb-posix:stat "/"))))
-          (and native
-               (eq (stamp-kind native) :directory)
-               (= (stamp-inode native) (stamp-inode posix))
-               (= (stamp-device native) (stamp-device posix))
-               (= (stamp-size native) (stamp-size posix))
-               (= (floor (stamp-mtime native) 1000000000)
-                  (floor (stamp-mtime posix) 1000000000))
-               (= (floor (stamp-ctime native) 1000000000)
-                  (floor (stamp-ctime posix) 1000000000)))))))
+       (handler-case
+           (let ((native (call-stamp #'%stat "/"))
+                 (posix (posix-stamp (sb-posix:stat "/"))))
+             (and native
+                  (eq (stamp-kind native) :directory)
+                  (= (stamp-inode native) (stamp-inode posix))
+                  (= (stamp-device native) (stamp-device posix))
+                  (= (stamp-size native) (stamp-size posix))
+                  (= (floor (stamp-mtime native) 1000000000)
+                     (floor (stamp-mtime posix) 1000000000))
+                  (= (floor (stamp-ctime native) 1000000000)
+                     (floor (stamp-ctime posix) 1000000000))))
+         (sb-posix:syscall-error () nil))))
 
 (defun native-stat-p ()
   "Return true when stamps have nanoseconds, the native stat being right here."
@@ -152,33 +170,37 @@ FOLLOW nil stamps a symbolic link itself, not what it points to."
       (if (native-stat-p)
           (call-stamp (if follow #'%stat #'%lstat) path)
           (posix-stamp (if follow (sb-posix:stat path) (sb-posix:lstat path))))
-    (error () nil)))
+    ((or sb-posix:syscall-error file-error sb-int:character-encoding-error) () nil)))
 
 (defun descriptor-stamp (fd)
   (if (native-stat-p)
       (call-stamp #'%fstat fd)
       (handler-case (posix-stamp (sb-posix:fstat fd))
-        (error () nil))))
+        (sb-posix:syscall-error () nil))))
 
 ;;;; Directories
 
 (defun directory-names (path)
-  "Return the names of the entries of directory PATH, but . and ..
+  "Return a fresh list of the entry names of directory PATH, excluding . and ..
+The caller owns the returned list and may sort or mutate it in place.
 The second value counts entries whose names could not be decoded, which
 are left out; the third is nil when PATH could not be listed at all."
   (let ((directory (handler-case (sb-posix:opendir path)
-                     (error () nil))))
+                     ((or sb-posix:syscall-error file-error sb-int:character-encoding-error) () nil))))
     (if (or (null directory) (sb-alien:null-alien directory))
         (values '() 0 nil)
         (unwind-protect
              (let ((names '()) (undecodable 0))
+               (declare (type fixnum undecodable))
                (loop
                  (let ((entry (handler-case (sb-posix:readdir directory)
-                                (error () nil))))
+                                (sb-posix:syscall-error () nil))))
                    (when (or (null entry) (sb-alien:null-alien entry))
                      (return))
                    (let ((name (handler-case (sb-posix:dirent-name entry)
-                                 (error () (incf undecodable) nil))))
+                                 ((or sb-int:character-decoding-error sb-posix:syscall-error) ()
+                                   (incf undecodable)
+                                   nil))))
                      (when (and name (string/= name ".") (string/= name ".."))
                        (push name names)))))
                (values names undecodable t))
@@ -220,7 +242,7 @@ END.  Empty lines are left out."
 it is no regular file or cannot be opened.  It is opened without waiting,
 so a FIFO in its place cannot hold the thread."
   (let ((fd (handler-case (sb-posix:open path (logior sb-posix:o-rdonly sb-posix:o-nonblock))
-              (error () nil))))
+              ((or sb-posix:syscall-error file-error sb-int:character-encoding-error) () nil))))
     (when fd
       (let ((stamp (descriptor-stamp fd)))
         (if (and stamp (eq (stamp-kind stamp) :regular))
@@ -239,16 +261,18 @@ so a FIFO in its place cannot hold the thread."
 (defmacro with-regular-file ((stream stamp path) &body body)
   "Run BODY with STREAM reading octets of regular file PATH, STAMP its
 stamp; return nil without running it when PATH is none."
-  (let ((fd (gensym "FD")))
-    `(multiple-value-bind (,fd ,stamp) (open-regular ,path)
-       (when ,fd
-         (let ((,stream nil))
-           (unwind-protect
-                (progn
-                  (setf ,stream (sb-sys:make-fd-stream ,fd :input t :element-type '(unsigned-byte 8)
-                                                           :buffering :full :name ,path))
-                  ,@body)
-             (if ,stream (close ,stream) (sb-posix:close ,fd))))))))
+  (let ((path-val (gensym "PATH"))
+        (fd (gensym "FD")))
+    `(let ((,path-val ,path))
+       (multiple-value-bind (,fd ,stamp) (open-regular ,path-val)
+         (when ,fd
+           (let ((,stream nil))
+             (unwind-protect
+                  (progn
+                    (setf ,stream (sb-sys:make-fd-stream ,fd :input t :element-type '(unsigned-byte 8)
+                                                             :buffering :full :name ,path-val))
+                    ,@body)
+               (if ,stream (close ,stream) (sb-posix:close ,fd)))))))))
 
 (defstruct (transcript-read
             (:constructor make-transcript-read (head tail stamp cut size covered))
@@ -303,7 +327,7 @@ file."
            size
            (or (<= size head-bytes)
                (and tail (<= size (+ head-bytes tail-bytes)))))))
-    (error () nil)))
+    ((or stream-error file-error sb-posix:syscall-error) () nil)))
 
 (defun read-file-octets (path limit)
   "Return the octets of regular file PATH and its stamp, or nil when it is
@@ -315,4 +339,4 @@ octets, and true as third value."
           (values (read-range stream (max 0 (- size limit)) size)
                   stamp
                   (> size limit))))
-    (error () nil)))
+    ((or stream-error file-error sb-posix:syscall-error) () nil)))

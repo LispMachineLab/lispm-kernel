@@ -325,6 +325,30 @@ latest turn ended as lispm-agent's :ready reads it; return them without."
               (should (string-prefix-p host (plist-get s :cwd)))
               (should (string-prefix-p host (plist-get s :file))))))))))
 
+(ert-deftest lispm-kernel-desktop-local-and-remote-caches-are-isolated ()
+  "Switching between local and remote SSH roots preserves both caches and generations."
+  (lispm-kernel-desktop-test--with-trees
+    (let* ((host "/ssh:dev@example.com:")
+           (local-root lispm-agents-claude-projects-directory)
+           (remote-root (concat host local-root))
+           (lispm-kernel-desktop-host-command-function
+            (lambda (h) (and (equal h host) (list lispm-kernel-test-program)))))
+      (lispm-kernel-desktop-test--with-desktop
+        (lispm-kernel-sessions-mode 1)
+        (let ((local-sessions (lispm-kernel-desktop-test--read-until-known 'claude)))
+          (should (= 4 (length local-sessions)))
+          (let ((lispm-agents-claude-projects-directory remote-root))
+            (should (eq (lispm-kernel-desktop-test--read 'claude) 'pending))
+            (let ((host-runtime (lispm-kernel-desktop-runtime remote-root)))
+              (should (lispm-kernel-test--wait
+                       host-runtime
+                       (lambda () (not (eq (lispm-kernel-desktop-test--read 'claude) 'pending)))))
+              (should (= 4 (length (lispm-kernel-desktop-test--read 'claude))))))
+          ;; Local cache entry remains intact without rescanning or cross-runtime supersede.
+          (should (plist-get (gethash 'claude lispm-kernel-desktop--cache) :known))
+          (should (plist-get (gethash (cons 'claude host) lispm-kernel-desktop--cache) :known))
+          (should (equal (lispm-kernel-desktop-test--read 'claude) local-sessions)))))))
+
 (ert-deftest lispm-kernel-desktop-restarts-a-kernel-that-dies-at-once-after-a-while ()
   "A kernel that exits soon after it started is started again only after a
 while, twice as long each time in a row, up to the limit; restarting it
@@ -424,16 +448,20 @@ restart command starts a running kernel anew."
                        (lispm-kernel-desktop-test--sorted reference)))))))
 
 (ert-deftest lispm-kernel-desktop-lists-every-session-from-a-new-reading ()
-  "Lists of every session take what the kernel read lately, waiting for it
-to read anew when that is stale; those that may be a while old take
-what it read, or none while it reads first.  Other agents, and readings
-of a kernel that says nothing of turns, are the agents' own."
+  "Lists of every session never wait on the kernel: before the first scan
+they return nil while starting the background scan, then answer immediately
+with cached sessions and refresh stale readings asynchronously.  Other
+agents, and readings without turn metadata, fall back to the agents' own."
   (skip-unless (boundp 'lispm-agents-read-sessions-function))
   (lispm-kernel-desktop-test--with-trees
     (lispm-kernel-desktop-test--with-desktop
       (let ((own (lambda () (error "The agents' own reader was asked"))))
         (lispm-kernel-sessions-mode 1)
         (should-not (funcall lispm-agents-read-sessions-function 'claude own t))
+        (should-not (funcall lispm-agents-read-sessions-function 'claude own))
+        (should (lispm-kernel-test--wait
+                 lispm-kernel-desktop--runtime
+                 (lambda () (plist-get (gethash 'claude lispm-kernel-desktop--cache) :known))))
         (should (equal (lispm-kernel-desktop-test--sorted
                         (lispm-kernel-desktop-test--turns-dropped
                          (funcall lispm-agents-read-sessions-function 'claude own)))
@@ -442,8 +470,22 @@ of a kernel that says nothing of turns, are the agents' own."
          (expand-file-name "project/f.jsonl" lispm-agents-claude-projects-directory)
          '(:type "user" :cwd "/c/f" :message (:content "new one")))
         (let ((lispm-kernel-desktop-cache-seconds 0))
-          (should (= (length (funcall lispm-agents-read-sessions-function 'claude own t)) 4))
+          (should (= (length (funcall lispm-agents-read-sessions-function 'claude own)) 4))
+          (should (integerp (plist-get (gethash 'claude lispm-kernel-desktop--cache) :request)))
+          (should (lispm-kernel-test--wait
+                   lispm-kernel-desktop--runtime
+                   (lambda () (null (plist-get (gethash 'claude lispm-kernel-desktop--cache)
+                                               :request)))))
           (should (= (length (funcall lispm-agents-read-sessions-function 'claude own)) 5)))
+        ;; Manual invalidate keeps `:turns' so `--current' and `--lookup' stay strictly async.
+        (run-hooks 'lispm-agents-reread-sessions-hook)
+        (should (= (length (funcall lispm-agents-read-sessions-function 'claude own)) 5))
+        (should (equal (plist-get (lispm-kernel-desktop--lookup 'claude "a") :id) "a"))
+        (should (integerp (plist-get (gethash 'claude lispm-kernel-desktop--cache) :request)))
+        (should (lispm-kernel-test--wait
+                 lispm-kernel-desktop--runtime
+                 (lambda () (null (plist-get (gethash 'claude lispm-kernel-desktop--cache)
+                                             :request)))))
         (should (eq (funcall lispm-agents-read-sessions-function 'hermes (lambda () 'own)) 'own))
         (setf (plist-get (gethash 'claude lispm-kernel-desktop--cache) :turns) nil)
         (should (eq (funcall lispm-agents-read-sessions-function 'claude (lambda () 'own)) 'own))

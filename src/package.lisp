@@ -28,8 +28,42 @@
 ;;;             programs
 ;;;   sessions  the agents' sessions, read from their transcripts
 
+(defpackage #:lispm-kernel/csp
+  (:use #:common-lisp)
+  (:documentation "Lock-free CSP channels, cancellation gates, credit sinks and work-helping pools.")
+  (:export #:mbox
+           #:make-mbox
+           #:mbox-p
+           #:mbox-send
+           #:mbox-recv
+           #:mbox-try-recv
+           #:mbox-drain
+           #:mbox-count
+           #:mbox-empty-p
+           #:cancel-token
+           #:make-cancel-token
+           #:cancel-token-p
+           #:cancel!
+           #:cancelled-p
+           #:await-cancel
+           #:register-cancel-hook
+           #:credit-sink
+           #:make-credit-sink
+           #:credit-sink-put-control
+           #:credit-sink-put-chunk
+           #:credit-sink-take
+           #:credit-sink-close
+           #:credit-sink-waiting
+           #:credit-sink-peak
+           #:credit-sink-closed-p
+           #:work-group
+           #:make-work-group
+           #:stop-work-group
+           #:work-group-map))
+
 (defpackage #:lispm-kernel/wire
   (:use #:common-lisp)
+  (:documentation "S-expression wire reader and printer between Emacs and the kernel.")
   (:export #:wire-error
            #:read-message
            #:write-message
@@ -37,6 +71,7 @@
 
 (defpackage #:lispm-kernel/json
   (:use #:common-lisp)
+  (:documentation "Strict RFC 8259 JSON parser matching Emacs's json-parse-string.")
   (:export #:json-error
            #:parse-json
            #:json-object
@@ -49,6 +84,7 @@
 
 (defpackage #:lispm-kernel/files
   (:use #:common-lisp)
+  (:documentation "Nanosecond file stamps, directory listing and bounded byte-range reading.")
   (:export #:stamp
            #:stamp-p
            #:stamp-kind
@@ -75,31 +111,46 @@
            #:native-stat-p))
 
 (defpackage #:lispm-kernel
-  (:use #:common-lisp #:lispm-kernel/wire)
+  (:use #:common-lisp #:lispm-kernel/csp #:lispm-kernel/wire)
+  (:documentation "CSP request coordinator, priority worker pools, credit outbox and built-in jobs.")
   (:export #:+protocol+
            #:main
+           ;; Structured conditions
+           #:kernel-error
+           #:message-error
+           #:job-error
+           #:fetch-error
+           #:exec-error
+           #:regex-error
            ;; Defining work
            #:define-job
            #:emit
            #:checkpoint
+           #:current-cancel-token
            #:parallel-map
            #:*cache-clearers*
+           #:*background-stoppers*
            ;; A kernel in this process
            #:start-kernel
            #:stop-kernel
+           #:stop-background-helpers
            #:handle-message
            #:handle-line
            #:kernel-stats))
 
 (defpackage #:lispm-kernel/sessions
-  (:use #:common-lisp #:lispm-kernel/json #:lispm-kernel/files)
+  (:use #:common-lisp #:lispm-kernel/csp #:lispm-kernel/json #:lispm-kernel/files)
+  (:documentation "Parallel discovery and snapshot-isolated caching of Codex and Claude sessions.")
   (:import-from #:lispm-kernel
+                #:job-error
                 #:define-job
                 #:emit
                 #:checkpoint
                 #:parallel-map
-                #:*cache-clearers*)
-  (:export #:scan
+                #:*cache-clearers*
+                #:*background-stoppers*)
+  (:export #:scan-error
+           #:scan
            #:clear-caches
            #:human-text-p
            #:content-text

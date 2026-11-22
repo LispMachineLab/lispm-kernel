@@ -34,6 +34,9 @@
 (defparameter *io-workers* 4
   "Threads running jobs of the class :io.")
 
+(defparameter *subworkers* 3
+  "Persistent subworker threads shared by data-parallel batches.")
+
 (defun hello ()
   (list 'hello
         :protocol +protocol+
@@ -43,6 +46,8 @@
         :workers (list :cpu *cpu-workers* :io *io-workers*)
         :nanoseconds (and (lispm-kernel/files:native-stat-p) t)
         :jobs (sort (loop for name being the hash-keys of *jobs* collect name) #'string<)))
+
+(declaim (ftype (function () *) main))
 
 (defun stream-sink (stream)
   "Return a sink writing messages to STREAM, one per line.  When Emacs no
@@ -54,10 +59,11 @@ longer reads them, the kernel stops its work and ends."
             (write-string message stream)
             (write-char #\Newline stream))
           (finish-output stream))
-      (error ()
-        (ignore-errors
-          (when *kernel*
-            (stop-kernel *kernel* :timeout 2)))
+      (stream-error ()
+        (handler-case
+            (when *kernel*
+              (stop-kernel *kernel* :timeout 2))
+          (serious-condition () nil))
         (sb-ext:exit :code 0 :abort t)))))
 
 (defun main ()
@@ -74,9 +80,11 @@ longer reads them, the kernel stops its work and ends."
          (output (sb-sys:make-fd-stream 1 :output t :buffering :full :name "Emacs"
                                           :external-format :utf-8))
          (kernel (start-kernel (stream-sink output)
-                               :cpu-workers *cpu-workers* :io-workers *io-workers*)))
+                               :cpu-workers *cpu-workers*
+                               :io-workers *io-workers*
+                               :subworkers *subworkers*)))
     (setf *kernel* kernel)
-    (outbox-put (kernel-outbox kernel) (message-string (hello)))
+    (credit-sink-put-control (kernel-outbox kernel) (message-string (hello)))
     (unwind-protect
          (handler-case
              (loop for line = (read-line input nil nil)
@@ -84,5 +92,6 @@ longer reads them, the kernel stops its work and ends."
                    until (eq (handle-line kernel line) :quit))
            (error (condition)
              (format *error-output* "lispm-kernel: ~A~%" (condition-text condition))))
-      (ignore-errors (stop-kernel kernel :timeout 2)))
+      (handler-case (stop-kernel kernel :timeout 2)
+        (serious-condition () nil)))
     (sb-ext:exit :code 0 :abort t)))

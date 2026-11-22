@@ -1,4 +1,4 @@
-;;;; exec.lisp --- Programs Emacs does not wait on
+;;;; exec.lisp --- Event-multiplexed subprocess execution without polling
 
 ;; Copyright (C) 2026  Ryan.K
 ;; SPDX-License-Identifier: AGPL-3.0-or-later
@@ -16,27 +16,14 @@
 ;; You should have received a copy of the GNU Affero General Public License
 ;; along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-;;; Emacs that runs a program forks itself, a large process, and reads
-;;; what the program prints on its own thread; waiting for it, as
-;;; `call-process' and `process-lines' do, it does nothing else.  The
-;;; exec job runs the program instead, in the kernel:
+;;; Single-worker non-blocking `poll(2)' multiplexer for external programs:
 ;;;
-;;;   Emacs  (submit 4 exec (:program "/bin/ps" :args ("-axo" "pid=")
-;;;                          :cwd "/Users/me/" :env ("PATH=/bin" ...)))
-;;;   kernel (chunk 4 "  1\n  97\n") ...  (done 4 success (:exit 0 :stderr ""))
+;;;   [wakeup-rfd, stdin-fd, stdout-fd, stderr-fd] ──▶ unix-poll ──▶ emit chunks
 ;;;
-;;; PROGRAM is a file, as Emacs found it in `exec-path'; it runs with
-;;; ARGS in the directory CWD, with ENV, the whole of its environment as
-;;; "NAME=VALUE" strings, else the kernel's, reading STDIN, a string,
-;;; when given, else nothing.  What it prints on its standard output
-;;; comes as chunks, strings, as it comes; the result says how it ended,
-;;; (:exit CODE :stderr TEXT), or (:signal NUMBER :stderr TEXT) when a
-;;; signal ended it, TEXT the last of what it printed on its standard
-;;; error.  Both are read as UTF-8.  A program that cannot be started
-;;; fails the request, saying why; one that takes longer than TIMEOUT
-;;; seconds, when given, is stopped and fails it.  Cancelling the request
-;;; stops it.  Stopping a program stops its process group, the programs
-;;; it started with it: SIGTERM first, SIGKILL a second later.
+;;; A lock-free refcounted wakeup pipe bridges both `SIGCHLD' (`:status-hook')
+;;; and CSP `cancel-token' hooks directly into `poll(2)', eliminating helper
+;;; stdin feeder threads and periodic sleep polling.  Standard error is kept
+;;; in a fixed-size circular byte ring buffer.
 
 (in-package #:lispm-kernel)
 
@@ -46,12 +33,10 @@
 (defparameter *exec-stderr-limit* 65536
   "Octets of a program's standard error kept, the last.")
 
-(defparameter *exec-poll-seconds* 0.005
-  "Seconds the job waits for output before it looks again whether it was
-cancelled or the program exited.")
-
 (defparameter *exec-kill-seconds* 1
   "Seconds a program stopped with SIGTERM has to exit before SIGKILL.")
+
+;;;; UTF-8 framing and fixed-capacity stderr ring buffer
 
 (defun complete-utf-8-end (octets end)
   "Return the end of the whole UTF-8 sequences among OCTETS below END:
@@ -69,41 +54,179 @@ END, or where a sequence begins that END cuts short."
   (sb-ext:octets-to-string octets :start start :end end
                                   :external-format '(:utf-8 :replacement #\REPLACEMENT_CHARACTER)))
 
-(defun read-some (fd buffer start timeout)
-  "Read what FD has into BUFFER from START, waiting at most TIMEOUT
-seconds; return how many octets came, 0 at its end, or nil when none did."
-  (when (sb-sys:wait-until-fd-usable fd :input timeout nil)
-    (loop
-      (multiple-value-bind (count errno)
-          (sb-sys:with-pinned-objects (buffer)
-            (sb-unix:unix-read fd (sb-sys:sap+ (sb-sys:vector-sap buffer) start)
-                               (- (length buffer) start)))
-        (cond (count (return count))
-              ((/= errno sb-unix:eintr)
-               (error "Reading the program's output failed: ~A" (sb-int:strerror errno))))))))
+(defstruct (byte-ring (:constructor make-byte-ring (capacity)) (:copier nil))
+  "Circular byte buffer retaining at most the last CAPACITY octets."
+  (capacity 0 :type fixnum :read-only t)
+  (data (make-array capacity :element-type '(unsigned-byte 8))
+   :type (simple-array (unsigned-byte 8) (*)) :read-only t)
+  (head 0 :type fixnum)
+  (filled 0 :type fixnum))
 
-(defun stop-process (process)
-  "Stop PROCESS and the programs of its process group, and wait for it:
-SIGTERM, then SIGKILL after `*exec-kill-seconds*'."
+(defun byte-ring-write (ring source count)
+  "Append the first COUNT octets of SOURCE into RING in O(min(COUNT, CAPACITY))."
+  (let ((cap (byte-ring-capacity ring)))
+    (when (and (plusp cap) (plusp count))
+      (let* ((skip (max 0 (- count cap)))
+             (take (- count skip))
+             (head (byte-ring-head ring))
+             (first-part (min take (- cap head)))
+             (second-part (- take first-part))
+             (data (byte-ring-data ring)))
+        (replace data source :start1 head :end1 (+ head first-part)
+                             :start2 skip :end2 (+ skip first-part))
+        (when (plusp second-part)
+          (replace data source :start1 0 :end1 second-part
+                               :start2 (+ skip first-part) :end2 count))
+        (setf (byte-ring-head ring) (mod (+ head take) cap)
+              (byte-ring-filled ring) (min cap (+ (byte-ring-filled ring) take)))))))
+
+(defun byte-ring-string (ring)
+  "Decode the retained tail of RING as UTF-8."
+  (let ((filled (byte-ring-filled ring))
+        (cap (byte-ring-capacity ring))
+        (head (byte-ring-head ring))
+        (data (byte-ring-data ring)))
+    (cond ((zerop filled) "")
+          ((< filled cap) (utf-8-text data 0 filled))
+          (t (let ((out (make-array cap :element-type '(unsigned-byte 8))))
+               (replace out data :start1 0 :start2 head :end2 cap)
+               (replace out data :start1 (- cap head) :start2 0 :end2 head)
+               (utf-8-text out 0 cap))))))
+
+;;;; Non-blocking descriptors, lock-free wakeup pipe and POSIX poll(2)
+
+(defun set-fd-nonblocking (fd)
+  "Enable O_NONBLOCK on file descriptor FD."
+  (let ((flags (sb-posix:fcntl fd sb-posix:f-getfl)))
+    (sb-posix:fcntl fd sb-posix:f-setfl (logior flags sb-posix:o-nonblock))))
+
+;;; Lower 32 bits of `state' hold `(1+ wfd)' (0 once closed); upper 32 bits
+;;; count in-flight `wakeup-poke' writers so `wfd' is never closed or reused
+;;; mid-write, without taking any lock inside signal or cancel hooks.
+(defstruct (wakeup-pipe (:constructor %make-wakeup-pipe (rfd state)) (:copier nil))
+  (rfd -1 :type fixnum :read-only t)
+  (state 0 :type sb-ext:word)
+  (byte (make-array 1 :element-type '(unsigned-byte 8) :initial-element 1)
+   :type (simple-array (unsigned-byte 8) (1)) :read-only t))
+
+(defun open-wakeup-pipe ()
+  "Create a non-blocking wakeup pipe, closing descriptors on setup failure."
+  (multiple-value-bind (rfd wfd) (sb-posix:pipe)
+    (let ((ok nil))
+      (unwind-protect
+           (progn
+             (set-fd-nonblocking rfd)
+             (set-fd-nonblocking wfd)
+             (prog1 (%make-wakeup-pipe rfd (1+ wfd))
+               (setf ok t)))
+        (unless ok
+          (handler-case (sb-posix:close rfd)
+            (sb-posix:syscall-error () nil))
+          (handler-case (sb-posix:close wfd)
+            (sb-posix:syscall-error () nil)))))))
+
+(defun wakeup-poke (pipe)
+  "Write one byte to PIPE if still open; safe from signal and cancel hooks."
+  (let ((pin-step (ash 1 32)))
+    (loop
+      (let ((old (wakeup-pipe-state pipe)))
+        (when (zerop (ldb (byte 32 0) old))
+          (return nil))
+        (when (eql old (sb-ext:compare-and-swap (wakeup-pipe-state pipe) old (+ old pin-step)))
+          (let ((wfd (1- (ldb (byte 32 0) old))))
+            (unwind-protect
+                 (sb-unix:unix-write wfd (wakeup-pipe-byte pipe) 0 1)
+              (loop
+                (let* ((cur (wakeup-pipe-state pipe))
+                       (next (- cur pin-step)))
+                  (when (eql cur (sb-ext:compare-and-swap (wakeup-pipe-state pipe) cur next))
+                    (when (and (zerop (ldb (byte 32 0) next))
+                               (zerop (ash next -32)))
+                      (handler-case (sb-posix:close wfd)
+                        (sb-posix:syscall-error () nil)))
+                    (return))))))
+          (return t))))))
+
+(defun drain-wakeup-pipe (pipe scratch)
+  "Drain pending wakeup bytes from PIPE into SCRATCH."
+  (loop
+    (multiple-value-bind (count errno)
+        (sb-sys:with-pinned-objects (scratch)
+          (sb-unix:unix-read (wakeup-pipe-rfd pipe) (sb-sys:vector-sap scratch) (length scratch)))
+      (declare (ignore errno))
+      (when (or (null count) (zerop count))
+        (return)))))
+
+(defun close-wakeup-pipe (pipe)
+  "Close both ends of PIPE safely."
+  (let ((wfd-to-close nil))
+    (loop
+      (let ((old (wakeup-pipe-state pipe)))
+        (when (zerop (ldb (byte 32 0) old))
+          (return))
+        (let ((cleared (logand old (ash #xFFFFFFFF 32))))
+          (when (eql old (sb-ext:compare-and-swap (wakeup-pipe-state pipe) old cleared))
+            (when (zerop (ash cleared -32))
+              (setf wfd-to-close (1- (ldb (byte 32 0) old))))
+            (return)))))
+    (when wfd-to-close
+      (handler-case (sb-posix:close wfd-to-close)
+        (sb-posix:syscall-error () nil)))
+    (handler-case (sb-posix:close (wakeup-pipe-rfd pipe))
+      (sb-posix:syscall-error () nil))))
+
+(defun unix-poll-fds (pollbuf count timeout-ms)
+  "Call POSIX `poll(2)' on COUNT 8-byte `struct pollfd' entries in POLLBUF."
+  (sb-sys:with-pinned-objects (pollbuf)
+    (let ((rc (sb-alien:alien-funcall
+               (sb-alien:extern-alien "poll"
+                                      (function sb-alien:int
+                                                sb-alien:system-area-pointer
+                                                sb-alien:unsigned-int
+                                                sb-alien:int))
+               (sb-sys:vector-sap pollbuf) count timeout-ms)))
+      (if (< rc 0) 0 rc))))
+
+(defconstant +pollin+ #x0001
+  "POSIX `POLLIN' event bit for `struct pollfd'.")
+
+(defconstant +pollout+ #x0004
+  "POSIX `POLLOUT' event bit for `struct pollfd'.")
+
+(defun set-pollfd (pollbuf slot fd events)
+  "Encode FD and EVENTS into 8-byte `struct pollfd' entry SLOT inside POLLBUF."
+  (let ((sap (sb-sys:vector-sap pollbuf))
+        (offset (* slot 8)))
+    (setf (sb-sys:signed-sap-ref-32 sap offset) fd
+          (sb-sys:signed-sap-ref-16 sap (+ offset 4)) events
+          (sb-sys:signed-sap-ref-16 sap (+ offset 6)) 0)))
+
+(defun read-nonblocking (fd buffer start)
+  "Read available octets from non-blocking FD into BUFFER from START.
+Return byte count (> 0), 0 on EOF, or `:would-block'."
+  (loop
+    (multiple-value-bind (count errno)
+        (sb-sys:with-pinned-objects (buffer)
+          (sb-unix:unix-read fd (sb-sys:sap+ (sb-sys:vector-sap buffer) start)
+                             (- (length buffer) start)))
+      (cond (count (return count))
+            ((= errno sb-unix:eintr))
+            ((or (= errno sb-posix:eagain) (= errno sb-posix:ewouldblock))
+             (return :would-block))
+            (t (exec-error "Reading the program's output failed: ~A"
+                           (sb-int:strerror errno)))))))
+
+;;;; Process lifecycle and environment preparation
+
+(defun stop-process (process exit-gate)
+  "Stop PROCESS and its process group: SIGTERM, waiting on EXIT-GATE up to
+`*exec-kill-seconds*', then SIGKILL."
   (when (sb-ext:process-alive-p process)
     (sb-ext:process-kill process sb-posix:sigterm :process-group)
-    (let ((deadline (+ (get-internal-real-time) (* *exec-kill-seconds* internal-time-units-per-second))))
-      (loop while (and (sb-ext:process-alive-p process) (< (get-internal-real-time) deadline))
-            do (sleep 0.005)))
+    (sb-concurrency:wait-on-gate exit-gate :timeout *exec-kill-seconds*)
     (when (sb-ext:process-alive-p process)
       (sb-ext:process-kill process sb-posix:sigkill :process-group))
     (sb-ext:process-wait process)))
-
-(defun feed (process stdin)
-  "Write STDIN to PROCESS's standard input on a thread of its own, then
-close it; return the thread.  A program that does not read it all is
-no error."
-  (let ((stream (sb-ext:process-input process)))
-    (sb-thread:make-thread
-     (lambda ()
-       (ignore-errors (write-string stdin stream) (finish-output stream))
-       (ignore-errors (close stream)))
-     :name "lispm-kernel exec input")))
 
 (defun environment-name (entry)
   "Return the variable name before #\\= in ENTRY."
@@ -119,7 +242,7 @@ When INHERIT is non-nil, merge ENV over the kernel's own environment."
          (check-type env list)
          (dolist (entry env)
            (unless (and (stringp entry) (find #\= entry))
-             (error "An environment entry is NAME=VALUE, not ~S" entry)))
+             (exec-error "An environment entry is NAME=VALUE, not ~S" entry)))
          (if (not inherit)
              env
              (let ((seen (make-hash-table :test #'equal))
@@ -136,84 +259,167 @@ When INHERIT is non-nil, merge ENV over the kernel's own environment."
                      (push entry merged))))
                (nreverse merged))))))
 
-(defun run-streaming-program (program args &key cwd env env-inherit stdin timeout search combine-error)
-  "Run PROGRAM with ARGS, emitting UTF-8 stdout chunks and returning how it ended."
-  (let* ((process (sb-ext:run-program program args
-                                      :search search :wait nil :directory cwd
-                                      :environment (exec-environment env env-inherit)
-                                      :input (if stdin :stream nil)
-                                      :output :stream
-                                      :error (if combine-error :output :stream)
-                                      :external-format '(:utf-8 :replacement #\?)))
-         (feeder (and stdin (feed process stdin)))
-         (deadline (and timeout (+ (get-internal-real-time) (* timeout internal-time-units-per-second))))
-         (output (make-array (+ *exec-read-octets* 3) :element-type '(unsigned-byte 8)))
-         (errors (make-array 4096 :element-type '(unsigned-byte 8)))
-         (kept (make-array 0 :element-type '(unsigned-byte 8) :adjustable t :fill-pointer 0))
+;;;; Single-thread non-blocking stream multiplexer
+
+(defun drain-stdout-fd (fd buffer carried)
+  "Drain available octets from FD, emitting whole UTF-8 chunks.
+Return (values OPEN-P NEW-CARRIED)."
+  (loop
+    (let ((count (read-nonblocking fd buffer carried)))
+      (cond ((eq count :would-block)
+             (return (values t carried)))
+            ((zerop count)
+             (when (plusp carried)
+               (emit (utf-8-text buffer 0 carried)))
+             (return (values nil 0)))
+            (t
+             (let* ((end (+ carried count))
+                    (whole (complete-utf-8-end buffer end)))
+               (when (plusp whole)
+                 (emit (utf-8-text buffer 0 whole)))
+               (replace buffer buffer :start2 whole :end2 end)
+               (setf carried (- end whole))))))))
+
+(defun drain-stderr-fd (fd scratch ring)
+  "Drain available octets from FD into RING; return OPEN-P."
+  (loop
+    (let ((count (read-nonblocking fd scratch 0)))
+      (cond ((eq count :would-block) (return t))
+            ((zerop count) (return nil))
+            (t (byte-ring-write ring scratch count))))))
+
+(defun pump-stdin-fd (fd octets offset stream)
+  "Write available slices of OCTETS from OFFSET to non-blocking FD.
+Return (values OPEN-P NEXT-OFFSET), closing STREAM on completion or EPIPE."
+  (let ((total (length octets)))
+    (loop while (< offset total)
+          do (multiple-value-bind (written errno)
+                 (sb-unix:unix-write fd octets offset (min 65536 (- total offset)))
+               (cond (written
+                      (incf offset written))
+                     ((= errno sb-unix:eintr))
+                     ((or (= errno sb-posix:eagain) (= errno sb-posix:ewouldblock))
+                      (return-from pump-stdin-fd (values t offset)))
+                     (t
+                      (close stream :abort t)
+                      (return-from pump-stdin-fd (values nil total))))))
+    (close stream :abort t)
+    (values nil total)))
+
+(defun compute-poll-timeout-ms (alive deadline)
+  "Compute the `poll(2)' timeout in milliseconds."
+  (cond ((not alive) 0)
+        (deadline
+         (let ((remaining (- deadline (get-internal-real-time))))
+           (if (<= remaining 0)
+               0
+               (min 1000 (ceiling (* remaining 1000) internal-time-units-per-second)))))
+        (t 1000)))
+
+(defun multiplex-process-io (process pipe stdin deadline program timeout combine-error)
+  "Multiplex non-blocking stdin, stdout and stderr for PROCESS until completion.
+Return the captured UTF-8 stderr tail string."
+  (let* ((stdin-stream (and stdin (sb-ext:process-input process)))
+         (stdin-octets (and stdin (sb-ext:string-to-octets stdin :external-format :utf-8)))
+         (stdin-fd (and stdin-stream (sb-sys:fd-stream-fd stdin-stream)))
+         (stdin-pos 0)
+         (stdin-open (and stdin-fd t))
          (output-fd (sb-sys:fd-stream-fd (sb-ext:process-output process)))
          (error-fd (and (not combine-error)
                         (sb-ext:process-error process)
                         (sb-sys:fd-stream-fd (sb-ext:process-error process))))
+         (output-buf (make-array (+ *exec-read-octets* 3) :element-type '(unsigned-byte 8)))
+         (scratch (make-array 4096 :element-type '(unsigned-byte 8)))
+         (stderr-ring (make-byte-ring *exec-stderr-limit*))
+         (pollbuf (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0))
+         (output-open t)
+         (errors-open (and error-fd t))
          (carried 0))
+    (when stdin-fd
+      (set-fd-nonblocking stdin-fd)
+      (multiple-value-setq (stdin-open stdin-pos)
+        (pump-stdin-fd stdin-fd stdin-octets stdin-pos stdin-stream)))
+    (set-fd-nonblocking output-fd)
+    (when error-fd (set-fd-nonblocking error-fd))
+    (loop while (or output-open errors-open)
+          do (checkpoint)
+             (when (and deadline (> (get-internal-real-time) deadline))
+               (exec-error "~A did not finish in ~D seconds" program timeout))
+             (let ((nfds 1))
+               (sb-sys:with-pinned-objects (pollbuf)
+                 (set-pollfd pollbuf 0 (wakeup-pipe-rfd pipe) +pollin+)
+                 (when stdin-open (set-pollfd pollbuf nfds stdin-fd +pollout+) (incf nfds))
+                 (when output-open (set-pollfd pollbuf nfds output-fd +pollin+) (incf nfds))
+                 (when errors-open (set-pollfd pollbuf nfds error-fd +pollin+) (incf nfds)))
+               (unix-poll-fds pollbuf nfds
+                              (compute-poll-timeout-ms (sb-ext:process-alive-p process) deadline))
+               (drain-wakeup-pipe pipe scratch)
+               (checkpoint)
+               (when stdin-open
+                 (multiple-value-setq (stdin-open stdin-pos)
+                   (pump-stdin-fd stdin-fd stdin-octets stdin-pos stdin-stream)))
+               (when output-open
+                 (multiple-value-setq (output-open carried)
+                   (drain-stdout-fd output-fd output-buf carried)))
+               (when errors-open
+                 (setf errors-open (drain-stderr-fd error-fd scratch stderr-ring)))
+               (when (and (not (sb-ext:process-alive-p process))
+                          (or output-open errors-open))
+                 (when output-open
+                   (multiple-value-setq (output-open carried)
+                     (drain-stdout-fd output-fd output-buf carried)))
+                 (when errors-open
+                   (setf errors-open (drain-stderr-fd error-fd scratch stderr-ring)))
+                 (when (plusp carried)
+                   (emit (utf-8-text output-buf 0 carried))
+                   (setf carried 0))
+                 (return))))
+    (byte-ring-string stderr-ring)))
+
+(defun run-streaming-program (program args &key cwd env env-inherit stdin timeout search combine-error)
+  "Run PROGRAM with ARGS via a single-thread `poll(2)' multiplexer."
+  (checkpoint)
+  (let* ((pipe (open-wakeup-pipe))
+         (exit-gate (sb-concurrency:make-gate :name "exec-exit" :open nil))
+         (token (current-cancel-token))
+         (deadline (and timeout
+                        (+ (get-internal-real-time)
+                           (* timeout internal-time-units-per-second))))
+         (process nil))
     (unwind-protect
-         (flet ((take-output (timeout)
-                  ;; Emit what came, keeping a UTF-8 sequence cut short for
-                  ;; the next; return nil at the end, :none when nothing came.
-                  (let ((count (read-some output-fd output carried timeout)))
-                    (cond ((null count) :none)
-                          ((zerop count)
-                           (when (plusp carried)
-                             (emit (utf-8-text output 0 carried)))
-                           nil)
-                          (t (let* ((end (+ carried count))
-                                    (whole (complete-utf-8-end output end)))
-                               (when (plusp whole)
-                                 (emit (utf-8-text output 0 whole)))
-                               (replace output output :start2 whole :end2 end)
-                               (setf carried (- end whole))
-                               t)))))
-                (take-errors ()
-                  ;; Keep the last of what came; return nil at the end.
-                  (let ((count (read-some error-fd errors 0 0)))
-                    (cond ((null count) :none)
-                          ((zerop count) nil)
-                          (t (loop for index below count
-                                   do (vector-push-extend (aref errors index) kept))
-                             (when (> (length kept) (* 2 *exec-stderr-limit*))
-                               (let ((cut (- (length kept) *exec-stderr-limit*)))
-                                 (replace kept kept :start2 cut)
-                                 (setf (fill-pointer kept) *exec-stderr-limit*)))
-                             t)))))
-           (let ((output-open t) (errors-open (and error-fd t)))
-             ;; Until both ends are reached, or the program exited and
-             ;; printed nothing more: what it started may hold them.
-             (loop while (or output-open errors-open)
+         (progn
+           (setf process
+                 (sb-ext:run-program
+                  program args
+                  :search search :wait nil :directory cwd
+                  :environment (exec-environment env env-inherit)
+                  :input (if stdin :stream nil)
+                  :output :stream
+                  :error (if combine-error :output :stream)
+                  :external-format '(:utf-8 :replacement #\?)
+                  :status-hook (lambda (proc)
+                                 (unless (sb-ext:process-alive-p proc)
+                                   (sb-concurrency:open-gate exit-gate)
+                                   (wakeup-poke pipe)))))
+           (when token
+             (register-cancel-hook token (lambda () (wakeup-poke pipe))))
+           (unless (sb-ext:process-alive-p process)
+             (sb-concurrency:open-gate exit-gate))
+           (let ((stderr (multiplex-process-io process pipe stdin deadline
+                                               program timeout combine-error)))
+             (loop while (sb-ext:process-alive-p process)
                    do (checkpoint)
                       (when (and deadline (> (get-internal-real-time) deadline))
-                        (error "~A did not finish in ~D seconds" program timeout))
-                      (let* ((alive (sb-ext:process-alive-p process))
-                             (wait (if alive *exec-poll-seconds* 0))
-                             (out (if output-open (take-output wait) :none))
-                             (err (if errors-open (take-errors) :none)))
-                        (unless out (setf output-open nil))
-                        (unless err (setf errors-open nil))
-                        (when (and (eq out :none) (eq err :none))
-                          (cond ((not alive) (return))
-                                ((not output-open) (sleep *exec-poll-seconds*)))))))
-           (loop while (sb-ext:process-alive-p process)
-                 do (checkpoint)
-                    (when (and deadline (> (get-internal-real-time) deadline))
-                      (error "~A did not finish in ~D seconds" program timeout))
-                    (sleep *exec-poll-seconds*))
-           (let ((stderr (let ((start (max 0 (- (length kept) *exec-stderr-limit*))))
-                           (utf-8-text kept start (length kept)))))
+                        (exec-error "~A did not finish in ~D seconds" program timeout))
+                      (sb-concurrency:wait-on-gate
+                       exit-gate :timeout (/ (compute-poll-timeout-ms t deadline) 1000.0d0)))
              (if (eq (sb-ext:process-status process) :signaled)
                  (list :signal (sb-ext:process-exit-code process) :stderr stderr)
                  (list :exit (sb-ext:process-exit-code process) :stderr stderr))))
-      (stop-process process)
-      (when feeder
-        (sb-thread:join-thread feeder :default nil :timeout 5))
-      (sb-ext:process-close process))))
+      (when process
+        (stop-process process exit-gate)
+        (sb-ext:process-close process))
+      (close-wakeup-pipe pipe))))
 
 (define-job (exec :class :io) (input)
   "Run PROGRAM with ARGS in CWD, its environment ENV, reading STDIN, at most
@@ -228,7 +434,7 @@ INPUT is a plist of them."
     (check-type timeout (or null (integer 1 86400)))
     (unless (and (plusp (length program))
                  (or search (char= (char program 0) #\/)))
-      (error "The program to run is a file, not ~S" program))
+      (exec-error "The program to run is a file, not ~S" program))
     (run-streaming-program program args
                            :cwd cwd :env env :env-inherit (and env-inherit t)
                            :stdin stdin :timeout timeout
@@ -268,8 +474,8 @@ INPUT is a plist of them."
                       path)
                  (close stream)))
           (unless ok
-            (ignore-errors (sb-posix:close fd))
-            (ignore-errors (sb-posix:unlink path))))))))
+            (handler-case (sb-posix:close fd) (sb-posix:syscall-error () nil))
+            (handler-case (sb-posix:unlink path) (sb-posix:syscall-error () nil))))))))
 
 (define-job (http-stream :class :io) (input)
   "POST BODY to URL with HEADERS using curl, streaming the response as chunks.
@@ -303,4 +509,5 @@ INPUT is (:url URL :headers HEADERS :body BODY :curl CURL :connect-timeout INT
             :stdin (curl-header-config headers)
             :timeout (+ max-time 15)
             :search (not (and (plusp (length curl)) (char= (char curl 0) #\/))))
-        (ignore-errors (sb-posix:unlink file))))))
+        (handler-case (sb-posix:unlink file)
+          (sb-posix:syscall-error () nil))))))

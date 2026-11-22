@@ -107,6 +107,23 @@ when the last `+turn-bytes+' do not tell, as `lispm-agents-tail-bytes'.")
 (defparameter *threads* 4
   "Threads reading the transcripts of one scan.")
 
+(define-condition scan-error (job-error)
+  ()
+  (:documentation "A failure to list or open the session root."))
+
+(defun scan-error (control &rest arguments)
+  "Signal `scan-error' formatted with CONTROL and ARGUMENTS."
+  (error 'scan-error :message (apply #'format nil control arguments)))
+
+(declaim (ftype (function (t) boolean) human-text-p)
+         (ftype (function (t) string) content-text)
+         (ftype (function (string) string) file-name-base)
+         (ftype (function (&key (:wait t)) t) clear-caches)
+         (ftype (function ((member :codex :claude) string
+                           &key (:index (or null string)) (:emit function))
+                          list)
+                scan))
+
 (defstruct (session (:constructor make-session (id cwd title file mtime
                                                  &optional started turn-ended parent))
                     (:copier nil))
@@ -364,7 +381,7 @@ transcripts below its directories before its own."
                  (incf undecodable bad)
                  (unless listed
                    (if (zerop depth)
-                       (error "~A cannot be listed" root)
+                       (scan-error "~A cannot be listed" root)
                        (setf truncated t))
                    (return-from walk '()))
                  (let ((below '()) (own '()))
@@ -405,16 +422,16 @@ sorts it, with a slash after a directory's; KIND :directory,
           path kind)))
 
 (defun codex-names (cache index)
-  "Return a table from Codex session id to its latest thread name, as
-INDEX, Codex's session index, has them."
+  "Return (values NAMES-TABLE INDEX-UPDATE) from Codex's session INDEX."
   (let ((stamp (and index (file-stamp index))))
     (if (not (and stamp (eq (stamp-kind stamp) :regular)))
-        (make-hash-table :test 'equal)
+        (values (make-hash-table :test 'equal) nil)
         (multiple-value-bind (names found) (cached cache 'index index stamp)
           (if found
-              names
+              (values names nil)
               (multiple-value-bind (octets read-stamp cut) (read-file-octets index *max-index-bytes*)
-                (let ((names (make-hash-table :test 'equal)))
+                (let ((names (make-hash-table :test 'equal))
+                      (update nil))
                   (when octets
                     (dolist (line (octet-lines octets :drop-first cut))
                       (let* ((object (handler-case (parse-json line) (json-error () nil)))
@@ -422,8 +439,9 @@ INDEX, Codex's session index, has them."
                              (name (json-get object "thread_name")))
                         (when (and (stringp id) (stringp name))
                           (setf (gethash id names) (ascii-compact name)))))
-                    (store cache 'index index read-stamp names))
-                  names)))))))
+                    (when read-stamp
+                      (setf update (list index read-stamp names))))
+                  (values names update))))))))
 
 ;;;; Claude Code
 
@@ -437,7 +455,7 @@ INDEX, Codex's session index, has them."
 be decoded, and whether a project could not be listed."
   (multiple-value-bind (projects undecodable listed) (directory-names (if (string= root "") "/" root))
     (unless listed
-      (error "~A cannot be listed" root))
+      (scan-error "~A cannot be listed" root))
     ;; In the order `file-expand-wildcards' gives them: by project, then name.
     (let ((files '()) (truncated nil))
       (dolist (project (sort projects #'string<))
@@ -534,20 +552,17 @@ lines are HEAD and TAIL."
       (and (stringp title) (not (blankp title)) title))))
 
 (defun claude-custom-title (cache session)
-  "Return the title chosen for Claude Code SESSION in the custom-title.json
-of its own directory, beside its transcript, or nil."
+  "Return (values TITLE PATH UPDATE) for Claude Code SESSION's custom-title.json."
   (let* ((path (concatenate 'string (file-directory (session-file session)) "/"
                             (session-id session) "/custom-title.json"))
          (stamp (file-stamp path)))
     (when (and stamp (eq (stamp-kind stamp) :regular))
       (multiple-value-bind (title found) (cached cache 'titles path stamp)
         (if found
-            (values title path)
+            (values title path nil)
             (multiple-value-bind (octets read-stamp cut) (read-file-octets path *max-title-file-bytes*)
               (let ((title (and octets (not cut) (ascii-compact (custom-title octets)))))
-                (when read-stamp
-                  (store cache 'titles path read-stamp title))
-                (values title path))))))))
+                (values title path (and read-stamp (list path read-stamp title))))))))))
 
 ;;;; How the latest turn went
 
@@ -615,61 +630,163 @@ READ's head and tail already wrapped as `lines'."
           (multiple-value-bind (state cut) (read-look +turn-bytes+)
             (eq :ended (if (or state (not cut)) state (read-look +end-bytes+))))))))
 
-;;;; What is kept between scans
+;;;; Snapshot-isolated session cache custodian (`P_cache', zero mutexes)
 
-(defstruct (cache (:constructor make-cache ()) (:copier nil))
-  (lock (sb-thread:make-mutex :name "sessions cache") :read-only t)
-  ;; Each a table from a file to (STAMP . WHAT-WAS-READ).
-  (transcripts (make-hash-table :test 'equal) :read-only t)
-  (titles (make-hash-table :test 'equal) :read-only t)
-  (index (make-hash-table :test 'equal) :read-only t))
-
-(defvar *caches* (make-hash-table :test 'equal)
-  "The cache of each agent and root, by (AGENT . ROOT).")
-
-(defvar *caches-lock* (sb-thread:make-mutex :name "sessions caches"))
-
-(defun agent-cache (agent root)
-  (sb-thread:with-mutex (*caches-lock*)
-    (let ((key (cons agent root)))
-      (or (gethash key *caches*)
-          (setf (gethash key *caches*) (make-cache))))))
-
-(defun clear-caches ()
-  "Forget every transcript and title read."
-  (sb-thread:with-mutex (*caches-lock*)
-    (clrhash *caches*)))
-
-(pushnew 'clear-caches *cache-clearers*)
+(defstruct (cache (:constructor make-cache (&key (epoch 0)
+                                                 (transcripts (make-hash-table :test 'equal))
+                                                 (titles (make-hash-table :test 'equal))
+                                                 (index (make-hash-table :test 'equal))))
+                  (:copier nil))
+  "An immutable snapshot of cached files for one (AGENT . ROOT)."
+  (epoch 0 :type sb-ext:word :read-only t)
+  (transcripts nil :type hash-table :read-only t)
+  (titles nil :type hash-table :read-only t)
+  (index nil :type hash-table :read-only t))
 
 (defun cache-table (cache which)
+  "Return the hash-table slot WHICH (`transcripts', `titles', or `index') of CACHE."
   (ecase which
     (transcripts (cache-transcripts cache))
     (titles (cache-titles cache))
     (index (cache-index cache))))
 
 (defun cached (cache which file stamp)
-  "Return what was read of FILE when it had STAMP, and true; else nil, nil."
-  (sb-thread:with-mutex ((cache-lock cache))
-    (let ((entry (gethash file (cache-table cache which))))
-      (if (and entry (stamp= (car entry) stamp))
-          (values (cdr entry) t)
-          (values nil nil)))))
+  "Look up FILE with STAMP in immutable snapshot CACHE without locking."
+  (let ((entry (gethash file (cache-table cache which))))
+    (if (and entry (stamp= (car entry) stamp))
+        (values (cdr entry) t)
+        (values nil nil))))
 
-(defun store (cache which file stamp value)
-  "Keep VALUE as what was read of FILE when it had STAMP, room allowing."
-  (sb-thread:with-mutex ((cache-lock cache))
-    (let ((table (cache-table cache which)))
-      (when (or (gethash file table) (< (hash-table-count table) *max-cached*))
-        (setf (gethash file table) (cons stamp value))))))
+(defun merge-snapshot-table (old-table updates seen &optional (authoritative t))
+  "Produce a new immutable hash-table from OLD-TABLE applying UPDATES and SEEN.
+When AUTHORITATIVE is nil (an overlapping scan committed since this scan took
+its base snapshot), skip stale SEEN sweeps and preserve strictly newer stamps."
+  (let* ((effective-seen (and authoritative seen))
+         (kept-all (or (null effective-seen)
+                       (loop for file being the hash-keys of old-table
+                             always (gethash file effective-seen)))))
+    (if (and (null updates) kept-all)
+        old-table
+        (let ((next (make-hash-table :test 'equal
+                                     :size (max 16 (+ (hash-table-count old-table)
+                                                      (length updates))))))
+          (maphash (lambda (file entry)
+                     (when (or (null effective-seen) (gethash file effective-seen))
+                       (setf (gethash file next) entry)))
+                   old-table)
+          (dolist (update updates)
+            (destructuring-bind (file stamp value) update
+              (let ((existing (gethash file next)))
+                (when (and (or (null effective-seen) (gethash file effective-seen))
+                           (or existing (< (hash-table-count next) *max-cached*))
+                           (or authoritative
+                               (null existing)
+                               (>= (stamp-mtime stamp) (stamp-mtime (car existing)))))
+                  (setf (gethash file next) (cons stamp value))))))
+          next))))
 
-(defun sweep (cache which seen)
-  "Forget the files of CACHE's table WHICH that SEEN, a table, does not have."
-  (sb-thread:with-mutex ((cache-lock cache))
-    (let ((table (cache-table cache which)))
-      (loop for file in (loop for file being the hash-keys of table collect file)
-            unless (gethash file seen)
-              do (remhash file table)))))
+(defstruct (cache-custodian (:constructor %make-cache-custodian (mbox thread)) (:copier nil))
+  (mbox nil :type mbox :read-only t)
+  (thread nil :read-only t))
+
+(defvar *cache-custodian* nil
+  "Running `P_cache' sequential custodian process, started lazily.")
+
+(defun cache-custodian-loop (mbox)
+  "Sequential `P_cache' process owning all `(AGENT . ROOT)' snapshots."
+  (let ((snapshots (make-hash-table :test 'equal)))
+    (loop
+      (let ((msg (mbox-recv mbox)))
+        (ecase (first msg)
+          (:snapshot
+           (destructuring-bind (agent root reply) (rest msg)
+             (mbox-send reply (or (gethash (cons agent root) snapshots) (make-cache)))))
+          (:commit
+           (destructuring-bind (agent root base-epoch t-ups title-ups idx-ups seen-t seen-titles reply)
+               (rest msg)
+             (let* ((key (cons agent root))
+                    (old (or (gethash key snapshots) (make-cache)))
+                    (authoritative (= base-epoch (cache-epoch old)))
+                    (next (make-cache
+                           :epoch (1+ (cache-epoch old))
+                           :transcripts (merge-snapshot-table (cache-transcripts old)
+                                                              t-ups seen-t authoritative)
+                           :titles (merge-snapshot-table (cache-titles old)
+                                                         title-ups seen-titles authoritative)
+                           :index (merge-snapshot-table (cache-index old)
+                                                        idx-ups nil authoritative))))
+               (setf (gethash key snapshots) next)
+               (mbox-send reply next))))
+          (:clear
+           (clrhash snapshots)
+           (when (second msg)
+             (mbox-send (second msg) t)))
+          (:stop
+           (mbox-send (second msg) t)
+           (return)))))))
+
+(defun ensure-cache-custodian ()
+  "Return the active `P_cache' custodian, starting one atomically if needed."
+  (or *cache-custodian*
+      (let* ((mbox (make-mbox :name "lispm-kernel sessions-cache"))
+             (thread (sb-thread:make-thread #'cache-custodian-loop
+                                            :name "lispm-kernel cache"
+                                            :arguments (list mbox)))
+             (fresh (%make-cache-custodian mbox thread)))
+        (if (eq nil (sb-ext:compare-and-swap *cache-custodian* nil fresh))
+            fresh
+            (let ((reply (make-mbox :name "cache-stop")))
+              (mbox-send mbox (list :stop reply))
+              (mbox-recv reply :timeout 1)
+              (sb-thread:join-thread thread :default nil :timeout 1)
+              *cache-custodian*)))))
+
+(defun stop-cache-custodian ()
+  "Stop `P_cache' cleanly before saving an SBCL core image."
+  (let ((custodian *cache-custodian*))
+    (when custodian
+      (setf *cache-custodian* nil)
+      (let ((reply (make-mbox :name "cache-stop")))
+        (mbox-send (cache-custodian-mbox custodian) (list :stop reply))
+        (mbox-recv reply :timeout 2))
+      (sb-thread:join-thread (cache-custodian-thread custodian) :default nil :timeout 2))))
+
+(pushnew 'stop-cache-custodian *background-stoppers*)
+
+(defun agent-cache (agent root)
+  "Return the current immutable `cache' snapshot for AGENT and ROOT."
+  (let ((reply (make-mbox :name "cache-snapshot")))
+    (mbox-send (cache-custodian-mbox (ensure-cache-custodian))
+               (list :snapshot agent (normalize-root root) reply))
+    (mbox-recv reply)))
+
+(defun commit-agent-cache (agent root base-epoch transcript-updates title-updates index-updates
+                           seen-transcripts seen-titles)
+  "Atomically publish a new snapshot for AGENT and ROOT in `P_cache'."
+  (let ((reply (make-mbox :name "cache-commit")))
+    (mbox-send (cache-custodian-mbox (ensure-cache-custodian))
+               (list :commit agent root base-epoch transcript-updates title-updates index-updates
+                     seen-transcripts seen-titles reply))
+    (mbox-recv reply)))
+
+(defun clear-caches (&key (wait t))
+  "Forget every transcript and title read.
+When WAIT is nil (used by `P_scheduler'), post `:clear' without blocking."
+  (let ((custodian *cache-custodian*))
+    (when custodian
+      (if wait
+          (let ((reply (make-mbox :name "cache-clear")))
+            (mbox-send (cache-custodian-mbox custodian) (list :clear reply))
+            (mbox-recv reply))
+          (progn
+            (mbox-send (cache-custodian-mbox custodian) '(:clear nil))
+            t)))))
+
+(defun clear-caches-async ()
+  "Non-blocking cache clear hook invoked by `P_scheduler'."
+  (clear-caches :wait nil))
+
+(pushnew 'clear-caches-async *cache-clearers*)
 
 ;;;; Scanning
 
@@ -686,35 +803,36 @@ them."
                   (ascii-compact (session-parent session)))))
 
 (defun transcript-session (cache agent path)
-  "Return what transcript PATH is, (STATUS . SESSION): STATUS is :read,
-:cached or :skipped, SESSION its session or nil."
+  "Inspect transcript PATH against immutable snapshot CACHE.
+Return (STATUS SESSION UPDATE), where UPDATE is (PATH STAMP SESSION) when newly read."
   (checkpoint)
   (let ((stamp (file-stamp path)))
     (if (not (and stamp (eq (stamp-kind stamp) :regular)))
-        (cons :skipped nil)
+        (list :skipped nil nil)
         (multiple-value-bind (session found) (cached cache 'transcripts path stamp)
           (if found
-              (cons :cached session)
+              (list :cached session nil)
               (let ((read (read-head-and-tail path +head-bytes+ +tail-bytes+)))
                 (if (null read)
-                    (cons :skipped nil)
-                    (let* ((stamp (transcript-read-stamp read))
+                    (list :skipped nil nil)
+                    (let* ((read-stamp (transcript-read-stamp read))
                            (head-lines (make-lines (transcript-read-head read)))
                            (tail (transcript-read-tail read))
                            (tail-lines (and tail (make-lines tail)))
                            (session (compact-session
                                      (funcall (if (eq agent :codex) #'codex-session #'claude-session)
-                                              path head-lines tail-lines stamp)
+                                              path head-lines tail-lines read-stamp)
                                      agent path read head-lines tail-lines)))
-                      (store cache 'transcripts path stamp session)
-                      (cons :read session)))))))))
+                      (list :read session (list path read-stamp session))))))))))
 
 (defun truncate-title (title)
+  "Trim TITLE to at most `*max-title-length*' characters."
   (if (> (length title) *max-title-length*)
       (subseq title 0 *max-title-length*)
       title))
 
 (defun session-row (session title)
+  "Format SESSION and resolved TITLE into the wire plist expected by Emacs."
   (list* :id (session-id session) :cwd (session-cwd session) :title (truncate-title title)
          :file (session-file session) :mtime (session-mtime session)
          :turn-ended (session-turn-ended session)
@@ -722,6 +840,7 @@ them."
                  (and (session-parent session) (list :parent (session-parent session))))))
 
 (defun row-length (row)
+  "Estimate the wire character footprint of ROW for chunk batching."
   (+ 64 (loop for item in row when (stringp item) sum (length item))))
 
 (defun emit-rows (rows emit)
@@ -758,58 +877,73 @@ in the order each id first comes, as lispm-agent's hash table has them."
   "Find AGENT's sessions below ROOT, give them to EMIT in chunks and return
 the summary (:files :rows :empty :skipped :cached :truncated :turn-ended t).
 AGENT is :codex or :claude; INDEX is Codex's session index, if any.
-Signal an error when ROOT is no directory that can be listed."
+Signal `scan-error' when ROOT is no directory that can be listed."
   (let* ((root (normalize-root root))
          (stamp (file-stamp (if (string= root "") "/" root))))
     (unless (and stamp (eq (stamp-kind stamp) :directory))
-      (error "~A is no directory" root))
+      (scan-error "~A is no directory" root))
     (multiple-value-bind (files undecodable truncated)
         (ecase agent
           (:codex (codex-files root))
           (:claude (claude-files root)))
-      (let* ((cache (agent-cache agent root))
-             (results (parallel-map (lambda (path) (transcript-session cache agent path))
-                                    files :threads *threads*))
-             (names (and (eq agent :codex) (codex-names cache index)))
-             (titles-seen (make-hash-table :test 'equal))
-             (empty 0) (skipped undecodable) (from-cache 0)
-             (pairs '()))
-        (loop for (status . session) in results
-              do (case status
-                   (:skipped (incf skipped))
-                   (:cached (incf from-cache)))
-                 (cond ((null session)
-                        (unless (eq status :skipped) (incf empty)))
-                       ((eq agent :codex)
-                        (let ((title (or (gethash (session-id session) names) (session-title session))))
-                          (if title
-                              (push (cons session title) pairs)
-                              (incf empty))))
-                       (t
-                        (checkpoint)
-                        (multiple-value-bind (custom path) (claude-custom-title cache session)
-                          (when path
-                            (setf (gethash path titles-seen) t))
-                          (push (cons session (or custom (session-title session))) pairs)))))
-        (setf pairs (nreverse pairs))
-        (unless truncated
-          (let ((seen (make-hash-table :test 'equal)))
-            (dolist (file files)
-              (setf (gethash file seen) t))
-            (sweep cache 'transcripts seen)
-            (sweep cache 'titles titles-seen)))
-        (let ((rows (mapcar (lambda (pair) (session-row (car pair) (cdr pair)))
-                            (newest-per-id pairs))))
-          (emit-rows rows emit)
-          (list :files (length files) :rows (length rows) :empty empty :skipped skipped
-                :cached from-cache :truncated (and truncated t) :turn-ended t))))))
+      (let* ((snapshot (agent-cache agent root))
+             (results (parallel-map (lambda (path) (transcript-session snapshot agent path))
+                                    files :threads *threads*)))
+        (multiple-value-bind (names index-update)
+            (if (eq agent :codex)
+                (codex-names snapshot index)
+                (values nil nil))
+          (let ((transcript-updates '())
+                (title-updates '())
+                (titles-seen (make-hash-table :test 'equal))
+                (empty 0) (skipped undecodable) (from-cache 0)
+                (pairs '()))
+            (loop for (status session update) in results
+                  do (when update (push update transcript-updates))
+                     (case status
+                       (:skipped (incf skipped))
+                       (:cached (incf from-cache)))
+                     (cond ((null session)
+                            (unless (eq status :skipped) (incf empty)))
+                           ((eq agent :codex)
+                            (let ((title (or (gethash (session-id session) names)
+                                             (session-title session))))
+                              (if title
+                                  (push (cons session title) pairs)
+                                  (incf empty))))
+                           (t
+                            (checkpoint)
+                            (multiple-value-bind (custom path title-update)
+                                (claude-custom-title snapshot session)
+                              (when path
+                                (setf (gethash path titles-seen) t))
+                              (when title-update
+                                (push title-update title-updates))
+                              (push (cons session (or custom (session-title session))) pairs)))))
+            (setf pairs (nreverse pairs))
+            (let ((seen-files (unless truncated
+                                (let ((seen (make-hash-table :test 'equal :size (max 16 (length files)))))
+                                  (dolist (file files seen)
+                                    (setf (gethash file seen) t))))))
+              (commit-agent-cache agent root
+                                  (cache-epoch snapshot)
+                                  (nreverse transcript-updates)
+                                  (nreverse title-updates)
+                                  (and index-update (list index-update))
+                                  seen-files
+                                  (unless truncated titles-seen)))
+            (let ((rows (mapcar (lambda (pair) (session-row (car pair) (cdr pair)))
+                                (newest-per-id pairs))))
+              (emit-rows rows emit)
+              (list :files (length files) :rows (length rows) :empty empty :skipped skipped
+                    :cached from-cache :truncated (and truncated t) :turn-ended t))))))))
 
 (define-job (scan-sessions :class :io) (input)
   "Find the sessions of INPUT's :agent, codex or claude, below its :root,
 with Codex's session index :index; see `scan'."
   (destructuring-bind (&key agent root index) input
     (unless (member agent '(:codex :claude))
-      (error "There is no agent ~S to read sessions of" agent))
+      (scan-error "There is no agent ~S to read sessions of" agent))
     (unless (stringp root)
-      (error "The root to read sessions in is ~S, no directory name" root))
+      (scan-error "The root to read sessions in is ~S, no directory name" root))
     (scan agent root :index (and (stringp index) index))))

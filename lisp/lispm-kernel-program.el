@@ -59,6 +59,8 @@
 (require 'subr-x)
 (require 'lispm-kernel)
 
+(define-error 'lispm-kernel-program-error "LispM kernel program error" 'lispm-kernel-error)
+
 (defcustom lispm-kernel-program-source 'download
   "Where the kernel program comes from.
 `download', the default, downloads the program the repository's workflow
@@ -88,12 +90,10 @@ Each gets one argument, non-nil when the program is then there.")
   "Why the program could not be had, a sentence, or nil.")
 
 (defvar lispm-kernel-program-progress-functions nil
-  "Functions called as the program downloads, each with how much of it
-is there, a fraction from 0 to 1, as curl counts it.")
+  "Hook called with the download progress fraction from 0.0 to 1.0.")
 
 (defvar lispm-kernel-program-progress nil
-  "How much of the program downloading is there, a fraction from 0 to 1,
-or nil while curl has not said, and when nothing downloads.")
+  "Current download progress fraction from 0.0 to 1.0, or nil when idle.")
 
 (defconst lispm-kernel-program-lisp-directory
   (file-name-directory (or load-file-name buffer-file-name))
@@ -114,14 +114,12 @@ or nil while curl has not said, and when nothing downloads.")
   "The process downloading or unpacking the program, until its sentinel has run.")
 
 (defvar lispm-kernel-program--stopped nil
-  "Non-nil once `lispm-kernel-program-stop' stopped the build or download
-under way, until its sentinel has run.")
+  "Non-nil after `lispm-kernel-program-stop' until the active sentinel runs.")
 
 ;;;; Sources and their version
 
 (defun lispm-kernel-program--source-files ()
-  "Return the program's sources, sorted: its system definition, its build
-script and the Common Lisp under src."
+  "Return the sorted list of files that determine the kernel program version."
   (let ((root lispm-kernel-program-source-directory))
     (sort (seq-filter
            #'file-regular-p
@@ -139,9 +137,9 @@ script and the Common Lisp under src."
     (secure-hash 'sha256 (current-buffer))))
 
 (defun lispm-kernel-program-source-digest ()
-  "Return the SHA-256 of the program's sources, in hex, or nil without them.
-It is that of what sha256sum writes for them at the repository's root:
-for each, in order, a line of its SHA-256, two spaces and its name."
+  "Return the hex SHA-256 of the program's sources, or nil without them.
+It matches `sha256sum' run over `lispm-kernel-program--source-files' from
+the repository root."
   (when-let* ((files (lispm-kernel-program--source-files)))
     (secure-hash 'sha256
                  (mapconcat (lambda (file)
@@ -150,10 +148,8 @@ for each, in order, a line of its SHA-256, two spaces and its name."
                             files ""))))
 
 (defun lispm-kernel-program-source-version ()
-  "Return the version of the program's sources, or nil without them: the
-first 16 digits of `lispm-kernel-program-source-digest'.  A prebuilt
-program is published, pinned and kept under it, so a program downloaded
-for the sources stays current for them, and none is once they change."
+  "Return the 16-hex-digit source version, or nil when sources are absent.
+Derived from `lispm-kernel-program-source-digest' to key prebuilt releases."
   (when-let* ((digest (lispm-kernel-program-source-digest)))
     (substring digest 0 16)))
 
@@ -164,19 +160,20 @@ for the sources stays current for them, and none is once they change."
   (expand-file-name "lispm-kernel-program-sums.eld" lispm-kernel-program-lisp-directory))
 
 (defun lispm-kernel-program--pins ()
-  "Return what lispm-kernel-program-sums.eld pins: a plist whose :version
-is the version of the sources pinned and :programs an alist of a SHA-256
-for each target; nil when nothing is pinned."
+  "Return the plist pinned in `lispm-kernel-program-sums.eld', or nil.
+Contains `:version' and `:programs' mapping each target to its hex SHA-256."
   (let ((file (lispm-kernel-program--sums-file)))
     (when (file-readable-p file)
       (with-temp-buffer
         (insert-file-contents file)
-        (let ((pins (ignore-errors (read (current-buffer)))))
+        (let ((pins (condition-case nil
+                        (read (current-buffer))
+                      ((end-of-file invalid-read-syntax) nil))))
           (and (listp pins) pins))))))
 
 (defun lispm-kernel-program--pinned-sha256 (&optional target)
-  "Return the SHA-256 pinned for the program of these sources for TARGET,
-by default this computer's, or nil when none is pinned for them."
+  "Return the pinned SHA-256 for TARGET (defaulting to this host), or nil.
+Returns nil when the pinned `:version' differs from current sources."
   (when-let* ((target (or target (lispm-kernel-program--target)))
               (version (lispm-kernel-program-source-version))
               (pins (lispm-kernel-program--pins))
@@ -187,9 +184,8 @@ by default this computer's, or nil when none is pinned for them."
 ;;;; Programs
 
 (defun lispm-kernel-program--target (&optional configuration)
-  "Return the target of the prebuilt program for a computer Emacs was built
-for as CONFIGURATION, by default this one's `system-configuration', or nil
-when none is published for it."
+  "Return the prebuilt target triple for CONFIGURATION, or nil if unsupported.
+CONFIGURATION defaults to `system-configuration'."
   (let ((configuration (or configuration system-configuration)))
     (cond ((string-match-p "\\`\\(?:aarch64\\|arm64\\)-apple-darwin" configuration) "aarch64-apple-darwin")
           ((string-match-p "\\`x86_64-apple-darwin" configuration) "x86_64-apple-darwin")
@@ -208,8 +204,7 @@ when none is published for it."
   (file-executable-p (lispm-kernel-program--built-file)))
 
 (defun lispm-kernel-program--stale-p ()
-  "Return non-nil when a source of the program is newer than the program
-SBCL built, as after an update."
+  "Return non-nil when any kernel source file is newer than the built binary."
   (let ((program (lispm-kernel-program--built-file)))
     (and (file-exists-p program)
          (seq-some (lambda (file) (file-newer-than-file-p file program))
@@ -220,9 +215,8 @@ SBCL built, as after an update."
   (expand-file-name "prebuilt" lispm-kernel-program-source-directory))
 
 (defun lispm-kernel-program--prebuilt-file (&optional target)
-  "Return where the program downloaded for the sources is kept, whether it
-is there or not, for TARGET (by default this computer's), or nil when none
-is published for it or there are no sources to name its version."
+  "Return the cache path of the prebuilt binary for TARGET, or nil.
+TARGET defaults to `lispm-kernel-program--target'."
   (when-let* ((target (or target (lispm-kernel-program--target)))
               (version (lispm-kernel-program-source-version)))
     (expand-file-name (concat "lispm-kernel-" target)
@@ -233,9 +227,7 @@ is published for it or there are no sources to name its version."
   (eq lispm-kernel-program-source 'build))
 
 (defun lispm-kernel-program--current-file ()
-  "Return a program current for the sources, or nil: when building, the one
-SBCL built unless a source is newer; else the one downloaded for them.
-A download is kept only once it was checked, so what is kept was."
+  "Return the up-to-date kernel executable for the current sources, or nil."
   (if (lispm-kernel-program--building-p)
       (and (lispm-kernel-program--built-p) (not (lispm-kernel-program--stale-p))
            (lispm-kernel-program--built-file))
@@ -243,20 +235,15 @@ A download is kept only once it was checked, so what is kept was."
       (and prebuilt (file-executable-p prebuilt) prebuilt))))
 
 (defun lispm-kernel-program-file ()
-  "Return the kernel program to run, or nil: a current one, see
-`lispm-kernel-program--current-file', else, when building, the one SBCL
-built, out of date.  Nothing is returned while it is being built or
-downloaded."
+  "Return the executable kernel program to run now, or nil while busy/missing.
+When building, falls back to an older built binary until a rebuild completes."
   (unless (lispm-kernel-program-busy-p)
     (or (lispm-kernel-program--current-file)
         (and (lispm-kernel-program--building-p) (lispm-kernel-program--built-p)
              (lispm-kernel-program--built-file)))))
 
 (defun lispm-kernel-program--plan ()
-  "Return how to get the program: `build' when building is asked for, SBCL
-and the sources are there, and the program SBCL built is missing or older
-than a source; `download' otherwise, when no program checked for these
-sources is there and one is pinned for this computer; else nil."
+  "Return `build', `download', or nil for how to obtain a current binary."
   (if (lispm-kernel-program--building-p)
       (and (executable-find "sbcl")
            (lispm-kernel-program--source-files)
@@ -294,9 +281,7 @@ That lasts until the process's sentinel has run, not only while it runs."
 (define-obsolete-function-alias 'lispm-kernel-program--busy-p #'lispm-kernel-program-busy-p "0.4.0")
 
 (defun lispm-kernel-program--finish (what)
-  "Say the program is there, it being WHAT, a word such as \"downloaded\",
-or nil when it could not be got, and tell
-`lispm-kernel-program-obtained-functions'."
+  "Finalize program acquisition as WHAT (or nil on failure) and run hooks."
   (let ((there (and what (lispm-kernel-program-file) t)))
     (if there
         (progn (setq lispm-kernel-program-problem nil)
@@ -345,8 +330,7 @@ is got when `lispm-kernel-program-source' is `build'."
 ;;;; Downloading, checked
 
 (defun lispm-kernel-program--install (program file)
-  "Keep the unpacked PROGRAM as FILE, executable, and remove the programs
-kept for other versions; return FILE."
+  "Install unpacked PROGRAM atomically at FILE, pruning older prebuilt dirs."
   (let ((directory (directory-file-name (file-name-directory file))))
     (make-directory directory t)
     ;; Renamed into place, so the program is there whole or not at all.
@@ -359,9 +343,8 @@ kept for other versions; return FILE."
     file))
 
 (defun lispm-kernel-program--run (name buffer command then &optional filter)
-  "Run COMMAND as the process NAME, its output in BUFFER, in the background;
-call THEN with whether it exited with 0.  FILTER, when given, takes the
-output instead.  Return the process."
+  "Run COMMAND asynchronously as NAME in BUFFER and call THEN on exit status 0.
+When FILTER is non-nil, pass process output to FILTER instead of BUFFER."
   (make-process
    :name name :buffer buffer :noquery t :command command :filter filter
    :sentinel (lambda (process _event)
@@ -369,8 +352,7 @@ output instead.  Return the process."
                  (funcall then (= (process-exit-status process) 0))))))
 
 (defun lispm-kernel-program--progress (fraction)
-  "Say that FRACTION of the program is there, a number from 0 to 1, or
-nil when nothing downloads."
+  "Record download progress FRACTION (0.0 to 1.0, or nil) and notify hooks."
   (unless (equal fraction lispm-kernel-program-progress)
     (setq lispm-kernel-program-progress fraction)
     (when fraction
@@ -378,13 +360,10 @@ nil when nothing downloads."
 
 (defconst lispm-kernel-program--bar-regexp
   "\\`[-#=O ]*?\\([0-9]+\\(?:[.,][0-9]+\\)?\\)%\\'"
-  "What curl's progress bar says once it knows the size: hashes, then the
-percentage.")
+  "Regexp matching `curl --progress-bar' percentage frames.")
 
 (defun lispm-kernel-program--curl-filter (buffer)
-  "Return the filter of a curl drawing its progress bar: the percentages go
-to `lispm-kernel-program--progress', the bar's other frames nowhere, and
-the rest, as curl's errors, into BUFFER."
+  "Return a filter parsing curl progress frames and writing errors to BUFFER."
   (let ((partial ""))
     (lambda (_process output)
       (let* ((pieces (split-string (concat partial output) "[\r\n]"))
@@ -404,8 +383,7 @@ the rest, as curl's errors, into BUFFER."
                      (insert piece "\n"))))))))))
 
 (defun lispm-kernel-program--stopped-p ()
-  "Return non-nil, once, when `lispm-kernel-program-stop' stopped the
-build or download whose sentinel asks."
+  "Consume and return non-nil when `lispm-kernel-program-stop' halted the job."
   (prog1 lispm-kernel-program--stopped
     (setq lispm-kernel-program--stopped nil)))
 
@@ -421,11 +399,10 @@ Those waiting for it hear that it is not there, and
       (delete-process process))))
 
 (defun lispm-kernel-program-download ()
-  "Download the program built for this computer from the sources there
-are, in the background, check it against the SHA-256 pinned for it, and
-unpack it.  It comes from `lispm-kernel-program-prebuilt-url'; what went
-wrong, if anything, is in `lispm-kernel-program-problem' and the
-*lispm-kernel download* buffer."
+  "Download, verify and unpack the prebuilt kernel program in the background.
+Uses `lispm-kernel-program-prebuilt-url' and checks SHA-256 against the
+pinned sum; failures are recorded in `lispm-kernel-program-problem' and
+`*lispm-kernel download*'."
   (interactive)
   (let ((file (lispm-kernel-program--prebuilt-file))
         (sha256 (lispm-kernel-program--pinned-sha256)))
@@ -507,6 +484,7 @@ ends; nil when there is none and none can be had, and
 ;;;; In batch: an installer's or a workflow's
 
 (defun lispm-kernel-program--wait ()
+  "Block until any active background build or download completes."
   (while (lispm-kernel-program-busy-p)
     (accept-process-output nil 0.1)))
 
@@ -526,10 +504,7 @@ ends; nil when there is none and none can be had, and
       (lispm-kernel-stop runtime))))
 
 (defun lispm-kernel-program-batch-download ()
-  "Download the program, unless one checked for its sources is there, for
-an installer or a workflow running Emacs in batch: Emacs then exits with
-0 once the program runs and speaks this Lisp's protocol, else 1, having
-said what went wrong."
+  "Download and verify the kernel program in batch Emacs, exiting with 0 or 1."
   (unless (lispm-kernel-program--current-file)
     (if (not (lispm-kernel-program--plan))
         (message "No lispm-kernel program can be downloaded: %s" (lispm-kernel-program--why-not))
@@ -539,16 +514,15 @@ said what went wrong."
     (kill-emacs (if (and program (lispm-kernel-program--check program)) 0 1))))
 
 (defun lispm-kernel-program--fetch (url file)
-  "Download URL into FILE with curl, or signal an error."
+  "Download URL into FILE with curl, or signal `lispm-kernel-program-error'."
   (unless (zerop (call-process "curl" nil nil nil "--fail" "--silent" "--show-error" "--location"
                                "--retry" "2" "--output" file url))
-    (error "Could not download %s" url)))
+    (signal 'lispm-kernel-program-error (list (format "Could not download %s" url)))))
 
 (defun lispm-kernel-program-published (url version)
-  "Return the alist of target and SHA-256 of the release of VERSION under
-URL, each program downloaded and found to be the one its SHA256SUMS
-lists, and one there for every target in `lispm-kernel-program-targets'.
-Signal an error otherwise."
+  "Return verified `(TARGET . SHA256)' pairs for release VERSION under URL.
+Downloads each asset listed in `SHA256SUMS', verifies its digest, and
+requires every target in `lispm-kernel-program-targets'."
   (let* ((release (format "%s/kernel-program-%s/" (string-trim-right url "/+") version))
          (directory (make-temp-file "lispm-kernel-pin" t))
          (sums (expand-file-name "SHA256SUMS" directory))
@@ -559,23 +533,29 @@ Signal an error otherwise."
           (dolist (line (split-string (with-temp-buffer (insert-file-contents sums) (buffer-string))
                                       "\n" t "[ \t\r]+"))
             (unless (string-match "\\`\\([0-9a-f]\\{64\\}\\) [ *]lispm-kernel-\\(.+\\)\\.gz\\'" line)
-              (error "SHA256SUMS of kernel-program-%s lists %S, not a kernel program" version line))
+              (signal 'lispm-kernel-program-error
+                      (list (format "SHA256SUMS of kernel-program-%s lists %S, not a kernel program"
+                                    version line))))
             (let* ((sha256 (match-string 1 line))
                    (target (match-string 2 line))
                    (file (expand-file-name (lispm-kernel-program--asset target) directory)))
               (lispm-kernel-program--fetch (concat release (lispm-kernel-program--asset target)) file)
               (unless (equal (lispm-kernel-program--sha256 file) sha256)
-                (error "%s is not the program SHA256SUMS lists: refusing to pin it"
-                       (lispm-kernel-program--asset target)))
+                (signal 'lispm-kernel-program-error
+                        (list (format "%s is not the program SHA256SUMS lists: refusing to pin it"
+                                      (lispm-kernel-program--asset target)))))
               (push (cons target sha256) programs)))
           (let ((missing (seq-remove (lambda (target) (assoc target programs))
                                      lispm-kernel-program-targets)))
             (when missing
-              (error "kernel-program-%s has no program for %s" version (string-join missing ", "))))
+              (signal 'lispm-kernel-program-error
+                      (list (format "Release kernel-program-%s has no program for %s"
+                                    version (string-join missing ", "))))))
           (sort programs (lambda (a b) (string< (car a) (car b)))))
       (delete-directory directory t))))
 
 (defun lispm-kernel-program--render-pins (version programs)
+  "Render `lispm-kernel-program-sums.eld' text for VERSION and PROGRAMS."
   (concat ";;; lispm-kernel-program-sums.eld --- The kernel programs LispM downloads  -*- lisp-data -*-
 ;; SPDX-License-Identifier: AGPL-3.0-or-later
 
@@ -602,7 +582,8 @@ writes nothing and exits with 1 when the file pins these sources
 otherwise than the release has them; a file pinning other sources
 passes, with a notice, as it does between a change of the sources and
 the next release."
-  (let ((version (or (lispm-kernel-program-source-version) (error "No sources here")))
+  (let ((version (or (lispm-kernel-program-source-version)
+                     (signal 'lispm-kernel-program-error '("No sources here"))))
         (pins (lispm-kernel-program--pins))
         (file (lispm-kernel-program--sums-file)))
     (condition-case error
@@ -618,8 +599,9 @@ the next release."
                           (sort (copy-sequence (plist-get pins :programs))
                                 (lambda (a b) (string< (car a) (car b)))))
                    (message "%s pins kernel-program-%s as published" (file-name-nondirectory file) version))
-                  (t (error "%s differs from the release kernel-program-%s"
-                            (file-name-nondirectory file) version)))
+                  (t (signal 'lispm-kernel-program-error
+                             (list (format "%s differs from the release kernel-program-%s"
+                                           (file-name-nondirectory file) version)))))
           (with-temp-file file
             (insert (lispm-kernel-program--render-pins
                      version (lispm-kernel-program-published lispm-kernel-program-prebuilt-url version))))
@@ -718,11 +700,49 @@ Call CALLBACK with (FILE nil) on success, or (nil PROBLEM) on failure."
    remote-path (shell-quote-argument sha256)))
 
 (defun lispm-kernel-program--remote-install-script (remote-dir remote-path sha256)
-  "Return a shell script installing stdin to REMOTE-PATH in REMOTE-DIR
-after verifying its SHA-256 matches SHA256."
+  "Return a shell script installing stdin to REMOTE-PATH in REMOTE-DIR.
+Verifies that the uploaded file digest matches SHA256 before moving into place."
   (format
    "set -e; mkdir -p %s; tmp=%s.part.$$; trap 'rm -f \"$tmp\"' EXIT; cat > \"$tmp\"; if command -v sha256sum >/dev/null 2>&1; then got=$(sha256sum \"$tmp\" | awk '{print $1}'); elif command -v shasum >/dev/null 2>&1; then got=$(shasum -a 256 \"$tmp\" | awk '{print $1}'); else exit 1; fi; [ \"$got\" = %s ]; chmod 755 \"$tmp\"; mv -f \"$tmp\" %s; trap - EXIT"
    remote-dir remote-path (shell-quote-argument sha256) remote-path))
+
+(defun lispm-kernel-program--stage-remote-binary (host ssh-args local-file callback)
+  "Verify or upload LOCAL-FILE over SSH-ARGS to HOST, then call CALLBACK."
+  (let* ((sha256 (lispm-kernel-program--sha256 local-file))
+         (version (or (lispm-kernel-program-source-version)
+                      (substring sha256 0 16)))
+         (remote-dir "$HOME/.cache/lispm/kernel")
+         (remote-path (format "%s/lispm-kernel-%s" remote-dir version))
+         (exec-cmd (append ssh-args (list (format "exec %s" remote-path))))
+         (check-buf (generate-new-buffer " *lispm-kernel ssh check*" t)))
+    (lispm-kernel-program--run
+     "lispm-kernel ssh check" check-buf
+     (append ssh-args
+             (list (lispm-kernel-program--remote-sha256-script remote-path sha256)))
+     (lambda (verified)
+       (when (buffer-live-p check-buf) (kill-buffer check-buf))
+       (if verified
+           (funcall callback exec-cmd nil)
+         (let ((stage-buf (generate-new-buffer " *lispm-kernel ssh stage*" t)))
+           (lispm-kernel-program--run
+            "lispm-kernel ssh stage" stage-buf
+            (list "sh" "-c"
+                  (format "cat %s | %s %s"
+                          (shell-quote-argument local-file)
+                          (mapconcat #'shell-quote-argument ssh-args " ")
+                          (shell-quote-argument
+                           (lispm-kernel-program--remote-install-script
+                            remote-dir remote-path sha256))))
+            (lambda (staged)
+              (let ((err (and (buffer-live-p stage-buf)
+                              (with-current-buffer stage-buf
+                                (string-trim (buffer-string))))))
+                (when (buffer-live-p stage-buf) (kill-buffer stage-buf))
+                (if staged
+                    (funcall callback exec-cmd nil)
+                  (funcall callback nil
+                           (format "could not stage lispm-kernel to %s: %s"
+                                   host (or err "")))))))))))))
 
 (defun lispm-kernel-program-stage-ssh (host callback)
   "Stage a SHA-256 verified kernel program to SSH HOST in the background.
@@ -749,41 +769,8 @@ to run the remote kernel, or (nil PROBLEM) when it cannot be staged."
                   (lambda (local-file problem)
                     (if (not local-file)
                         (funcall callback nil problem)
-                      (let* ((sha256 (lispm-kernel-program--sha256 local-file))
-                             (version (or (lispm-kernel-program-source-version)
-                                          (substring sha256 0 16)))
-                             (remote-dir "$HOME/.cache/lispm/kernel")
-                             (remote-path (format "%s/lispm-kernel-%s" remote-dir version))
-                             (exec-cmd (append ssh-args (list (format "exec %s" remote-path))))
-                             (check-buf (generate-new-buffer " *lispm-kernel ssh check*" t)))
-                        (lispm-kernel-program--run
-                         "lispm-kernel ssh check" check-buf
-                         (append ssh-args
-                                 (list (lispm-kernel-program--remote-sha256-script remote-path sha256)))
-                         (lambda (verified)
-                           (when (buffer-live-p check-buf) (kill-buffer check-buf))
-                           (if verified
-                               (funcall callback exec-cmd nil)
-                             (let ((stage-buf (generate-new-buffer " *lispm-kernel ssh stage*" t)))
-                               (lispm-kernel-program--run
-                                "lispm-kernel ssh stage" stage-buf
-                                (list "sh" "-c"
-                                      (format "cat %s | %s %s"
-                                              (shell-quote-argument local-file)
-                                              (mapconcat #'shell-quote-argument ssh-args " ")
-                                              (shell-quote-argument
-                                               (lispm-kernel-program--remote-install-script
-                                                remote-dir remote-path sha256))))
-                                (lambda (staged)
-                                  (let ((err (and (buffer-live-p stage-buf)
-                                                  (with-current-buffer stage-buf
-                                                    (string-trim (buffer-string))))))
-                                    (when (buffer-live-p stage-buf) (kill-buffer stage-buf))
-                                    (if staged
-                                        (funcall callback exec-cmd nil)
-                                      (funcall callback nil
-                                               (format "could not stage lispm-kernel to %s: %s"
-                                                       host (or err ""))))))))))))))))))))))))
+                      (lispm-kernel-program--stage-remote-binary
+                       host ssh-args local-file callback)))))))))))))
 
 (provide 'lispm-kernel-program)
 ;;; lispm-kernel-program.el ends here

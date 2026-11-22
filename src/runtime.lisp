@@ -1,4 +1,4 @@
-;;;; runtime.lisp --- Requests, worker pools and the outbox
+;;;; runtime.lisp --- CSP request coordinator, worker channels and credit outbox
 
 ;; Copyright (C) 2026  Ryan.K
 ;; SPDX-License-Identifier: AGPL-3.0-or-later
@@ -16,30 +16,19 @@
 ;; You should have received a copy of the GNU Affero General Public License
 ;; along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-;;; Emacs asks for a job by name, with a request ID of its choosing, an
-;;; owner, a generation and a priority:
+;;; CSP concurrency architecture (zero domain mutexes):
 ;;;
-;;;   Emacs  (submit 7 scan-sessions (:agent codex :root "...") :owner 1 :generation 3)
-;;;   kernel (chunk 7 DATA) ...  then exactly one  (done 7 STATUS VALUE)
+;;;   P_reader ──control-mbox──▶ P_scheduler ──worker-mbox──▶ P_worker (:cpu/:io)
+;;;                                   │                            │
+;;;                                   └──ctrl──▶ credit-sink ◀─────┴──chunk (4 MiB)
+;;;                                                   │
+;;;                                                P_writer ──▶ Emacs
 ;;;
-;;; STATUS is success, failed (VALUE says why), cancelled, or rejected
-;;; (VALUE says why: capacity, stale, unknown-job, duplicate, closed, or
-;;; malformed for a submission the kernel could not read).
-;;; Every request Emacs sends gets its one done, and its chunks come
-;;; before it.
-;;;
-;;; Requests wait in a queue per class of work, :cpu or :io, each served
-;;; by threads of its own.  A worker takes the request of the highest
-;;; priority, one more for each `*aging-milliseconds*' it has waited, the
-;;; oldest of equals first.  An owner's newer generation cancels its older
-;;; requests, and a request of an older one is rejected as stale.
-;;; Cancelling a queued request answers it at once; a running one stops
-;;; at its next `checkpoint'.
-;;;
-;;; Messages for Emacs wait in the outbox, which one thread writes out.
-;;; Chunks count against `*outbox-limit*': while Emacs reads slower than
-;;; jobs emit, a job emitting waits, until there is room or it is
-;;; cancelled.  Final and other messages never wait.
+;;; `P_scheduler' is the single sequential owner of admission state, owner
+;;; generations, aging priority queues and counters.  Workers never share or
+;;; lock scheduler tables: each idle worker announces readiness on
+;;; `control-mbox', receives one assigned request on its private `worker-mbox',
+;;; runs it with an explicit `cancel-token', and posts `:settled' back.
 
 (in-package #:lispm-kernel)
 
@@ -68,6 +57,60 @@
   "Functions that free what jobs keep between requests, called when Emacs
 sends (clear-caches).")
 
+(defvar *background-stoppers* '()
+  "Functions that stop lazy process-wide helper threads before image save or REPL teardown.")
+
+;;;; Structured conditions
+
+(define-condition kernel-error (error)
+  ((message :initarg :message :reader kernel-error-message :type string))
+  (:report (lambda (condition stream)
+             (write-string (kernel-error-message condition) stream)))
+  (:documentation "Base condition for structured errors signalled by the kernel."))
+
+(define-condition message-error (kernel-error)
+  ()
+  (:documentation "A wire datum that is not a valid protocol message."))
+
+(define-condition job-error (kernel-error)
+  ()
+  (:documentation "A domain failure raised by a kernel job."))
+
+(define-condition fetch-error (job-error)
+  ()
+  (:documentation "A download failure in the fetch job."))
+
+(define-condition exec-error (job-error)
+  ()
+  (:documentation "A process execution failure in the exec or http-stream job."))
+
+(define-condition regex-error (job-error)
+  ()
+  (:documentation "An invalid regular expression pattern in search-files."))
+
+(defun signal-kernel-error (type control arguments)
+  (error type :message (apply #'format nil control arguments)))
+
+(defun message-error (control &rest arguments)
+  "Signal `message-error' formatted with CONTROL and ARGUMENTS."
+  (signal-kernel-error 'message-error control arguments))
+
+(defun job-error (control &rest arguments)
+  "Signal `job-error' formatted with CONTROL and ARGUMENTS."
+  (signal-kernel-error 'job-error control arguments))
+
+(defun fetch-error (control &rest arguments)
+  "Signal `fetch-error' formatted with CONTROL and ARGUMENTS."
+  (signal-kernel-error 'fetch-error control arguments))
+
+(defun exec-error (control &rest arguments)
+  "Signal `exec-error' formatted with CONTROL and ARGUMENTS."
+  (signal-kernel-error 'exec-error control arguments))
+
+(defun regex-error (control &rest arguments)
+  "Signal `regex-error' formatted with CONTROL and ARGUMENTS."
+  (signal-kernel-error 'regex-error control arguments))
+
 ;;;; Jobs
 
 (defstruct (job (:constructor make-job (name class function)) (:copier nil))
@@ -92,7 +135,7 @@ request stops.  An error it signals fails the request."
                                          ,@body)))
        ',name)))
 
-;;;; Requests
+;;;; Requests and cancellation tokens
 
 (defstruct (request (:constructor make-request (id job input owner generation priority))
                     (:copier nil))
@@ -103,132 +146,113 @@ request stops.  An error it signals fails the request."
   (generation 0 :type integer :read-only t)
   (priority 0 :type integer :read-only t)
   (submitted (get-internal-real-time) :type integer :read-only t)
+  ;; Owned exclusively by P_scheduler (:queued -> :running -> :answered).
   (state :queued :type (member :queued :running :answered))
-  (cancelled nil))
+  ;; Broadcast CSP cancellation channel shared between P_scheduler and P_worker.
+  (token (make-cancel-token :name "request-cancel") :type cancel-token :read-only t))
+
+(defun request-cancelled (request)
+  "Return true when REQUEST's cancellation token has fired."
+  (cancelled-p (request-token request)))
+
+(defun (setf request-cancelled) (value request)
+  "Fire REQUEST's cancellation token when VALUE is non-nil."
+  (when value
+    (cancel! (request-token request)))
+  (and value t))
 
 (defvar *request* nil
-  "The request this thread works on, or nil.")
+  "The request this worker currently executes, or nil.")
+
+(defun current-cancel-token ()
+  "Return the active `cancel-token' of the current request, or nil."
+  (let ((request *request*))
+    (and request (request-token request))))
 
 (defun checkpoint ()
-  "Stop the current request here when it was cancelled.
+  "Stop the current request here when its cancellation token has fired.
 Outside a request it does nothing."
   (let ((request *request*))
-    (when (and request (request-cancelled request))
+    (when (and request (cancelled-p (request-token request)))
       (throw 'cancelled nil))))
 
-;;;; The outbox
+;;;; Outbox compatibility accessors over `credit-sink'
 
-(defstruct (outbox (:constructor make-outbox ()) (:copier nil))
-  (lock (sb-thread:make-mutex :name "outbox") :read-only t)
-  (ready (sb-thread:make-waitqueue :name "outbox ready") :read-only t)
-  (room (sb-thread:make-waitqueue :name "outbox room") :read-only t)
-  ;; Messages in order, as (STRING . LENGTH-COUNTED-OR-NIL).
+(declaim (inline outbox-waiting outbox-peak))
+
+(defun outbox-waiting (outbox)
+  "Return bytes of chunk output currently buffered in OUTBOX."
+  (credit-sink-waiting outbox))
+
+(defun outbox-peak (outbox)
+  "Return peak bytes of chunk output buffered in OUTBOX."
+  (credit-sink-peak outbox))
+
+;;;; Priority work queues (owned solely by P_scheduler, lock-free by single ownership)
+
+;;; Invariant: (= (work-queue-count q) (length (work-queue-head q)))
+;;;            and (eq (work-queue-tail q) (last (work-queue-head q))).
+(defstruct (work-queue (:constructor make-work-queue ()) (:copier nil))
+  "A FIFO queue of requests supporting O(1) enqueue and aging-priority pop."
   (head '() :type list)
   (tail '() :type list)
-  (waiting 0 :type (integer 0))
-  (peak 0 :type (integer 0))
-  (closed nil))
+  (count 0 :type (integer 0)))
 
-(defun outbox-put (outbox string &key request)
-  "Queue STRING, one message, for Emacs; return true.
-With REQUEST, STRING is one of its chunks: it counts against
-`*outbox-limit*', and while there is no room for it this waits; when
-REQUEST is cancelled meanwhile, nothing is queued and nil returned."
-  (let ((length (length string)))
-    (sb-thread:with-mutex ((outbox-lock outbox))
-      (when request
-        (loop while (and (plusp (outbox-waiting outbox))
-                         (> (+ (outbox-waiting outbox) length) *outbox-limit*)
-                         (not (outbox-closed outbox))
-                         (not (request-cancelled request)))
-              do (sb-thread:condition-wait (outbox-room outbox) (outbox-lock outbox)))
-        (when (request-cancelled request)
-          (return-from outbox-put nil))
-        (incf (outbox-waiting outbox) length)
-        (setf (outbox-peak outbox) (max (outbox-peak outbox) (outbox-waiting outbox))))
-      (let ((cell (list (cons string (and request length)))))
-        (if (outbox-tail outbox)
-            (setf (cdr (outbox-tail outbox)) cell)
-            (setf (outbox-head outbox) cell))
-        (setf (outbox-tail outbox) cell))
-      (sb-thread:condition-notify (outbox-ready outbox))
-      t)))
+(defun work-queue-push (wq request)
+  "Append REQUEST to the tail of WQ in O(1) time."
+  (let ((cell (list request)))
+    (if (work-queue-tail wq)
+        (setf (cdr (work-queue-tail wq)) cell)
+        (setf (work-queue-head wq) cell))
+    (setf (work-queue-tail wq) cell)
+    (incf (work-queue-count wq))
+    request))
 
-(defun outbox-take (outbox)
-  "Wait for messages, and return every one queued, in order.
-Return nil once the outbox is closed and empty."
-  (sb-thread:with-mutex ((outbox-lock outbox))
-    (loop while (and (null (outbox-head outbox)) (not (outbox-closed outbox)))
-          do (sb-thread:condition-wait (outbox-ready outbox) (outbox-lock outbox)))
-    (let ((messages (outbox-head outbox)))
-      (setf (outbox-head outbox) '()
-            (outbox-tail outbox) '())
-      (dolist (message messages)
-        (when (cdr message)
-          (decf (outbox-waiting outbox) (cdr message))))
-      (sb-thread:condition-broadcast (outbox-room outbox))
-      (mapcar #'car messages))))
-
-(defun outbox-wake (outbox)
-  "Wake the jobs waiting for room, so that a cancelled one stops waiting."
-  (sb-thread:with-mutex ((outbox-lock outbox))
-    (sb-thread:condition-broadcast (outbox-room outbox))))
-
-(defun outbox-close (outbox)
-  "Let the writer end once it has written what is queued."
-  (sb-thread:with-mutex ((outbox-lock outbox))
-    (setf (outbox-closed outbox) t)
-    (sb-thread:condition-broadcast (outbox-ready outbox))
-    (sb-thread:condition-broadcast (outbox-room outbox))))
-
-;;;; The kernel
-
-(defstruct (kernel (:constructor make-kernel (outbox)) (:copier nil))
-  (lock (sb-thread:make-mutex :name "kernel") :read-only t)
-  (cpu-work (sb-thread:make-waitqueue :name "cpu work") :read-only t)
-  (io-work (sb-thread:make-waitqueue :name "io work") :read-only t)
-  ;; Queued requests of each class, the oldest first.
-  (cpu-queue '() :type list)
-  (io-queue '() :type list)
-  ;; Requests accepted and not yet answered, by ID.
-  (requests (make-hash-table) :read-only t)
-  ;; The current generation of each owner that has one.
-  (generations (make-hash-table) :read-only t)
-  ;; Requests accepted and not yet answered, by owner.
-  (owner-counts (make-hash-table) :read-only t)
-  (counts (make-hash-table :test 'eq) :read-only t)
-  (outbox nil :type outbox :read-only t)
-  (writer nil)
-  (workers '() :type list)
-  (started (get-internal-real-time) :read-only t)
-  (closed nil))
-
-(defvar *kernel* nil
-  "The kernel this process runs for Emacs.")
-
-(defun queue (kernel class)
-  (ecase class
-    (:cpu (kernel-cpu-queue kernel))
-    (:io (kernel-io-queue kernel))))
-
-(defun (setf queue) (requests kernel class)
-  (ecase class
-    (:cpu (setf (kernel-cpu-queue kernel) requests))
-    (:io (setf (kernel-io-queue kernel) requests))))
-
-(defun work-waitqueue (kernel class)
-  (ecase class
-    (:cpu (kernel-cpu-work kernel))
-    (:io (kernel-io-work kernel))))
-
-(defun tally (kernel what &optional (amount 1))
-  (incf (gethash what (kernel-counts kernel) 0) amount))
+(defun work-queue-remove (wq target)
+  "Remove TARGET from WQ if present; return true when removed."
+  (loop with prev = nil
+        for cell on (work-queue-head wq)
+        when (eq (car cell) target)
+          do (if prev
+                 (setf (cdr prev) (cdr cell))
+                 (setf (work-queue-head wq) (cdr cell)))
+             (when (null (cdr cell))
+               (setf (work-queue-tail wq) prev))
+             (decf (work-queue-count wq))
+             (return t)
+        do (setf prev cell)))
 
 (defun effective-priority (request now)
   "Return REQUEST's priority at NOW, raised by how long it has waited."
   (+ (request-priority request)
      (floor (* (- now (request-submitted request)) 1000)
             (* *aging-milliseconds* internal-time-units-per-second))))
+
+(defun work-queue-take-best (wq now)
+  "Unlink and return the highest effective-priority request in WQ at NOW,
+ties broken by oldest arrival."
+  (let ((head (work-queue-head wq)))
+    (when head
+      (let* ((best-cell head)
+             (best-prev nil)
+             (best-priority (effective-priority (car head) now)))
+        (loop for prev = head then cell
+              for cell = (cdr head) then (cdr cell)
+              while cell
+              do (let ((priority (effective-priority (car cell) now)))
+                   (when (> priority best-priority)
+                     (setf best-cell cell
+                           best-prev prev
+                           best-priority priority))))
+        (if best-prev
+            (setf (cdr best-prev) (cdr best-cell))
+            (setf (work-queue-head wq) (cdr best-cell)))
+        (when (null (cdr best-cell))
+          (setf (work-queue-tail wq) best-prev))
+        (decf (work-queue-count wq))
+        (car best-cell)))))
+
+;;;; Formatting outcomes for the wire
 
 (defun condition-text (condition)
   "Return what CONDITION says, at most `*max-error-length*' characters."
@@ -253,136 +277,260 @@ A VALUE that cannot be sent, or is too long, fails the request instead."
         (message-string (list 'done id 'failed "The result is too long to send to Emacs"))
         text)))
 
-(defun forget (kernel request)
-  "Free what REQUEST holds of KERNEL's admission; the lock is held."
-  (remhash (request-id request) (kernel-requests kernel))
+;;;; Kernel handle and P_scheduler private state
+
+(defstruct (kernel (:constructor make-kernel (control outbox subworkers)) (:copier nil))
+  "Handle to a running CSP kernel process network."
+  (control nil :type mbox :read-only t)
+  (outbox nil :type credit-sink :read-only t)
+  (subworkers nil :type work-group :read-only t)
+  (scheduler nil)
+  (writer nil)
+  (workers '() :type list)
+  (started (get-internal-real-time) :type integer :read-only t)
+  ;; Bit 0 is 1 while open; upper bits count in-flight `post-control' callers.
+  (control-state 1 :type sb-ext:word)
+  (closed (make-cancel-token :name "kernel-closed") :type cancel-token :read-only t)
+  (final-stats '() :type list))
+
+(defstruct (scheduler-state (:constructor make-scheduler-state (total-workers)) (:copier nil))
+  "Mutable scheduling tables owned exclusively by the sequential P_scheduler process."
+  (cpu-queue (make-work-queue) :type work-queue :read-only t)
+  (io-queue (make-work-queue) :type work-queue :read-only t)
+  (idle-cpu '() :type list)
+  (idle-io '() :type list)
+  (requests (make-hash-table) :read-only t)
+  (generations (make-hash-table) :read-only t)
+  (owner-counts (make-hash-table) :read-only t)
+  (counts (make-hash-table :test 'eq) :read-only t)
+  (live-workers total-workers :type (integer 0))
+  (closing nil :type boolean)
+  (shutdown-gate nil))
+
+(defvar *kernel* nil
+  "The kernel this process runs for Emacs.")
+
+(declaim (ftype (function () null) checkpoint)
+         (ftype (function () (or null cancel-token)) current-cancel-token)
+         (ftype (function (t) t) emit)
+         (ftype (function (function &key (:cpu-workers (integer 0))
+                                    (:io-workers (integer 0))
+                                    (:subworkers (integer 0)))
+                          kernel)
+                start-kernel)
+         (ftype (function (kernel &key (:timeout (or null real))) kernel) stop-kernel)
+         (ftype (function () null) stop-background-helpers)
+         (ftype (function (kernel) list) kernel-stats)
+         (ftype (function (function list &key (:threads (integer 1))) list) parallel-map)
+         (ftype (function (kernel t) t) handle-message)
+         (ftype (function (kernel string) t) handle-line))
+
+;;;; Pure/single-owner scheduler transitions
+
+(defun state-queue (state class)
+  (ecase class
+    (:cpu (scheduler-state-cpu-queue state))
+    (:io (scheduler-state-io-queue state))))
+
+(defun state-queued-count (state)
+  (+ (work-queue-count (scheduler-state-cpu-queue state))
+     (work-queue-count (scheduler-state-io-queue state))))
+
+(defun pop-idle-worker (state class)
+  (ecase class
+    (:cpu (pop (scheduler-state-idle-cpu state)))
+    (:io (pop (scheduler-state-idle-io state)))))
+
+(defun push-idle-worker (state class worker-mbox)
+  (ecase class
+    (:cpu (push worker-mbox (scheduler-state-idle-cpu state)))
+    (:io (push worker-mbox (scheduler-state-idle-io state)))))
+
+(defun tally-state (state what &optional (amount 1))
+  (incf (gethash what (scheduler-state-counts state) 0) amount))
+
+(defun forget-request (state request)
+  "Release REQUEST from STATE's admission tables."
+  (remhash (request-id request) (scheduler-state-requests state))
   (let ((owner (request-owner request))
-        (counts (kernel-owner-counts kernel)))
+        (counts (scheduler-state-owner-counts state)))
     (if (<= (gethash owner counts 0) 1)
         (remhash owner counts)
         (decf (gethash owner counts)))))
 
-(defun answer-locked (kernel request status value)
-  "Answer REQUEST with STATUS and VALUE, the lock held; return its final
-message, or nil when it was answered before.  A cancelled request is
-answered as cancelled, whatever it did."
+(defun settle-request (state outbox request status value)
+  "Finalize REQUEST in STATE and post its `done' message to OUTBOX."
   (unless (eq (request-state request) :answered)
-    (when (request-cancelled request)
+    (when (cancelled-p (request-token request))
       (setf status 'cancelled value nil))
     (setf (request-state request) :answered)
-    (forget kernel request)
-    (tally kernel status)
-    (final-message request status value)))
+    (forget-request state request)
+    (tally-state state status)
+    (credit-sink-put-control outbox (final-message request status value))))
 
-(defun answer (kernel request status value)
-  "Give Emacs REQUEST's final message, unless it was answered before."
-  (let ((message (sb-thread:with-mutex ((kernel-lock kernel))
-                   (answer-locked kernel request status value))))
-    (when message
-      (outbox-put (kernel-outbox kernel) message))))
-
-(defun cancel-locked (kernel request)
-  "Cancel REQUEST, the lock held.  A queued request is answered here and its
-final message returned; a running one stops at its next checkpoint."
-  (setf (request-cancelled request) t)
+(defun cancel-in-state (state outbox request)
+  "Signal REQUEST's cancel token; if still queued, settle it immediately."
+  (cancel! (request-token request))
   (when (eq (request-state request) :queued)
-    (let ((class (job-class (request-job request))))
-      (setf (queue kernel class) (remove request (queue kernel class))))
-    (answer-locked kernel request 'cancelled nil)))
+    (work-queue-remove (state-queue state (job-class (request-job request))) request)
+    (settle-request state outbox request 'cancelled nil)))
 
-(defun supersede-locked (kernel owner generation)
-  "Make GENERATION OWNER's current one, cancelling its older requests, the
-lock held; return the final messages of those that were queued."
-  (when (> generation (gethash owner (kernel-generations kernel) 0))
-    (setf (gethash owner (kernel-generations kernel)) generation)
-    (let ((older (loop for request being the hash-values of (kernel-requests kernel)
+(defun supersede-in-state (state outbox owner generation)
+  "Advance OWNER to GENERATION in STATE, cancelling all older requests."
+  (when (> generation (gethash owner (scheduler-state-generations state) 0))
+    (setf (gethash owner (scheduler-state-generations state)) generation)
+    (let ((older (loop for request being the hash-values of (scheduler-state-requests state)
                        when (and (= (request-owner request) owner)
                                  (< (request-generation request) generation))
                          collect request)))
-      (remove nil (mapcar (lambda (request) (cancel-locked kernel request)) older)))))
+      (dolist (request older)
+        (cancel-in-state state outbox request)))))
 
-(defun post-all (kernel messages)
-  "Queue MESSAGES for Emacs and wake jobs waiting for room."
+(defun reject-in-state (state outbox id reason)
+  (tally-state state 'rejected)
+  (credit-sink-put-control outbox (message-string (list 'done id 'rejected reason))))
+
+(defun dispatch-class (state class)
+  "Match queued requests of CLASS with idle workers in STATE."
+  (let ((wq (state-queue state class)))
+    (loop while (and (work-queue-head wq)
+                     (ecase class
+                       (:cpu (scheduler-state-idle-cpu state))
+                       (:io (scheduler-state-idle-io state))))
+          do (let ((worker-mbox (pop-idle-worker state class))
+                   (best (work-queue-take-best wq (get-internal-real-time))))
+               (setf (request-state best) :running)
+               (mbox-send worker-mbox best)))))
+
+(defun submit-in-state (state outbox id name input owner generation priority)
+  "Evaluate admission for request ID in STATE and enqueue or dispatch it."
+  (let* ((job (gethash name *jobs*))
+         (requests (scheduler-state-requests state))
+         (reason (cond ((scheduler-state-closing state) 'closed)
+                       ((gethash id requests) 'duplicate)
+                       ((null job) 'unknown-job)
+                       ((< generation (gethash owner (scheduler-state-generations state) 0))
+                        'stale))))
+    (unless reason
+      (supersede-in-state state outbox owner generation)
+      (setf reason
+            (cond ((>= (hash-table-count requests) *max-requests*) 'capacity)
+                  ((>= (gethash owner (scheduler-state-owner-counts state) 0)
+                       *max-requests-per-owner*)
+                   'capacity))))
+    (if reason
+        (reject-in-state state outbox id reason)
+        (let ((request (make-request id job input owner generation priority))
+              (class (job-class job)))
+          (setf (gethash id requests) request)
+          (incf (gethash owner (scheduler-state-owner-counts state) 0))
+          (tally-state state 'accepted)
+          (work-queue-push (state-queue state class) request)
+          (setf (gethash 'peak-queued (scheduler-state-counts state))
+                (max (gethash 'peak-queued (scheduler-state-counts state) 0)
+                     (state-queued-count state)))
+          (dispatch-class state class)))))
+
+(defun snapshot-stats (kernel state)
+  "Build the stats plist from KERNEL and single-owner STATE."
+  (let ((outbox (kernel-outbox kernel))
+        (counts (scheduler-state-counts state)))
+    (flet ((count-of (what) (gethash what counts 0)))
+      (list :requests (hash-table-count (scheduler-state-requests state))
+            :queued (state-queued-count state)
+            :accepted (count-of 'accepted)
+            :rejected (count-of 'rejected)
+            :success (count-of 'success)
+            :failed (count-of 'failed)
+            :cancelled (count-of 'cancelled)
+            :peak-queued (count-of 'peak-queued)
+            :outbox (outbox-waiting outbox)
+            :outbox-peak (outbox-peak outbox)
+            :heap (sb-kernel:dynamic-usage)
+            :gc-milliseconds (floor (* sb-ext:*gc-run-time* 1000) internal-time-units-per-second)
+            :uptime-milliseconds (floor (* (- (get-internal-real-time) (kernel-started kernel)) 1000)
+                                        internal-time-units-per-second)))))
+
+(defun initiate-shutdown (state outbox gate)
+  "Transition STATE into closing mode, cancelling queued and running requests."
+  (setf (scheduler-state-closing state) t
+        (scheduler-state-shutdown-gate state) gate)
+  (let ((active (loop for request being the hash-values of (scheduler-state-requests state)
+                      collect request)))
+    (dolist (request active)
+      (cancel-in-state state outbox request)))
+  (dolist (worker-mbox (scheduler-state-idle-cpu state))
+    (mbox-send worker-mbox :stop)
+    (decf (scheduler-state-live-workers state)))
+  (dolist (worker-mbox (scheduler-state-idle-io state))
+    (mbox-send worker-mbox :stop)
+    (decf (scheduler-state-live-workers state)))
+  (setf (scheduler-state-idle-cpu state) '()
+        (scheduler-state-idle-io state) '()))
+
+(defun scheduler-step (kernel state event)
+  "Process one CSP control EVENT in `P_scheduler'."
   (let ((outbox (kernel-outbox kernel)))
-    (dolist (message messages)
-      (outbox-put outbox message))
-    (outbox-wake outbox)))
+    (ecase (first event)
+      (:worker-ready
+       (destructuring-bind (class worker-mbox) (rest event)
+         (if (scheduler-state-closing state)
+             (progn
+               (mbox-send worker-mbox :stop)
+               (decf (scheduler-state-live-workers state)))
+             (progn
+               (push-idle-worker state class worker-mbox)
+               (dispatch-class state class)))))
+      (:settled
+       (destructuring-bind (request status value) (rest event)
+         (settle-request state outbox request status value)))
+      (:submit
+       (destructuring-bind (id name input owner generation priority) (rest event)
+         (submit-in-state state outbox id name input owner generation priority)))
+      (:cancel
+       (let ((request (gethash (second event) (scheduler-state-requests state))))
+         (when request
+           (cancel-in-state state outbox request))))
+      (:supersede
+       (destructuring-bind (owner generation) (rest event)
+         (supersede-in-state state outbox owner generation)))
+      (:malformed
+       (destructuring-bind (id error-text) (rest event)
+         (credit-sink-put-control outbox (message-string (list 'protocol-error error-text)))
+         (when (and id (not (gethash id (scheduler-state-requests state))))
+           (reject-in-state state outbox id 'malformed))))
+      (:stats-wire
+       (credit-sink-put-control outbox
+                                (message-string (list 'stats (snapshot-stats kernel state)))))
+      (:stats-sync
+       (mbox-send (second event) (snapshot-stats kernel state)))
+      (:clear-caches
+       (mapc #'funcall *cache-clearers*))
+      (:ping
+       (credit-sink-put-control outbox (message-string (list* 'pong (second event)))))
+      (:shutdown
+       (initiate-shutdown state outbox (second event))))))
 
-(defun reject (kernel id reason)
-  (sb-thread:with-mutex ((kernel-lock kernel))
-    (tally kernel 'rejected))
-  (outbox-put (kernel-outbox kernel) (message-string (list 'done id 'rejected reason))))
-
-(defun submit (kernel id name input &key (owner 0) (generation 0) (priority 0))
-  "Accept request ID for the job NAME with INPUT, or reject it."
-  (let ((job (gethash name *jobs*))
-        (reason nil)
-        (cancelled '()))
-    (sb-thread:with-mutex ((kernel-lock kernel))
-      (let ((requests (kernel-requests kernel)))
-        (setf reason
-              (cond ((kernel-closed kernel) 'closed)
-                    ((gethash id requests) 'duplicate)
-                    ((null job) 'unknown-job)
-                    ((< generation (gethash owner (kernel-generations kernel) 0)) 'stale)))
-        (unless reason
-          (setf cancelled (supersede-locked kernel owner generation))
-          (setf reason
-                (cond ((>= (hash-table-count requests) *max-requests*) 'capacity)
-                      ((>= (gethash owner (kernel-owner-counts kernel) 0) *max-requests-per-owner*)
-                       'capacity))))
-        (unless reason
-          (let ((request (make-request id job input owner generation priority))
-                (class (job-class job)))
-            (setf (gethash id requests) request)
-            (incf (gethash owner (kernel-owner-counts kernel) 0))
-            (setf (queue kernel class) (append (queue kernel class) (list request)))
-            (tally kernel 'accepted)
-            (setf (gethash 'peak-queued (kernel-counts kernel))
-                  (max (gethash 'peak-queued (kernel-counts kernel) 0)
-                       (+ (length (kernel-cpu-queue kernel)) (length (kernel-io-queue kernel)))))
-            (sb-thread:condition-notify (work-waitqueue kernel class))))))
-    (post-all kernel cancelled)
-    (when reason
-      (reject kernel id reason))
-    (not reason)))
-
-(defun cancel (kernel id)
-  "Cancel request ID, if it is not answered yet."
-  (post-all kernel (sb-thread:with-mutex ((kernel-lock kernel))
-                     (let ((request (gethash id (kernel-requests kernel))))
-                       (and request (remove nil (list (cancel-locked kernel request))))))))
-
-(defun supersede (kernel owner generation)
-  "Make GENERATION OWNER's current one, cancelling its older requests."
-  (post-all kernel (sb-thread:with-mutex ((kernel-lock kernel))
-                     (supersede-locked kernel owner generation))))
-
-;;;; Workers
-
-(defun take-request (kernel class)
-  "Wait for a request of CLASS and return the one to run next, or nil once
-the kernel is closed."
-  (sb-thread:with-mutex ((kernel-lock kernel))
+(defun scheduler-loop (kernel total-workers)
+  "Sequential coordinator process `P_scheduler'."
+  (let ((state (make-scheduler-state total-workers))
+        (control (kernel-control kernel)))
     (loop
-      (when (kernel-closed kernel)
-        (return nil))
-      (let ((queue (queue kernel class)))
-        (when queue
-          (let* ((now (get-internal-real-time))
-                 (best (first queue))
-                 (best-priority (effective-priority best now)))
-            (dolist (request (rest queue))
-              (let ((priority (effective-priority request now)))
-                (when (> priority best-priority)
-                  (setf best request best-priority priority))))
-            (setf (queue kernel class) (remove best queue :count 1)
-                  (request-state best) :running)
-            (return best))))
-      (sb-thread:condition-wait (work-waitqueue kernel class) (kernel-lock kernel)))))
+      (when (and (scheduler-state-closing state)
+                 (zerop (hash-table-count (scheduler-state-requests state)))
+                 (<= (scheduler-state-live-workers state) 0))
+        (dolist (event (mbox-drain control))
+          (scheduler-step kernel state event))
+        (setf (kernel-final-stats kernel) (snapshot-stats kernel state))
+        (when (scheduler-state-shutdown-gate state)
+          (sb-concurrency:open-gate (scheduler-state-shutdown-gate state)))
+        (return))
+      (scheduler-step kernel state (mbox-recv control)))))
+
+;;;; Worker and Writer processes
 
 (defun run-request (kernel request)
-  "Run REQUEST's job and answer it."
+  "Execute REQUEST's job function and return (STATUS VALUE)."
   (let* ((*kernel* kernel)
          (*request* request)
          (outcome (catch 'cancelled
@@ -391,145 +539,184 @@ the kernel is closed."
                                                 (request-input request)))
                       (serious-condition (condition)
                         (list 'failed (condition-text condition)))))))
-    (if outcome
-        (answer kernel request (first outcome) (second outcome))
-        (answer kernel request 'cancelled nil))))
+    (or outcome (list 'cancelled nil))))
 
 (defun worker-loop (kernel class)
-  (loop for request = (take-request kernel class)
-        while request
-        do (handler-case (run-request kernel request)
-             (serious-condition (condition)
-               (format *error-output* "lispm-kernel: a worker failed: ~A~%"
-                       (condition-text condition))))))
+  "Sequential worker process `P_worker': announces readiness, receives one
+request on its private mailbox, executes it, and posts `:settled'."
+  (let ((control (kernel-control kernel))
+        (inbox (make-mbox :name (format nil "~(~A~)-worker" class))))
+    (loop
+      (mbox-send control (list :worker-ready class inbox))
+      (let ((message (mbox-recv inbox)))
+        (when (eq message :stop)
+          (return))
+        (let ((outcome (handler-case (run-request kernel message)
+                         (serious-condition (condition)
+                           (format *error-output* "lispm-kernel: a worker failed: ~A~%"
+                                   (condition-text condition))
+                           (list 'failed (condition-text condition))))))
+          (mbox-send control (list :settled message (first outcome) (second outcome))))))))
 
 (defun write-loop (outbox sink)
-  "Give SINK the messages of OUTBOX as they come, until it is closed."
-  (loop for messages = (outbox-take outbox)
+  "Sequential writer process `P_writer': drains OUTBOX into SINK until closed."
+  (loop for messages = (credit-sink-take outbox)
         while messages
         do (funcall sink messages)))
 
-(defun start-kernel (sink &key (cpu-workers 2) (io-workers 4))
-  "Start a kernel and return it.
-Its messages for Emacs go to SINK, a function called with a list of them,
-strings, in order, on a thread of its own.  CPU-WORKERS and IO-WORKERS
-threads run the jobs of each class."
-  (let* ((outbox (make-outbox))
-         (kernel (make-kernel outbox)))
+(defun start-kernel (sink &key (cpu-workers 2) (io-workers 4) (subworkers 3))
+  "Start a CSP kernel process network and return its handle.
+CPU-WORKERS, IO-WORKERS and SUBWORKERS bound the persistent thread pools."
+  (let* ((control (make-mbox :name "lispm-kernel control"))
+         (outbox (make-credit-sink :limit *outbox-limit*))
+         (wg (make-work-group :workers subworkers :name "lispm-kernel subworker"))
+         (total (+ cpu-workers io-workers))
+         (kernel (make-kernel control outbox wg)))
     (setf (kernel-writer kernel)
-          (sb-thread:make-thread #'write-loop :name "lispm-kernel writer"
-                                              :arguments (list outbox sink)))
-    (flet ((workers (class count)
+          (sb-thread:make-thread #'write-loop
+                                 :name "lispm-kernel writer"
+                                 :arguments (list outbox sink))
+          (kernel-scheduler kernel)
+          (sb-thread:make-thread #'scheduler-loop
+                                 :name "lispm-kernel scheduler"
+                                 :arguments (list kernel total)))
+    (flet ((spawn-pool (class count)
              (loop for index from 1 to count
                    collect (sb-thread:make-thread
                             #'worker-loop
                             :name (format nil "lispm-kernel ~(~A~) worker ~D" class index)
                             :arguments (list kernel class)))))
       (setf (kernel-workers kernel)
-            (append (workers :cpu cpu-workers) (workers :io io-workers))))
+            (append (spawn-pool :cpu cpu-workers) (spawn-pool :io io-workers))))
     kernel))
+
+(defun close-control-channel (kernel)
+  "Seal KERNEL against new `post-control' callers and wait for in-flight sends."
+  (loop
+    (let ((old (kernel-control-state kernel)))
+      (when (not (logbitp 0 old))
+        (return))
+      (when (eql old (sb-ext:compare-and-swap (kernel-control-state kernel)
+                                              old (logand old (lognot 1))))
+        (return))))
+  (loop until (zerop (ash (kernel-control-state kernel) -1))
+        do (sb-thread:thread-yield)))
 
 (defun stop-kernel (kernel &key (timeout 10))
-  "Close KERNEL: reject new requests, cancel those there are, wait for its
-threads at most TIMEOUT seconds each and let its writer finish."
-  (let ((cancelled (sb-thread:with-mutex ((kernel-lock kernel))
-                     (setf (kernel-closed kernel) t)
-                     (let ((requests (loop for request being the hash-values of (kernel-requests kernel)
-                                           collect request)))
-                       (prog1 (remove nil (mapcar (lambda (request) (cancel-locked kernel request))
-                                                  requests))
-                         (sb-thread:condition-broadcast (kernel-cpu-work kernel))
-                         (sb-thread:condition-broadcast (kernel-io-work kernel)))))))
-    (post-all kernel cancelled)
-    (dolist (worker (kernel-workers kernel))
-      (sb-thread:join-thread worker :default nil :timeout timeout))
-    (outbox-close (kernel-outbox kernel))
-    (sb-thread:join-thread (kernel-writer kernel) :default nil :timeout timeout)
-    kernel))
+  "Close KERNEL cleanly: cancel active work, join scheduler, workers,
+subworkers and writer within TIMEOUT seconds."
+  (when (cancel! (kernel-closed kernel))
+    (close-control-channel kernel)
+    (let ((gate (sb-concurrency:make-gate :name "kernel-shutdown" :open nil)))
+      (mbox-send (kernel-control kernel) (list :shutdown gate))
+      (sb-concurrency:wait-on-gate gate :timeout timeout)
+      (dolist (worker (kernel-workers kernel))
+        (sb-thread:join-thread worker :default nil :timeout timeout))
+      (sb-thread:join-thread (kernel-scheduler kernel) :default nil :timeout timeout)
+      (stop-work-group (kernel-subworkers kernel) :timeout timeout)
+      (credit-sink-close (kernel-outbox kernel))
+      (sb-thread:join-thread (kernel-writer kernel) :default nil :timeout timeout)))
+  kernel)
 
 (defun kernel-stats (kernel)
-  "Return a plist of what KERNEL holds and has done."
-  (let ((outbox (kernel-outbox kernel)))
-    (sb-thread:with-mutex ((kernel-lock kernel))
-      (let ((counts (kernel-counts kernel)))
-        (flet ((count-of (what) (gethash what counts 0)))
-          (list :requests (hash-table-count (kernel-requests kernel))
-                :queued (+ (length (kernel-cpu-queue kernel)) (length (kernel-io-queue kernel)))
-                :accepted (count-of 'accepted)
-                :rejected (count-of 'rejected)
-                :success (count-of 'success)
-                :failed (count-of 'failed)
-                :cancelled (count-of 'cancelled)
-                :peak-queued (count-of 'peak-queued)
-                :outbox (outbox-waiting outbox)
-                :outbox-peak (outbox-peak outbox)
-                :heap (sb-kernel:dynamic-usage)
-                :gc-milliseconds (floor (* sb-ext:*gc-run-time* 1000) internal-time-units-per-second)
-                :uptime-milliseconds (floor (* (- (get-internal-real-time) (kernel-started kernel)) 1000)
-                                            internal-time-units-per-second)))))))
+  "Ask KERNEL's coordinator for a consistent stats plist."
+  (if (cancelled-p (kernel-closed kernel))
+      (kernel-final-stats kernel)
+      (let ((reply (make-mbox :name "stats-reply")))
+        (mbox-send (kernel-control kernel) (list :stats-sync reply))
+        (or (mbox-recv reply :timeout 5) (kernel-final-stats kernel)))))
 
-;;;; Parallel work within a request
+;;;; Parallel work within a request (persistent work-group + caller work-helping)
+
+(defvar *standalone-subworkers* nil
+  "Lazy persistent work-group used only when `parallel-map' is called outside a kernel.")
+
+(defun stop-standalone-subworkers ()
+  "Stop any standalone work-group before saving an SBCL core image."
+  (let ((wg *standalone-subworkers*))
+    (when wg
+      (setf *standalone-subworkers* nil)
+      (stop-work-group wg :timeout 2))))
+
+(defun stop-background-helpers ()
+  "Stop all lazy process-wide background helper pools (`*standalone-subworkers*', `P_cache')."
+  (mapc #'funcall *background-stoppers*)
+  nil)
+
+(pushnew 'stop-standalone-subworkers *background-stoppers*)
+(pushnew 'stop-background-helpers sb-ext:*save-hooks*)
+
+(defun current-work-group ()
+  (if *kernel*
+      (kernel-subworkers *kernel*)
+      (or *standalone-subworkers*
+          (let ((fresh (make-work-group :workers 3 :name "lispm-kernel standalone-subworker")))
+            (if (eq nil (sb-ext:compare-and-swap *standalone-subworkers* nil fresh))
+                fresh
+                (progn
+                  (stop-work-group fresh :timeout 1)
+                  *standalone-subworkers*))))))
 
 (defun parallel-map (function list &key (threads 4))
-  "Return (mapcar FUNCTION LIST), FUNCTION called on up to THREADS threads at once.
-Within a request, it stops at the next `checkpoint' of each thread when
-the request is cancelled; an error FUNCTION signals stops every thread
-and is signalled again here."
-  (let* ((items (coerce list 'simple-vector))
-         (count (length items))
-         (results (make-array count :initial-element nil))
-         (next 0)
-         (failure nil)
-         (lock (sb-thread:make-mutex :name "parallel-map"))
-         (kernel *kernel*)
-         (request *request*))
-    (flet ((work ()
-             (let ((*kernel* kernel)
-                   (*request* request))
-               (catch 'cancelled
-                 (handler-case
-                     (loop
-                       (let ((index (sb-thread:with-mutex (lock)
-                                      (when (and (< next count) (not failure))
-                                        (prog1 next (incf next))))))
-                         (unless index
-                           (return))
-                         (setf (svref results index) (funcall function (svref items index)))))
-                   (serious-condition (condition)
-                     (sb-thread:with-mutex (lock)
-                       (setf failure (or failure condition)))))))))
-      (let ((helpers (loop repeat (max 0 (min (1- threads) (1- count)))
-                           collect (sb-thread:make-thread #'work :name "lispm-kernel helper"))))
-        (work)
-        (dolist (helper helpers)
-          (sb-thread:join-thread helper :default nil))
-        (checkpoint)
-        (when failure
-          (error failure))
-        (coerce results 'list)))))
+  "Return (mapcar FUNCTION LIST) across persistent CSP subworkers plus the
+calling thread (work-helping), without spawning per-request OS threads."
+  (let* ((kernel *kernel*)
+         (request *request*)
+         (token (and request (request-token request)))
+         (wg (current-work-group)))
+    (checkpoint)
+    (let ((results (work-group-map
+                    wg function list
+                    :threads threads
+                    :token token
+                    :context (lambda (thunk)
+                               (let ((*kernel* kernel)
+                                     (*request* request))
+                                 (catch 'cancelled
+                                   (funcall thunk)))))))
+      (checkpoint)
+      results)))
 
-;;;; Emitting
+;;;; Emitting chunks
 
 (defun emit (datum)
   "Send DATUM to Emacs as a chunk of the current request.
-While Emacs reads slower than chunks come, this waits; a cancelled
-request stops here."
+Applies byte-credit backpressure against `*outbox-limit*' and wakes
+immediately if the request's cancellation token fires."
   (let ((request *request*))
     (checkpoint)
     (when request
-      (outbox-put (kernel-outbox *kernel*)
-                  (message-string (list 'chunk (request-id request) datum))
-                  :request request)
+      (credit-sink-put-chunk (kernel-outbox *kernel*)
+                             (message-string (list 'chunk (request-id request) datum))
+                             :token (request-token request)
+                             :limit *outbox-limit*)
       (checkpoint))
     datum))
 
-;;;; Messages from Emacs
+;;;; Messages from Emacs (P_reader -> P_scheduler channel)
+
+(defun post-control (kernel event)
+  "Send EVENT to KERNEL's coordinator, or handle closed-kernel rejection.
+Uses lock-free sender pinning so every accepted EVENT arrives before `:shutdown'."
+  (loop
+    (let ((old (kernel-control-state kernel)))
+      (unless (logbitp 0 old)
+        (when (eq (first event) :submit)
+          (credit-sink-put-control
+           (kernel-outbox kernel)
+           (message-string (list 'done (second event) 'rejected 'closed))))
+        (return nil))
+      (when (eql old (sb-ext:compare-and-swap (kernel-control-state kernel) old (+ old 2)))
+        (unwind-protect
+             (mbox-send (kernel-control kernel) event)
+          (sb-ext:atomic-decf (kernel-control-state kernel) 2))
+        (return t)))))
 
 (defun handle-message (kernel message)
-  "Act on MESSAGE, one datum from Emacs.  Return :quit when Emacs asks the
-kernel to end.  Signal an error for a malformed one."
+  "Validate MESSAGE from Emacs and forward it to `P_scheduler'.
+Return :quit when Emacs asks the kernel to end."
   (unless (and (consp message) (keywordp (first message)))
-    (error "A message is a list headed by a symbol, not ~S" message))
+    (message-error "A message is a list headed by a symbol, not ~S" message))
   (destructuring-bind (head &rest arguments) message
     (ecase head
       (:submit
@@ -539,22 +726,22 @@ kernel to end.  Signal an error for a malformed one."
          (check-type owner integer)
          (check-type generation integer)
          (check-type priority (integer -100 100))
-         (submit kernel id name input :owner owner :generation generation :priority priority)))
+         (post-control kernel (list :submit id name input owner generation priority))))
       (:cancel
        (destructuring-bind (id) arguments
          (check-type id (integer 0))
-         (cancel kernel id)))
+         (post-control kernel (list :cancel id))))
       (:supersede
        (destructuring-bind (owner generation) arguments
          (check-type owner integer)
          (check-type generation integer)
-         (supersede kernel owner generation)))
+         (post-control kernel (list :supersede owner generation))))
       (:stats
-       (outbox-put (kernel-outbox kernel) (message-string (list 'stats (kernel-stats kernel)))))
+       (post-control kernel '(:stats-wire)))
       (:clear-caches
-       (mapc #'funcall *cache-clearers*))
+       (post-control kernel '(:clear-caches)))
       (:ping
-       (outbox-put (kernel-outbox kernel) (message-string (list* 'pong arguments))))
+       (post-control kernel (list :ping arguments)))
       (:quit :quit))))
 
 (defun submit-id (line)
@@ -568,16 +755,9 @@ kernel to end.  Signal an error for a malformed one."
           (parse-integer line :start (length prefix) :end end))))))
 
 (defun handle-line (kernel line)
-  "Act on LINE, one message from Emacs; a malformed one is answered with
-(protocol-error TEXT), and when it was a submission of a request not yet
-accepted, with that request's (done ID rejected malformed) as well.
-Return :quit when Emacs asks the kernel to end."
+  "Parse LINE from Emacs and send the resulting command or `:malformed' event
+to `P_scheduler'.  Return :quit when Emacs asks the kernel to end."
   (handler-case (handle-message kernel (read-message line))
     (error (condition)
-      (outbox-put (kernel-outbox kernel)
-                  (message-string (list 'protocol-error (condition-text condition))))
-      (let ((id (submit-id line)))
-        (when (and id (not (sb-thread:with-mutex ((kernel-lock kernel))
-                             (gethash id (kernel-requests kernel)))))
-          (reject kernel id 'malformed)))
+      (post-control kernel (list :malformed (submit-id line) (condition-text condition)))
       nil)))

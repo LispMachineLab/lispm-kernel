@@ -33,8 +33,8 @@
 (push *root* asdf:*central-registry*)
 
 (handler-bind ((warning (lambda (condition)
-                          ;; Loading what was just compiled redefines its macros.
-                          (unless (typep condition 'sb-kernel:redefinition-warning)
+                          ;; Loading a FASL just compiled in the same image re-installs its macros.
+                          (unless (typep condition 'sb-kernel:redefinition-with-defmacro)
                             (format *error-output* "~&Warning, so no build: ~A~%" condition)
                             (uiop:quit 1)))))
   (asdf:load-system "lispm-kernel" :force t))

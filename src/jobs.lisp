@@ -35,11 +35,12 @@ MILLISECONDS.  INPUT is a plist of them."
     (check-type milliseconds (integer 0 3600000))
     (dotimes (index chunks)
       (emit index))
-    (let ((deadline (+ (get-internal-real-time)
-                       (floor (* milliseconds internal-time-units-per-second) 1000))))
-      (loop while (< (get-internal-real-time) deadline)
-            do (checkpoint)
-               (sleep 0.002)))
+    (when (plusp milliseconds)
+      (let ((token (current-cancel-token)))
+        (if token
+            (await-cancel token :timeout (/ milliseconds 1000.0d0))
+            (sleep (/ milliseconds 1000.0d0)))))
+    (checkpoint)
     (when fail
-      (error "~A" fail))
+      (job-error "~A" fail))
     milliseconds))

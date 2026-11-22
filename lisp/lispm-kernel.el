@@ -4,7 +4,7 @@
 
 ;; Author: Ryan.K
 ;; URL: https://github.com/LispMachineLab/lispm-kernel
-;; Version: 0.8.1
+;; Version: 0.9.0
 ;; Package-Requires: ((emacs "30.1"))
 ;; SPDX-License-Identifier: AGPL-3.0-or-later
 
@@ -59,6 +59,10 @@
 (defconst lispm-kernel-protocol 1
   "The protocol this Lisp speaks; a kernel saying another is refused.")
 
+(define-error 'lispm-kernel-error "LispM kernel error")
+(define-error 'lispm-kernel-wire-error "Invalid kernel wire datum" 'lispm-kernel-error)
+(define-error 'lispm-kernel-state-error "Kernel state error" 'lispm-kernel-error)
+
 (defgroup lispm-kernel nil
   "LispM's kernel: background work done in a Lisp of its own."
   :group 'applications)
@@ -97,8 +101,9 @@ timer does.  It calls `lispm-kernel-dispatch' later, with
   (overruns 0) last-error
   (requests (make-hash-table :test #'eql))
   (generations (make-hash-table :test #'eql))
-  ;; Callbacks waiting for (stats ...) and (pong ...), oldest first.
-  (waiters nil))
+  ;; Callbacks waiting for (stats ...) and (pong ...), oldest first, with tail pointer.
+  (waiters nil)
+  (waiters-tail nil))
 
 (cl-defstruct (lispm-kernel--pending (:constructor lispm-kernel--pending) (:copier nil))
   "A request waiting for its final word."
@@ -167,7 +172,8 @@ nil for this computer).  Its standard error goes to the buffer
                          (file-executable-p (car command))
                        (executable-find (car command)))
                    (file-executable-p (car command))))
-      (error "No kernel program to run: %S" program))
+      (signal 'lispm-kernel-state-error
+              (list (format "No kernel program to run: %S" program))))
     (let* ((runtime (lispm-kernel--make-runtime :program program :host host))
            (default-directory (expand-file-name "~/"))
            (buffer (get-buffer-create (if host (format " *lispm-kernel %s*" host) " *lispm-kernel*")))
@@ -185,7 +191,7 @@ nil for this computer).  Its standard error goes to the buffer
       runtime)))
 
 (defun lispm-kernel--stderr-filter (process string)
-  "Keep the last 64 KiB of what the kernel PROCESS says on its standard error."
+  "Keep the last 64 KiB of STRING printed by kernel PROCESS on standard error."
   (when (buffer-live-p (process-buffer process))
     (with-current-buffer (process-buffer process)
       (let ((inhibit-read-only t))
@@ -221,6 +227,7 @@ A kernel whose exit Emacs has not heard of yet says so from its process."
        t))
 
 (defun lispm-kernel--cancel-timers (runtime)
+  "Cancel all active dispatch and expiry timers of RUNTIME."
   (dolist (timer (list (lispm-kernel-runtime-timer runtime) (lispm-kernel-runtime-expiry-timer runtime)))
     (when timer (cancel-timer timer)))
   (setf (lispm-kernel-runtime-timer runtime) nil
@@ -235,6 +242,7 @@ Callbacks waiting hear nothing more."
     (lispm-kernel--cancel-timers runtime)
     (clrhash (lispm-kernel-runtime-requests runtime))
     (setf (lispm-kernel-runtime-waiters runtime) nil
+          (lispm-kernel-runtime-waiters-tail runtime) nil
           (lispm-kernel-runtime-incoming runtime) nil
           (lispm-kernel-runtime-ready runtime) nil
           (lispm-kernel-runtime-partial runtime) nil)
@@ -250,18 +258,20 @@ Callbacks waiting hear nothing more."
 ;;;; Sending
 
 (defun lispm-kernel--wire-symbol-p (symbol)
-  "Return non-nil when SYMBOL's name reads back as that symbol in the
-kernel: ASCII letters, digits and _/*+<>=!?-, a keyword's after its
-colon, not starting with ? and no number: 1+ and e1 are none."
+  "Return non-nil when SYMBOL's name reads back as that symbol in the kernel.
+Allowed characters are ASCII letters, digits and `_/*+<>=!?-', after the
+leading colon for a keyword, not starting with `?' and not a number token
+such as `1+' or `e1'."
   (let ((name (string-remove-prefix ":" (symbol-name symbol))))
     (and (string-match-p "\\`[a-zA-Z0-9_/*+<>=!-][a-zA-Z0-9_/*+<>=!?-]*\\'" name)
          (not (and (string-match-p "[0-9]" name)
                    (string-match-p "\\`[-+.eE0-9]+\\'" name))))))
 
 (defun lispm-kernel--wire-p (datum &optional depth)
-  "Return non-nil when DATUM can go to the kernel: integers, strings,
-plain symbols, lists and vectors of them, nested at most 63 deep, so
-that the message holding it is at most 64 deep."
+  "Return non-nil when DATUM at nesting DEPTH can cross the wire to the kernel.
+Allowed values are integers, strings, plain symbols, proper lists and
+vectors of them, nested at most 63 deep so the enclosing command is at
+most 64 deep."
   (let ((depth (or depth 0)))
     (and (<= depth 63)
          (cond ((or (null datum) (eq datum t) (integerp datum) (stringp datum)) t)
@@ -273,11 +283,10 @@ that the message holding it is at most 64 deep."
                 (cl-every (lambda (item) (lispm-kernel--wire-p item (1+ depth))) datum))))))
 
 (defun lispm-kernel--plain (datum)
-  "Return DATUM with its strings' text properties left out, which the
-kernel cannot read, and any unibyte UTF-8 strings (such as the output of
-`json-serialize') decoded into multibyte characters so `prin1-to-string'
-does not emit raw octal byte escapes that the kernel's wire reader
-replaces with U+FFFD."
+  "Return DATUM normalized for wire serialization.
+Text properties are stripped from strings, and unibyte UTF-8 strings (such
+as `json-serialize' output) are decoded into multibyte characters so
+`prin1-to-string' does not emit raw octal byte escapes."
   (cond ((stringp datum)
          (let ((s (substring-no-properties datum)))
            (if (multibyte-string-p s)
@@ -315,15 +324,20 @@ exits first.  OWNER's requests of a GENERATION older than one submitted
 or superseded later are cancelled, and their callbacks hear nothing
 more.  Of PRIORITY, -100 to 100, a higher one runs first."
   (unless (lispm-kernel-live-p runtime)
-    (error "The kernel is not running"))
+    (signal 'lispm-kernel-state-error '("The kernel is not running")))
   (setq input (lispm-kernel--plain input))
   (unless (and (symbolp job) (lispm-kernel--wire-p job) (lispm-kernel--wire-p input))
-    (error "Only integers, strings, symbols, lists and vectors go to the kernel: %S" input))
+    (signal 'lispm-kernel-wire-error
+            (list (format "Only integers, strings, symbols, lists and vectors go to the kernel: %S"
+                          input))))
   (unless (and (integerp owner) (integerp generation) (integerp priority) (<= -100 priority 100))
-    (error "Owner and generation are integers, priority one from -100 to 100"))
+    (signal 'lispm-kernel-wire-error
+            '("Owner and generation are integers, priority one from -100 to 100")))
   (let ((generations (lispm-kernel-runtime-generations runtime)))
     (when (< generation (gethash owner generations 0))
-      (error "Generation %s of owner %s is older than its current one" generation owner))
+      (signal 'lispm-kernel-state-error
+              (list (format "Generation %s of owner %s is older than its current one"
+                            generation owner))))
     (puthash owner generation generations))
   (let ((id (cl-incf (lispm-kernel-runtime-next-id runtime))))
     (puthash id (lispm-kernel--pending :callback on-result :owner owner :generation generation
@@ -345,21 +359,47 @@ more.  Of PRIORITY, -100 to 100, a higher one runs first."
     (lispm-kernel--send runtime `(cancel ,id))))
 
 (defun lispm-kernel-supersede (runtime owner generation)
-  "Make GENERATION OWNER's current one in RUNTIME: its older requests are
-cancelled, and their callbacks hear nothing more."
+  "Make GENERATION OWNER's current generation in RUNTIME.
+Older requests of OWNER are cancelled, and their callbacks hear nothing more."
   (let ((generations (lispm-kernel-runtime-generations runtime)))
     (when (< generation (gethash owner generations 0))
-      (error "Generation %s of owner %s is older than its current one" generation owner))
+      (signal 'lispm-kernel-state-error
+              (list (format "Generation %s of owner %s is older than its current one"
+                            generation owner))))
     (puthash owner generation generations))
   (when (lispm-kernel-live-p runtime)
     (lispm-kernel--send runtime `(supersede ,owner ,generation))))
 
+(defun lispm-kernel--enqueue-waiter (runtime entry)
+  "Append waiter ENTRY to RUNTIME's waiter queue in O(1) time."
+  (let ((cell (list entry)))
+    (if (lispm-kernel-runtime-waiters-tail runtime)
+        (setcdr (lispm-kernel-runtime-waiters-tail runtime) cell)
+      (setf (lispm-kernel-runtime-waiters runtime) cell))
+    (setf (lispm-kernel-runtime-waiters-tail runtime) cell)))
+
+(defun lispm-kernel--pop-waiter (runtime kind)
+  "Remove and return the oldest waiter for KIND in RUNTIME, or nil."
+  (let ((prev nil)
+        (cursor (lispm-kernel-runtime-waiters runtime))
+        (found nil))
+    (while (and cursor (not found))
+      (if (eq (caar cursor) kind)
+          (progn
+            (setq found (car cursor))
+            (if prev
+                (setcdr prev (cdr cursor))
+              (setf (lispm-kernel-runtime-waiters runtime) (cdr cursor)))
+            (when (null (cdr cursor))
+              (setf (lispm-kernel-runtime-waiters-tail runtime) prev)))
+        (setq prev cursor
+              cursor (cdr cursor))))
+    found))
+
 (defun lispm-kernel--ask (runtime kind form callback)
-  "Send FORM, to which RUNTIME's kernel answers with a message headed by
-KIND; CALLBACK gets the rest of that message."
+  "Send FORM to RUNTIME's kernel and pass the KIND reply tail to CALLBACK."
   (when (lispm-kernel-live-p runtime)
-    (setf (lispm-kernel-runtime-waiters runtime)
-          (append (lispm-kernel-runtime-waiters runtime) (list (cons kind callback))))
+    (lispm-kernel--enqueue-waiter runtime (cons kind callback))
     (lispm-kernel--send runtime form)
     t))
 
@@ -403,6 +443,7 @@ KIND; CALLBACK gets the rest of that message."
     (lispm-kernel--schedule runtime)))
 
 (defun lispm-kernel--tick (runtime)
+  "Run one scheduled dispatch slice for RUNTIME."
   (setf (lispm-kernel-runtime-timer runtime) nil)
   (lispm-kernel-dispatch runtime))
 
@@ -422,11 +463,13 @@ KIND; CALLBACK gets the rest of that message."
   (pop (lispm-kernel-runtime-ready runtime)))
 
 (defun lispm-kernel--lines-p (runtime)
+  "Return non-nil when RUNTIME has queued incoming or ready lines."
   (or (lispm-kernel-runtime-ready runtime) (lispm-kernel-runtime-incoming runtime)))
 
 (defun lispm-kernel-dispatch (runtime)
-  "Take in RUNTIME's messages for `lispm-kernel-slice-seconds', at least one,
-giving way to typing; schedule the rest.  It does not run inside itself."
+  "Take in RUNTIME's messages for up to `lispm-kernel-slice-seconds'.
+At least one message is processed per slice, yielding to pending input
+afterwards and rescheduling any remainder.  Never re-enters itself."
   (unless (or (lispm-kernel-runtime-closed runtime) (lispm-kernel-runtime-dispatching runtime))
     (setf (lispm-kernel-runtime-dispatching runtime) t)
     (unwind-protect
@@ -460,10 +503,8 @@ giving way to typing; schedule the rest.  It does not run inside itself."
     (`(chunk ,id ,data) (lispm-kernel--deliver runtime id 'chunk data nil))
     (`(done ,id ,status ,value) (lispm-kernel--deliver runtime id status value t))
     (`(,(and kind (or 'stats 'pong)) . ,arguments)
-     (let ((waiter (assq kind (lispm-kernel-runtime-waiters runtime))))
-       (when waiter
-         (setf (lispm-kernel-runtime-waiters runtime) (delq waiter (lispm-kernel-runtime-waiters runtime)))
-         (lispm-kernel--call runtime (cdr waiter) arguments))))
+     (when-let* ((waiter (lispm-kernel--pop-waiter runtime kind)))
+       (lispm-kernel--call runtime (cdr waiter) arguments)))
     (message (setf (lispm-kernel-runtime-last-error runtime) message))))
 
 (defun lispm-kernel--call (runtime function &rest arguments)
@@ -477,12 +518,12 @@ giving way to typing; schedule the rest.  It does not run inside itself."
         (cl-incf (lispm-kernel-runtime-overruns runtime))))))
 
 (defun lispm-kernel--current-p (runtime pending)
-  "Return non-nil when PENDING's generation is its owner's current one."
+  "Return non-nil when PENDING's generation is current in RUNTIME."
   (= (lispm-kernel--pending-generation pending)
      (gethash (lispm-kernel--pending-owner pending) (lispm-kernel-runtime-generations runtime) 0)))
 
 (defun lispm-kernel--deliver (runtime id kind value final)
-  "Give request ID's callback KIND and VALUE; FINAL ends the request."
+  "Deliver KIND and VALUE to request ID's callback in RUNTIME; FINAL ends it."
   (let ((pending (gethash id (lispm-kernel-runtime-requests runtime))))
     (when pending
       (when final
@@ -524,7 +565,8 @@ giving way to typing; schedule the rest.  It does not run inside itself."
     (maphash (lambda (id _) (push id ids)) (lispm-kernel-runtime-requests runtime))
     (dolist (id (sort ids #'<))
       (lispm-kernel--deliver runtime id 'lost nil t)))
-  (setf (lispm-kernel-runtime-waiters runtime) nil)
+  (setf (lispm-kernel-runtime-waiters runtime) nil
+        (lispm-kernel-runtime-waiters-tail runtime) nil)
   (lispm-kernel--cancel-timers runtime)
   (when (process-live-p (lispm-kernel-runtime-process runtime))
     (delete-process (lispm-kernel-runtime-process runtime)))
