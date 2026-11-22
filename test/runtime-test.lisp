@@ -167,6 +167,8 @@
       (let ((outbox (lispm-kernel::kernel-outbox kernel)))
         (is (<= (lispm-kernel::outbox-waiting outbox) 200)))
       (send kernel "(cancel 1)")
+      ;; Synchronize with `P_scheduler' FIFO mailbox before unblocking the sink.
+      (lispm-kernel:kernel-stats kernel)
       (setf (collector-stalled collector) nil)
       (let ((messages (answered collector 1)))
         (is (equal '(:done 1 :cancelled nil) (done-of 1 messages)))
