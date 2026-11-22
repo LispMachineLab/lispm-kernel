@@ -126,7 +126,7 @@ END, or where a sequence begins that END cuts short."
             (sb-posix:syscall-error () nil)))))))
 
 (defun wakeup-poke (pipe)
-  "Write one byte to PIPE if still open; safe from signal and cancel hooks."
+  "Write one byte to PIPE if still open; async-signal-safe (`SIGCHLD') and lock-free."
   (let ((pin-step (ash 1 32)))
     (loop
       (let ((old (wakeup-pipe-state pipe)))
@@ -142,8 +142,7 @@ END, or where a sequence begins that END cuts short."
                   (when (eql cur (sb-ext:compare-and-swap (wakeup-pipe-state pipe) cur next))
                     (when (and (zerop (ldb (byte 32 0) next))
                                (zerop (ash next -32)))
-                      (handler-case (sb-posix:close wfd)
-                        (sb-posix:syscall-error () nil)))
+                      (sb-unix:unix-close wfd))
                     (return))))))
           (return t))))))
 
@@ -201,6 +200,15 @@ END, or where a sequence begins that END cuts short."
           (sb-sys:signed-sap-ref-16 sap (+ offset 4)) events
           (sb-sys:signed-sap-ref-16 sap (+ offset 6)) 0)))
 
+(defun wait-wakeup-pipe (pipe timeout-ms)
+  "Wait up to TIMEOUT-MS milliseconds on PIPE via `poll(2)' and drain it."
+  (let ((pollbuf (make-array 8 :element-type '(unsigned-byte 8) :initial-element 0))
+        (scratch (make-array 64 :element-type '(unsigned-byte 8))))
+    (sb-sys:with-pinned-objects (pollbuf)
+      (set-pollfd pollbuf 0 (wakeup-pipe-rfd pipe) +pollin+))
+    (unix-poll-fds pollbuf 1 (max 0 timeout-ms))
+    (drain-wakeup-pipe pipe scratch)))
+
 (defun read-nonblocking (fd buffer start)
   "Read available octets from non-blocking FD into BUFFER from START.
 Return byte count (> 0), 0 on EOF, or `:would-block'."
@@ -218,12 +226,17 @@ Return byte count (> 0), 0 on EOF, or `:would-block'."
 
 ;;;; Process lifecycle and environment preparation
 
-(defun stop-process (process exit-gate)
-  "Stop PROCESS and its process group: SIGTERM, waiting on EXIT-GATE up to
-`*exec-kill-seconds*', then SIGKILL."
+(defun stop-process (process pipe &optional (kill-seconds *exec-kill-seconds*))
+  "Stop PROCESS and its process group: SIGTERM, polling PIPE up to
+KILL-SECONDS for `SIGCHLD', then SIGKILL."
   (when (sb-ext:process-alive-p process)
     (sb-ext:process-kill process sb-posix:sigterm :process-group)
-    (sb-concurrency:wait-on-gate exit-gate :timeout *exec-kill-seconds*)
+    (let ((deadline (+ (get-internal-real-time)
+                       (* kill-seconds internal-time-units-per-second))))
+      (loop while (sb-ext:process-alive-p process)
+            for remaining-ms = (compute-poll-timeout-ms t deadline)
+            while (plusp remaining-ms)
+            do (wait-wakeup-pipe pipe remaining-ms)))
     (when (sb-ext:process-alive-p process)
       (sb-ext:process-kill process sb-posix:sigkill :process-group))
     (sb-ext:process-wait process)))
@@ -380,7 +393,6 @@ Return the captured UTF-8 stderr tail string."
   "Run PROGRAM with ARGS via a single-thread `poll(2)' multiplexer."
   (checkpoint)
   (let* ((pipe (open-wakeup-pipe))
-         (exit-gate (sb-concurrency:make-gate :name "exec-exit" :open nil))
          (token (current-cancel-token))
          (deadline (and timeout
                         (+ (get-internal-real-time)
@@ -399,25 +411,21 @@ Return the captured UTF-8 stderr tail string."
                   :external-format '(:utf-8 :replacement #\?)
                   :status-hook (lambda (proc)
                                  (unless (sb-ext:process-alive-p proc)
-                                   (sb-concurrency:open-gate exit-gate)
                                    (wakeup-poke pipe)))))
            (when token
              (register-cancel-hook token (lambda () (wakeup-poke pipe))))
-           (unless (sb-ext:process-alive-p process)
-             (sb-concurrency:open-gate exit-gate))
            (let ((stderr (multiplex-process-io process pipe stdin deadline
                                                program timeout combine-error)))
              (loop while (sb-ext:process-alive-p process)
                    do (checkpoint)
                       (when (and deadline (> (get-internal-real-time) deadline))
                         (exec-error "~A did not finish in ~D seconds" program timeout))
-                      (sb-concurrency:wait-on-gate
-                       exit-gate :timeout (/ (compute-poll-timeout-ms t deadline) 1000.0d0)))
+                      (wait-wakeup-pipe pipe (compute-poll-timeout-ms t deadline)))
              (if (eq (sb-ext:process-status process) :signaled)
                  (list :signal (sb-ext:process-exit-code process) :stderr stderr)
                  (list :exit (sb-ext:process-exit-code process) :stderr stderr))))
       (when process
-        (stop-process process exit-gate)
+        (stop-process process pipe)
         (sb-ext:process-close process))
       (close-wakeup-pipe pipe))))
 

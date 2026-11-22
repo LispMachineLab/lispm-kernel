@@ -16,9 +16,9 @@
 ;; You should have received a copy of the GNU Affero General Public License
 ;; along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-;;; Downloads URL into FILE via `curl' without polling: a CSP gate wakes the
-;;; worker immediately when either `curl' exits (`:status-hook') or the
-;;; request's `cancel-token' fires.
+;;; Downloads URL into FILE via `curl' without polling: an async-signal-safe
+;;; self-pipe wakes `poll(2)' immediately when either `curl' exits
+;;; (`:status-hook' on `SIGCHLD') or the request's `cancel-token' fires.
 
 (in-package #:lispm-kernel)
 
@@ -63,40 +63,34 @@ seconds; return FILE's size.  INPUT is a plist of them."
     (check-type proxy (or null string))
     (check-type timeout (integer 1 3600))
     (checkpoint)
-    (let* ((wake (sb-concurrency:make-gate :name "fetch-wake" :open nil))
-           (exit-gate (sb-concurrency:make-gate :name "fetch-exit" :open nil))
+    (let* ((pipe (open-wakeup-pipe))
            (token (current-cancel-token))
-           (process (sb-ext:run-program
-                     "curl" (fetch-arguments url file :proxy proxy :timeout timeout)
-                     :search t :wait nil :input nil :output nil :error :stream
-                     :external-format '(:utf-8 :replacement #\?)
-                     :status-hook (lambda (proc)
-                                    (unless (sb-ext:process-alive-p proc)
-                                      (sb-concurrency:open-gate exit-gate)
-                                      (sb-concurrency:open-gate wake)))))
+           (process nil)
            (fetched nil))
       (unwind-protect
            (progn
+             (setf process
+                   (sb-ext:run-program
+                    "curl" (fetch-arguments url file :proxy proxy :timeout timeout)
+                    :search t :wait nil :input nil :output nil :error :stream
+                    :external-format '(:utf-8 :replacement #\?)
+                    :status-hook (lambda (proc)
+                                   (unless (sb-ext:process-alive-p proc)
+                                     (wakeup-poke pipe)))))
              (when token
-               (register-cancel-hook token (lambda () (sb-concurrency:open-gate wake))))
-             (unless (sb-ext:process-alive-p process)
-               (sb-concurrency:open-gate exit-gate)
-               (sb-concurrency:open-gate wake))
+               (register-cancel-hook token (lambda () (wakeup-poke pipe))))
              (loop while (sb-ext:process-alive-p process)
                    do (checkpoint)
-                      (sb-concurrency:wait-on-gate wake :timeout 1.0))
+                      (wait-wakeup-pipe pipe 1000))
              (checkpoint)
              (unless (eql (sb-ext:process-exit-code process) 0)
                (fetch-error "~A" (curl-failure process)))
              (prog1 (sb-posix:stat-size (sb-posix:stat file))
                (setf fetched t)))
-        (when (sb-ext:process-alive-p process)
-          (sb-ext:process-kill process sb-posix:sigterm :process-group)
-          (sb-concurrency:wait-on-gate exit-gate :timeout *fetch-kill-seconds*)
-          (when (sb-ext:process-alive-p process)
-            (sb-ext:process-kill process sb-posix:sigkill :process-group))
-          (sb-ext:process-wait process))
-        (sb-ext:process-close process)
+        (when process
+          (stop-process process pipe *fetch-kill-seconds*)
+          (sb-ext:process-close process))
+        (close-wakeup-pipe pipe)
         (unless fetched
           (handler-case (sb-posix:unlink file)
             (sb-posix:syscall-error () nil)))))))
