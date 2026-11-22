@@ -194,8 +194,7 @@ CALLBACK, ARGS, INPUT, TIMEOUT, ON-OUTPUT and COMBINE-ERROR are as
 ;;;; In the kernel
 
 (defun lispm-kernel-exec--finish (program callback status value output)
-  "Give CALLBACK how the kernel's request to run PROGRAM ended, STATUS
-and VALUE, OUTPUT what it printed meanwhile."
+  "Pass final outcome STATUS and VALUE of PROGRAM with OUTPUT to CALLBACK."
   (pcase (cons status value)
     (`(success . (:exit ,code :stderr ,said))
      (lispm-kernel-exec--call callback code output said))
@@ -208,12 +207,11 @@ and VALUE, OUTPUT what it printed meanwhile."
 
 (cl-defun lispm-kernel-exec--submit (program args callback fallback
                                      &key input timeout on-output combine-error)
-  "Have the kernel run PROGRAM with ARGS, then call CALLBACK; return
-a zero-argument cancellation function when it took it, nil when it
-cannot: no kernel knowing the job, the program not found, or a directory
-without a running kernel for its host.  A kernel that turns the request
-away later, as when full, leaves it to FALLBACK, called as
-`lispm-kernel-exec' is, where the program was asked for."
+  "Submit PROGRAM with ARGS to the kernel and invoke CALLBACK when it ends.
+Return a zero-argument cancellation function when accepted, or nil when no
+eligible kernel runs or PROGRAM is missing.  INPUT, TIMEOUT, ON-OUTPUT and
+COMBINE-ERROR configure standard input, time limit and streaming output.
+When rejected for capacity, delegate to FALLBACK."
   (let* ((directory (expand-file-name default-directory))
          (remote (file-remote-p directory))
          (runtime (lispm-kernel-exec--runtime :exec directory))
@@ -288,13 +286,15 @@ away later, as when full, leaves it to FALLBACK, called as
 CALLBACK gets the exit code, an integer, or a string saying why PROGRAM
 did not run or exit, then what it printed to its standard output and its
 standard error, strings read as UTF-8; it is called later, never before
-this returns.  PROGRAM is found in `exec-path' and runs in
+this returns.  PROGRAM is found in variable `exec-path' and runs in
 `default-directory' with `process-environment', reading INPUT, a string,
-when given, else nothing.  ARGS are strings.  Where no kernel knowing
-the `exec' job runs, see `lispm-kernel-exec-runtime-function', or
-PROGRAM or `default-directory' is not on this computer, Emacs runs it,
-`lispm-kernel-exec-locally'.  The kernel stops a program that takes longer
-than TIMEOUT (by default `lispm-kernel-exec-timeout')."
+when given, else nothing.  ON-OUTPUT receives each stdout chunk as it
+arrives, and COMBINE-ERROR merges stderr into stdout.  ARGS are strings.
+Where no kernel knowing the `exec' job runs, see
+`lispm-kernel-exec-runtime-function', or PROGRAM or `default-directory'
+is not on this computer, Emacs runs it via `lispm-kernel-exec-locally'.
+The kernel stops a program running past TIMEOUT (by default
+`lispm-kernel-exec-timeout')."
   (unless (lispm-kernel-exec--submit program args callback #'lispm-kernel-exec-locally
                                      :input input :timeout timeout
                                      :on-output on-output :combine-error combine-error)
@@ -382,6 +382,8 @@ nil when it cannot."
                                      &key glob glob-dir open-files
                                      max-file-size max-matches)
   "Search FILES for PATTERN in the kernel's `search-files' job.
+When CASE-FOLD is non-nil, match case-insensitively.  GLOB, GLOB-DIR,
+OPEN-FILES, MAX-FILE-SIZE and MAX-MATCHES filter and bound the scan.
 Call CALLBACK with (:items ITEMS :large LARGE) on success, or (:error WHY)
 if the job fails or is rejected.  Return a zero-argument cancellation
 function when the kernel took the request, or nil when it cannot."
@@ -427,8 +429,7 @@ function when the kernel took the request, or nil when it cannot."
 ;;;; lispm-agent's programs
 
 (defun lispm-kernel-exec--around (original program args callback &rest keys)
-  "Run PROGRAM with ARGS in the kernel, else as ORIGINAL would, a
-`lispm-exec-function' that CALLBACK and KEYS are for."
+  "Run PROGRAM with ARGS in the kernel, else call ORIGINAL with CALLBACK and KEYS."
   (or (apply #'lispm-kernel-exec--submit program args callback original keys)
       (apply original program args callback keys)))
 

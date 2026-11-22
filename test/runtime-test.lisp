@@ -261,3 +261,47 @@
                                                   (loop for n below 100 collect n))
                        :finished)))
     (is (<= seen 4))))
+
+(deftest runtime-structured-conditions-and-work-queue ()
+  (with-kernel (kernel collector)
+    (signals lispm-kernel:message-error
+      (lispm-kernel:handle-message kernel "not-a-command")))
+  (let* ((wq (lispm-kernel::make-work-queue))
+         (job (gethash :echo lispm-kernel::*jobs*))
+         (r1 (lispm-kernel::make-request 1 job nil 0 0 0))
+         (r2 (lispm-kernel::make-request 2 job nil 0 0 10))
+         (r3 (lispm-kernel::make-request 3 job nil 0 0 5)))
+    (lispm-kernel::work-queue-push wq r1)
+    (lispm-kernel::work-queue-push wq r2)
+    (lispm-kernel::work-queue-push wq r3)
+    (is (= 3 (lispm-kernel::work-queue-count wq)))
+    (is (eq r2 (lispm-kernel::work-queue-take-best wq (get-internal-real-time))))
+    (is (= 2 (lispm-kernel::work-queue-count wq)))
+    (is (lispm-kernel::work-queue-remove wq r3))
+    (is (eq (car (lispm-kernel::work-queue-tail wq)) r1))
+    (is (eq r1 (lispm-kernel::work-queue-take-best wq (get-internal-real-time))))
+    (is (= 0 (lispm-kernel::work-queue-count wq)))
+    (is (null (lispm-kernel::work-queue-tail wq)))))
+
+(deftest runtime-concurrent-submit-during-shutdown-never-drops ()
+  (dotimes (_ 10)
+    (let* ((collector (make-collector))
+           (kernel (lispm-kernel:start-kernel (collector-sink collector)
+                                              :cpu-workers 1 :io-workers 1 :subworkers 1)))
+      (let ((submitter (sb-thread:make-thread
+                        (lambda ()
+                          (loop for id from 1 to 40
+                                do (lispm-kernel:handle-message
+                                    kernel (list :submit id :echo id)))))))
+        (sleep 0.001)
+        (lispm-kernel:stop-kernel kernel :timeout 5)
+        (sb-thread:join-thread submitter :default nil :timeout 5)
+        (let ((messages (collector-messages collector)))
+          ;; Every submission settled before `outbox' closed has a terminal `done';
+          ;; any submission arriving after `close-control-channel' was rejected cleanly.
+          (loop for id from 1 to 40
+                for done = (done-of id messages)
+                when done
+                  do (is (member (third done) '(:success :cancelled :rejected))))))))
+  (is (null (lispm-kernel:stop-background-helpers))))
+

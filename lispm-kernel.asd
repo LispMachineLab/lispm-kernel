@@ -20,17 +20,19 @@
   :description "LispM's kernel: work Emacs should not wait on, done on threads of a Lisp of its own"
   :author "Ryan.K"
   :license "AGPL-3.0-or-later"
-  :depends-on ((:require "sb-posix"))
+  :depends-on ((:require "sb-posix")
+               (:require "sb-concurrency"))
   :pathname "src/"
   :serial t
   :components ((:file "package")
+               (:file "csp")
                (:file "wire")
                (:file "json")
                (:file "files")
                (:file "runtime")
                (:file "jobs")
-               (:file "fetch")
                (:file "exec")
+               (:file "fetch")
                (:file "search")
                (:file "sessions")
                (:file "main"))
@@ -44,6 +46,7 @@
   :pathname "test/"
   :serial t
   :components ((:file "harness")
+               (:file "csp-test")
                (:file "wire-test")
                (:file "json-test")
                (:file "files-test")

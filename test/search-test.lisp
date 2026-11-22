@@ -24,8 +24,8 @@
     (is (not (funcall match "x{2,3}" "axb")))
     (is (funcall match "(foo)\\s+\\1" "foo   foo"))
     (is (not (funcall match "(foo)\\s+\\1" "foo   bar")))
-    (signals error (lispm-kernel::compile-matcher "a(?=b)" nil))
-    (signals error (lispm-kernel::compile-matcher "abc\\" nil))))
+    (signals lispm-kernel:regex-error (lispm-kernel::compile-matcher "a(?=b)" nil))
+    (signals lispm-kernel:regex-error (lispm-kernel::compile-matcher "abc\\" nil))))
 
 (deftest search-files-parallel-and-globs ()
   (with-directory (directory)

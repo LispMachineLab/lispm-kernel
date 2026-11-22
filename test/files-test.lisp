@@ -159,3 +159,12 @@
         (declare (ignore stamp))
         (is (equalp (octets "6789") octets))
         (is cut)))))
+
+(deftest files-with-regular-file-evaluates-path-once ()
+  (with-directory (directory)
+    (let ((file (write-file (path directory "once") "hello"))
+          (evaluations 0))
+      (with-regular-file (stream stamp (progn (incf evaluations) file))
+        (is (= 6 (stamp-size stamp)))
+        (is (= 6 (length (read-range stream 0 6)))))
+      (is (= 1 evaluations)))))

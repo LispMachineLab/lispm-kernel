@@ -43,10 +43,19 @@
 (require 'lispm-kernel)
 (require 'parse-time)
 
+(define-error 'lispm-kernel-sessions-error "LispM kernel sessions error" 'lispm-kernel-error)
+
+(defun lispm-kernel-sessions--parse-started (stamp)
+  "Return STAMP parsed as an ISO 8601 `float-time', or nil when invalid."
+  (when (stringp stamp)
+    (condition-case nil
+        (float-time (parse-iso8601-time-string stamp))
+      (error nil))))
+
 (defun lispm-kernel-sessions--session (agent row &optional runtime)
-  "Return the session of AGENT the kernel sent as ROW, or nil when ROW is
-not one.  When RUNTIME has a remote host, re-attach its TRAMP prefix to
-`:cwd' and `:file'."
+  "Convert kernel ROW for AGENT into a session plist, or nil when malformed.
+When RUNTIME has a remote host, re-attach its TRAMP prefix to `:cwd' and
+`:file'."
   (let ((id (plist-get row :id))
         (cwd (plist-get row :cwd))
         (title (plist-get row :title))
@@ -63,8 +72,7 @@ not one.  When RUNTIME has a remote host, re-attach its TRAMP prefix to
         (append (list :agent agent :id id
                       :cwd (lispm-kernel-host-path runtime cwd)
                       :title title
-                      :started (when-let* ((stamp (plist-get row :started)))
-                                 (ignore-errors (float-time (parse-iso8601-time-string stamp))))
+                      :started (lispm-kernel-sessions--parse-started (plist-get row :started))
                       :file (lispm-kernel-host-path runtime file)
                       :time time)
                 turn parent)))))
@@ -86,7 +94,8 @@ called on Emacs's thread instead, and SUMMARY says :source elisp and
 :error why.  Superseding OWNER's GENERATION leaves CALLBACK uncalled.
 Return the request's id, or nil when the kernel is not running."
   (unless (memq agent '(codex claude))
-    (error "There is no agent %S to read sessions of" agent))
+    (signal 'lispm-kernel-sessions-error
+            (list (format "There is no agent %S to read sessions of" agent))))
   (let ((rows nil)
         (finished nil))
     (cl-labels

@@ -7,10 +7,10 @@ native threads, without a global lock, and hands Emacs the results in
 pieces Emacs can take in between keystrokes.
 
 ```
-Emacs                                         kernel (SBCL)
-  lispm-kernel-submit ──(submit ...)──stdin──▶  reader thread ─▶ queues ─▶ workers (:cpu, :io)
-                                                                                │ emit
-  filter ─▶ lines ─▶ frame clock ◀──stdout── writer thread ◀── outbox ◀────────┘
+Emacs                                         kernel (SBCL — CSP channels, zero domain mutexes)
+  lispm-kernel-submit ──(submit ...)──stdin──▶  reader ─▶ control-mbox ─▶ P_scheduler ─▶ workers (:cpu, :io)
+                                                                              │               │ emit
+  filter ─▶ lines ─▶ frame clock ◀──stdout── P_writer ◀── credit-sink ◀───────┴───────────────┘
               lispm-kernel-dispatch: a slice at a time, giving way to typing
 ```
 
@@ -57,12 +57,17 @@ newer generation cancels its older requests, queued or running, and a
 request of an older one is rejected as stale. Emacs filters the same way,
 so a superseded callback hears nothing more.
 
-Requests wait in a queue per class, `:cpu` and `:io`, each served by
-threads of its own. A worker takes the request of the highest priority,
-raised by one for every 50 ms it has waited, the oldest of equals first.
-Cancelling a queued request answers it at once. A running one stops at
-its next `checkpoint`, or while it waits to emit. A job that signals an
-error fails its request, and the worker goes on.
+Requests are coordinated by a single sequential process (`P_scheduler` in
+`src/runtime.lisp`, built on `src/csp.lisp` and `:sb-concurrency`) without
+domain mutexes: idle workers of each class (`:cpu` and `:io`) announce
+readiness on `control-mbox` and receive the highest effective-priority
+request (raised by one for every 50 ms waited, oldest of equals first) on
+their private mailbox. Data-parallel batches share a bounded persistent
+`subworker` pool with caller work-helping rather than spawning transient OS
+threads. Cancelling a queued request answers it at once; cancelling a
+running request opens its broadcast `cancel-token` gate, waking `poll`,
+subprocess waits, or credit-sink backpressure immediately without polling.
+A job that signals an error fails its request, and the worker goes on.
 
 ## The outbox
 
@@ -137,13 +142,15 @@ of a turn. The same readings answer three more callers in lispm-agent.
 `lispm-agents-session-lookup-functions` looks a session up, for its
 transcript and its turn, when the agents bridge asks whether an agent is
 free for a message; it never waits and never reads the agents' own way.
-`lispm-agents-read-sessions-function` lists every session. A terminal
-learning its session takes a reading of any age and is told when a newer
-one comes. The session picker takes one no older than the cache, waiting
-up to `lispm-kernel-desktop-wait-seconds` for the kernel to read anew.
-Only readings that say whether turns ended are used there: an older
-kernel's may lack sessions lispm-agent lists. A remote or missing root
-is read the agents' own way. A kernel that
+`lispm-agents-read-sessions-function` lists every session strictly
+asynchronously without ever blocking Emacs: both terminals learning their
+session and the session picker answer at once with what the kernel read
+last (or `nil` while the initial background scan runs, scheduling a refresh
+when stale and notifying `lispm-agents-sessions-arrived` when newer sessions
+arrive). Only readings that say whether turns ended are used there: an older
+kernel's may lack sessions lispm-agent lists. Single-hop SSH hosts run a
+staged remote kernel of their own with isolated cache keys; other remote or
+missing roots are read the agents' own way. A kernel that
 exits is started again when a reader is next asked, unless it ran shorter
 than `lispm-kernel-desktop-restart-seconds`; then it is not started again
 until the mode is turned on anew.

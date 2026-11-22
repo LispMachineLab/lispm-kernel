@@ -88,9 +88,9 @@
          runtime)))
 
 (defun lispm-kernel-package--proxy (url)
-  "Return how url.el would reach URL: (proxy PROXY), PROXY \"http://HOST:PORT/\",
-\(direct), or nil when it would go another way, through SOCKS or a
-gateway of its own."
+  "Return how `url.el' reaches URL, or nil when unsupported by the kernel.
+The result is `(proxy PROXY)' with an `http://' URL, `(direct)' for no
+proxy, or nil when `url.el' uses SOCKS or another gateway."
   (require 'url)
   (url-do-setup)
   (let* ((parsed (url-generic-parse-url url))
@@ -98,6 +98,12 @@ gateway of its own."
     (cond ((not (eq url-gateway-method 'native)) nil)
           ((null proxy) '(direct))
           ((string-prefix-p "http://" proxy) (list 'proxy proxy)))))
+
+(defun lispm-kernel-package--delete-quietly (file)
+  "Delete FILE if present, ignoring file-system errors."
+  (condition-case nil
+      (delete-file file)
+    (file-error nil)))
 
 (defun lispm-kernel-package--deliver (url file body error-function noerror status value)
   "Run BODY with what the kernel fetched from URL into FILE, or say why not.
@@ -118,7 +124,7 @@ url.el's callback would say it."
               (unless noerror
                 (error "Error retrieving: %s %S" url (list status value)))))
         (error (message "%s" (error-message-string err))))
-    (ignore-errors (delete-file file))))
+    (lispm-kernel-package--delete-quietly file)))
 
 (cl-defun lispm-kernel-package--with-response-buffer
     (original url body &rest keys &key async file error-function noerror &allow-other-keys)
@@ -146,16 +152,16 @@ NOERROR."
                              location target body error-function noerror kind value))))
             nil)
         ;; The kernel went away meanwhile: url.el downloads.
-        (error (ignore-errors (delete-file target))
+        (error (lispm-kernel-package--delete-quietly target)
                (apply original url body keys))))))
 
 ;;;; lispm-prebuilt's downloads
 
 (cl-defun lispm-kernel-package--prebuilt-fetch (original url file callback &rest keys
                                                          &key timeout &allow-other-keys)
-  "Have the kernel fetch URL into FILE, then call CALLBACK with nil, or
-with why it failed; else leave it to ORIGINAL, a
-`lispm-prebuilt-fetch-function', with KEYS.  TIMEOUT is in seconds."
+  "Fetch URL into FILE via the kernel, else delegate to ORIGINAL with KEYS.
+CALLBACK receives nil on success or a failure reason string; TIMEOUT is in
+seconds."
   (let* ((runtime (and (string-match-p "\\`https?:" url) (lispm-kernel-package--runtime)))
          (route (and runtime (lispm-kernel-package--proxy url)))
          (timeout (min 3600 (max 1 (or timeout lispm-kernel-package-timeout)))))
@@ -173,7 +179,7 @@ with why it failed; else leave it to ORIGINAL, a
                           ('success (funcall callback nil))
                           ;; Turned away, as when full: as without the kernel.
                           ('rejected (apply original url file callback keys))
-                          (_ (ignore-errors (delete-file file))
+                          (_ (lispm-kernel-package--delete-quietly file)
                              (funcall callback (format "Could not download %s: %s" url
                                                        (or value kind)))))))
         ;; The kernel went away meanwhile.
@@ -186,8 +192,7 @@ with why it failed; else leave it to ORIGINAL, a
 
 ;;;###autoload
 (define-minor-mode lispm-kernel-package-mode
-  "Have the kernel make the downloads package.el makes in the background,
-and those of LispM's packages' native code, through lispm-prebuilt.
+  "Offload background `package.el' and `lispm-prebuilt' downloads to the kernel.
 The kernel is the one `lispm-kernel-package-runtime-function' returns,
 by default the agents' while `lispm-kernel-sessions-mode' runs it; while
 none that knows the `fetch' job runs, url.el downloads, and lispm-prebuilt

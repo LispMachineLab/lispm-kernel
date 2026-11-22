@@ -1,4 +1,4 @@
-;;;; fetch.lisp --- Downloads Emacs does not wait on
+;;;; fetch.lisp --- Event-driven downloads Emacs does not wait on
 
 ;; Copyright (C) 2026  Ryan.K
 ;; SPDX-License-Identifier: AGPL-3.0-or-later
@@ -16,20 +16,9 @@
 ;; You should have received a copy of the GNU Affero General Public License
 ;; along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-;;; Emacs downloads with url.el in its own process, and negotiates TLS on
-;;; its own thread.  The fetch job downloads instead, with curl, which
-;;; the kernel runs; SBCL speaks no TLS of its own:
-;;;
-;;;   Emacs  (submit 9 fetch (:url "https://..." :file "/tmp/x" :proxy nil))
-;;;   kernel (done 9 success 2639466)
-;;;
-;;; FILE gets what URL holds, and the result is its size in bytes.  PROXY
-;;; is the proxy url.el would reach URL through, "http://HOST:PORT/", or
-;;; nil for none: curl then uses no proxy of the environment either.
-;;; Only http and https are fetched, redirections too, compressed on the
-;;; way when the server can, as url.el asks for it.  A download that
-;;; fails fails its request with what curl said; one that is cancelled
-;;; stops curl.  Either removes FILE.
+;;; Downloads URL into FILE via `curl' without polling: an async-signal-safe
+;;; self-pipe wakes `poll(2)' immediately when either `curl' exits
+;;; (`:status-hook' on `SIGCHLD') or the request's `cancel-token' fires.
 
 (in-package #:lispm-kernel)
 
@@ -52,14 +41,18 @@ none, giving up after TIMEOUT seconds when given."
 
 (defun curl-failure (process)
   "Return why PROCESS, curl, failed: the last line it said, else its code."
-  (let ((said (ignore-errors
-               (loop with last = nil
-                     for line = (read-line (sb-ext:process-error process) nil nil)
-                     while line
-                     unless (zerop (length (string-trim " " line)))
-                       do (setf last (string-trim " " line))
-                     finally (return last)))))
+  (let ((said (handler-case
+                  (loop with last = nil
+                        for line = (read-line (sb-ext:process-error process) nil nil)
+                        while line
+                        unless (zerop (length (string-trim " " line)))
+                          do (setf last (string-trim " " line))
+                        finally (return last))
+                (stream-error () nil))))
     (or said (format nil "curl exited with code ~D" (sb-ext:process-exit-code process)))))
+
+(defparameter *fetch-kill-seconds* 2
+  "Seconds to wait after SIGTERM before sending SIGKILL to curl.")
 
 (define-job (fetch :class :io) (input)
   "Download URL into FILE, through PROXY or none, in at most TIMEOUT
@@ -69,22 +62,35 @@ seconds; return FILE's size.  INPUT is a plist of them."
     (check-type file string)
     (check-type proxy (or null string))
     (check-type timeout (integer 1 3600))
-    (let ((process (sb-ext:run-program "curl" (fetch-arguments url file :proxy proxy :timeout timeout)
-                                       :search t :wait nil :input nil :output nil :error :stream
-                                       :external-format '(:utf-8 :replacement #\?)))
-          (fetched nil))
+    (checkpoint)
+    (let* ((pipe (open-wakeup-pipe))
+           (token (current-cancel-token))
+           (process nil)
+           (fetched nil))
       (unwind-protect
            (progn
+             (setf process
+                   (sb-ext:run-program
+                    "curl" (fetch-arguments url file :proxy proxy :timeout timeout)
+                    :search t :wait nil :input nil :output nil :error :stream
+                    :external-format '(:utf-8 :replacement #\?)
+                    :status-hook (lambda (proc)
+                                   (unless (sb-ext:process-alive-p proc)
+                                     (wakeup-poke pipe)))))
+             (when token
+               (register-cancel-hook token (lambda () (wakeup-poke pipe))))
              (loop while (sb-ext:process-alive-p process)
                    do (checkpoint)
-                      (sleep 0.01))
+                      (wait-wakeup-pipe pipe 1000))
+             (checkpoint)
              (unless (eql (sb-ext:process-exit-code process) 0)
-               (error "~A" (curl-failure process)))
+               (fetch-error "~A" (curl-failure process)))
              (prog1 (sb-posix:stat-size (sb-posix:stat file))
                (setf fetched t)))
-        (when (sb-ext:process-alive-p process)
-          (sb-ext:process-kill process sb-posix:sigterm)
-          (sb-ext:process-wait process))
-        (sb-ext:process-close process)
+        (when process
+          (stop-process process pipe *fetch-kill-seconds*)
+          (sb-ext:process-close process))
+        (close-wakeup-pipe pipe)
         (unless fetched
-          (ignore-errors (sb-posix:unlink file)))))))
+          (handler-case (sb-posix:unlink file)
+            (sb-posix:syscall-error () nil)))))))
