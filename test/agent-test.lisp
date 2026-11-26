@@ -531,10 +531,16 @@
                      (message-string `(agent-turn "s-dup" (:turn-id "tdp" :body "{\"messages\":[{\"role\":\"user\",\"content\":\"go\"}]}"))))
                (await collector (lambda (ms) (some (lambda (m) (turn-event-p m "s-dup" :turn-done)) ms)))
                (let* ((snap (lispm-kernel:kernel-agent-snapshot kernel "s-dup"))
-                      (tools (getf snap :completed-tools)))
+                      (tools (getf snap :completed-tools))
+                      (read-entry (find "read_file" tools :key (lambda (e) (getf e :tool)) :test #'string=))
+                      (search-entry (find "search_files" tools :key (lambda (e) (getf e :tool)) :test #'string=)))
                  (is (= 2 (length tools)))
-                 (is (search "dup-line-2" (getf (first tools) :result)))
-                 (is (search "dup.txt:3:dup-line-3" (getf (second tools) :result))))))
+                 (is (and read-entry
+                          (string= "dup_1" (getf read-entry :call-id))
+                          (search "dup-line-2" (getf read-entry :result))))
+                 (is (and search-entry
+                          (string= "dup_1" (getf search-entry :call-id))
+                          (search "dup.txt:3:dup-line-3" (getf search-entry :result)))))))
         (stop-mock-http-server srv)))))
 
 (deftest agent-path-containment-unsaved-fallback-and-socket-guard ()
