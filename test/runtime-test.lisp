@@ -307,3 +307,47 @@
                   do (is (member (third done) '(:success :cancelled :rejected))))))))
   (is (null (lispm-kernel:stop-background-helpers))))
 
+(deftest runtime-cli-option-parsing ()
+  (is (eq :version (lispm-kernel::parse-cli-options '("--version"))))
+  (let ((opts (lispm-kernel::parse-cli-options
+               '("--cpu-workers" "3" "--io-workers" "5" "--subworkers" "2"
+                 "--max-requests" "512" "--max-requests-per-owner" "32"
+                 "--max-reactor-slots" "256" "--stream-credit" "65536"))))
+    (is (= 14 (length opts)))
+    (is (= 3 (getf opts :cpu-workers)))
+    (is (= 5 (getf opts :io-workers)))
+    (is (= 2 (getf opts :subworkers)))
+    (is (= 512 (getf opts :max-requests)))
+    (is (= 32 (getf opts :max-requests-per-owner)))
+    (is (= 256 (getf opts :max-reactor-slots)))
+    (is (= 65536 (getf opts :stream-credit))))
+  (signals lispm-kernel:message-error
+    (lispm-kernel::parse-cli-options '("--unknown")))
+  (signals lispm-kernel:message-error
+    (lispm-kernel::parse-cli-options '("--cpu-workers")))
+  (signals lispm-kernel:message-error
+    (lispm-kernel::parse-cli-options '("--cpu-workers" "abc")))
+  (signals lispm-kernel:message-error
+    (lispm-kernel::parse-cli-options '("--cpu-workers" "-1")))
+  (signals lispm-kernel:message-error
+    (lispm-kernel::parse-cli-options '("--stream-credit" "100"))))
+
+(deftest runtime-per-owner-quota-isolation ()
+  (with-globals ((lispm-kernel::*max-requests* 10)
+                 (lispm-kernel::*max-requests-per-owner* 2))
+    (with-kernel (kernel collector :io-workers 2)
+      (send kernel
+            "(submit 1 wait (:milliseconds 5000) :owner 11)"
+            "(submit 2 wait (:milliseconds 5000) :owner 11)"
+            "(submit 3 echo should-reject :owner 11)"
+            "(submit 4 echo sibling-ok :owner 12)")
+      (let ((messages (answered collector 3 4)))
+        (is (equal '(:done 3 :rejected :capacity) (done-of 3 messages)))
+        (is (equal '(:done 4 :success :sibling-ok) (done-of 4 messages))))
+      (send kernel "(cancel 1)" "(cancel 2)")
+      (answered collector 1 2)
+      (let ((hello (rest (lispm-kernel::hello))))
+        (is (= 128 (getf (getf hello :workers) :reactor)))
+        (is (eql 10 (getf (getf hello :limits) :requests)))
+        (is (eql 2 (getf (getf hello :limits) :per-owner)))))))
+

@@ -219,3 +219,157 @@ b
              (sleep 0.1)
              (is (not (process-there-p pid)))))
       (ignore-errors (lispm-kernel:stop-kernel kernel :timeout 1)))))
+
+(defun exec-owned (id owner program args &rest keys)
+  "Return the submission of request ID for OWNER running PROGRAM with ARGS and KEYS."
+  (message-string `(submit ,id exec (:program ,program :args ,args ,@keys) :owner ,owner)))
+
+(defun shell-owned (id owner script &rest keys)
+  "Return the submission of shell request ID for OWNER running SCRIPT and KEYS."
+  (apply #'exec-owned id owner "/bin/sh" (list "-c" script) keys))
+
+(deftest exec-reactor-high-concurrency-without-io-starvation ()
+  (with-directory (directory)
+    (let ((fake-curl (write-file (path directory "fake-curl")
+                                 "#!/bin/sh"
+                                 "cat >/dev/null"
+                                 "sleep 0.3"
+                                 "printf 'stream-ok\\n'"
+                                 "printf '\\n__LISPM_HTTP_STATUS__:200\\n'")))
+      (sb-posix:chmod fake-curl #o755)
+      (with-kernel (kernel collector :io-workers 2 :reactor-slots 128)
+        (let ((started (get-internal-real-time))
+              (ids (loop for id from 1 to 52 collect id)))
+          (loop for id from 1 to 32
+                do (send kernel
+                         (message-string
+                          `(submit ,id http-stream
+                                   (:url "https://api.example.com/v1/stream"
+                                    :headers ("x-test: 1")
+                                    :body "payload"
+                                    :curl ,fake-curl)
+                                   :owner ,(1+ (mod id 4))))))
+          (loop for id from 33 to 48
+                do (send kernel
+                         (shell-owned id (1+ (mod id 4))
+                                      (format nil "sleep 0.3; printf 'exec-~D'" id))))
+          (loop for id from 49 to 52
+                do (send kernel
+                         (message-string `(submit ,id wait (:milliseconds 250) :owner 99))))
+          (let* ((messages (apply #'answered collector ids))
+                 (elapsed (/ (- (get-internal-real-time) started)
+                             (float internal-time-units-per-second))))
+            (is (< elapsed 4.0))
+            (loop for id from 1 to 32
+                  do (is (equal '(:exit 0 :stderr "") (fourth (done-of id messages))))
+                     (is (search "stream-ok" (output-of id messages))))
+            (loop for id from 33 to 48
+                  do (is (equal '(:exit 0 :stderr "") (fourth (done-of id messages))))
+                     (is (equal (format nil "exec-~D" id) (output-of id messages))))
+            (loop for id from 49 to 52
+                  do (is (eq :success (third (done-of id messages)))))
+            (let ((stats (lispm-kernel:kernel-stats kernel)))
+              (is (= 0 (getf stats :requests)))
+              (is (= 0 (getf stats :reactor-active))))))))))
+
+(deftest exec-reactor-per-owner-quota-and-sibling-isolation ()
+  (with-globals ((lispm-kernel::*max-requests* 32)
+                 (lispm-kernel::*max-requests-per-owner* 3))
+    (with-kernel (kernel collector :io-workers 2)
+      (send kernel
+            (shell-owned 1 101 "sleep 10")
+            (shell-owned 2 101 "sleep 10")
+            (shell-owned 3 101 "sleep 10")
+            (shell-owned 4 101 "printf blocked")
+            (shell-owned 5 102 "printf sibling-ok"))
+      (let ((messages (answered collector 4 5)))
+        (is (equal '(:done 4 :rejected :capacity) (done-of 4 messages)))
+        (is (equal '(:done 5 :success (:exit 0 :stderr "")) (done-of 5 messages)))
+        (is (equal "sibling-ok" (output-of 5 messages))))
+      (send kernel "(cancel 1)" "(cancel 2)" "(cancel 3)")
+      (answered collector 1 2 3)
+      (is (= 0 (getf (lispm-kernel:kernel-stats kernel) :reactor-active))))))
+
+(deftest exec-reactor-per-stream-backpressure-and-resume ()
+  (with-globals ((lispm-kernel::*exec-read-octets* 128)
+                 (lispm-kernel::*exec-stream-credit* 512)
+                 (lispm-kernel::*outbox-limit* 65536))
+    (with-kernel (kernel collector :io-workers 2)
+      ;; Phase 1: stalling the consumer stops the firehose at its per-stream budget
+      ;; without starving a sibling or delaying cancellation.
+      (setf (collector-stalled collector) t)
+      (send kernel
+            (shell-owned 1 201 "yes abcdefghijklmnop | head -c 50000")
+            (shell-owned 2 202 "printf sibling-live"))
+      (sleep 0.12)
+      (let ((waiting (lispm-kernel::outbox-waiting (lispm-kernel::kernel-outbox kernel))))
+        (is (<= waiting 2048)))
+      (send kernel "(cancel 1)")
+      (lispm-kernel:kernel-stats kernel)
+      (setf (collector-stalled collector) nil)
+      (let ((messages (answered collector 1 2)))
+        (is (equal '(:done 1 :cancelled nil) (done-of 1 messages)))
+        (is (equal '(:exit 0 :stderr "") (fourth (done-of 2 messages))))
+        (is (equal "sibling-live" (output-of 2 messages))))
+      ;; Phase 2: full resume under active per-stream credit delivers all octets intact.
+      (send kernel (shell-owned 3 201 "head -c 32768 /dev/zero | tr '\\0' x"))
+      (let* ((messages (answered collector 3))
+             (output (output-of 3 messages)))
+        (is (equal '(:exit 0 :stderr "") (fourth (done-of 3 messages))))
+        (is (= 32768 (length output)))
+        (is (every (lambda (ch) (char= ch #\x)) output))))))
+
+(deftest exec-reactor-mixed-cancel-timeout-and-cleanup ()
+  (with-kernel (kernel collector :io-workers 2)
+    (let ((started (get-internal-real-time)))
+      (dotimes (i 4)
+        (send kernel (shell-owned (+ 10 i) 301 "sleep 30 & echo $!; wait")))
+      (let* ((msgs (await collector
+                          (lambda (ms)
+                            (every (lambda (id) (find #\Newline (output-of id ms)))
+                                   '(10 11 12 13)))))
+             (pids (loop for id from 10 to 13
+                         collect (parse-integer (output-of id msgs)))))
+        (dolist (pid pids)
+          (is (process-there-p pid)))
+        (send kernel
+              (exec-owned 20 302 "/bin/sleep" '("30") :timeout 1)
+              (exec-owned 21 302 "/bin/sleep" '("30") :timeout 1)
+              (shell-owned 30 303 "printf ok-30")
+              (shell-owned 31 303 "printf ok-31"))
+        (send kernel "(cancel 10)" "(cancel 11)" "(cancel 12)" "(cancel 13)")
+        (let ((all (answered collector 10 11 12 13 20 21 30 31)))
+          (dolist (id '(10 11 12 13))
+            (is (equal `(:done ,id :cancelled nil) (done-of id all))))
+          (dolist (id '(20 21))
+            (is (eq :failed (third (done-of id all))))
+            (is (search "did not finish" (fourth (done-of id all)))))
+          (dolist (id '(30 31))
+            (is (equal (format nil "ok-~D" id) (output-of id all)))))
+        (sleep 0.1)
+        (dolist (pid pids)
+          (is (not (process-there-p pid))))
+        (is (< (- (get-internal-real-time) started) (* 4 internal-time-units-per-second)))
+        (is (= 0 (getf (lispm-kernel:kernel-stats kernel) :reactor-active)))))))
+
+(deftest exec-reactor-parallel-shutdown-of-stubborn-processes ()
+  (with-globals ((lispm-kernel::*exec-kill-seconds* 1))
+    (let* ((collector (make-collector))
+           (kernel (lispm-kernel:start-kernel (collector-sink collector) :io-workers 1)))
+      (unwind-protect
+           (progn
+             (loop for id from 1 to 4
+                   do (send kernel (shell id "trap '' TERM; printf 'ready\\n'; sleep 30")))
+             (await collector
+                    (lambda (msgs)
+                      (every (lambda (id) (search "ready" (output-of id msgs)))
+                             '(1 2 3 4))))
+             (let ((started (get-internal-real-time)))
+               (lispm-kernel:stop-kernel kernel :timeout 5)
+               (let ((elapsed (/ (- (get-internal-real-time) started)
+                                 (float internal-time-units-per-second))))
+                 (is (< elapsed 2.5))))
+             (let ((msgs (messages collector)))
+               (loop for id from 1 to 4
+                     do (is (equal `(:done ,id :cancelled nil) (done-of id msgs))))))
+        (ignore-errors (lispm-kernel:stop-kernel kernel :timeout 1))))))

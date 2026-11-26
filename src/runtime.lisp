@@ -41,6 +41,12 @@
 (defparameter *max-requests-per-owner* 64
   "Requests of one owner accepted and not yet answered, at most.")
 
+(defparameter *max-reactor-slots* 128
+  "Concurrent active multiplexed I/O slots handled by P_reactor, at most.")
+
+(defparameter *exec-stream-credit* (* 256 1024)
+  "Per-stream in-flight outbox byte budget before pausing reads on that stream.")
+
 (defparameter *outbox-limit* (* 4 1024 1024)
   "Characters of chunks waiting for Emacs, at most, but for one chunk alone.")
 
@@ -115,7 +121,7 @@ sends (clear-caches).")
 
 (defstruct (job (:constructor make-job (name class function)) (:copier nil))
   (name nil :type keyword :read-only t)
-  (class :cpu :type (member :cpu :io) :read-only t)
+  (class :cpu :type (member :cpu :io :reactor) :read-only t)
   (function #'identity :type function :read-only t))
 
 (defvar *jobs* (make-hash-table :test 'eq)
@@ -123,10 +129,10 @@ sends (clear-caches).")
 
 (defmacro define-job ((name &key (class :cpu)) (input) &body body)
   "Define the job NAME, which Emacs asks for as (submit ID NAME INPUT ...).
-BODY runs on a worker of CLASS, :cpu or :io, with INPUT bound to the
-datum Emacs sent, and its value is the result Emacs gets.  It may `emit'
-chunks before, and calls `checkpoint' between steps, where a cancelled
-request stops.  An error it signals fails the request."
+BODY runs on a worker of CLASS, :cpu, :io or :reactor, with INPUT bound to
+the datum Emacs sent, and its value is the result Emacs gets.  It may
+`emit' chunks before, and calls `checkpoint' between steps, where a
+cancelled request stops.  An error it signals fails the request."
   (let ((keyword (intern (string name) :keyword)))
     `(progn
        (setf (gethash ,keyword *jobs*)
@@ -279,11 +285,22 @@ A VALUE that cannot be sent, or is too long, fails the request instead."
 
 ;;;; Kernel handle and P_scheduler private state
 
+(defstruct (reactor-handle (:constructor make-reactor-handle (thread submit-fn stop-fn))
+                           (:copier nil))
+  "Handle to the CSP multiplexed I/O reactor process `P_reactor'."
+  (thread nil :read-only t)
+  (submit-fn #'identity :type function :read-only t)
+  (stop-fn #'identity :type function :read-only t))
+
+(defvar *reactor-starter* nil
+  "Function (KERNEL) returning a `reactor-handle', installed by `reactor.lisp'.")
+
 (defstruct (kernel (:constructor make-kernel (control outbox subworkers)) (:copier nil))
   "Handle to a running CSP kernel process network."
   (control nil :type mbox :read-only t)
   (outbox nil :type credit-sink :read-only t)
   (subworkers nil :type work-group :read-only t)
+  (reactor nil :type (or null reactor-handle))
   (scheduler nil)
   (writer nil)
   (workers '() :type list)
@@ -293,12 +310,18 @@ A VALUE that cannot be sent, or is too long, fails the request instead."
   (closed (make-cancel-token :name "kernel-closed") :type cancel-token :read-only t)
   (final-stats '() :type list))
 
-(defstruct (scheduler-state (:constructor make-scheduler-state (total-workers)) (:copier nil))
+(defstruct (scheduler-state (:constructor make-scheduler-state
+                             (total-workers reactor-live reactor-limit))
+                            (:copier nil))
   "Mutable scheduling tables owned exclusively by the sequential P_scheduler process."
   (cpu-queue (make-work-queue) :type work-queue :read-only t)
   (io-queue (make-work-queue) :type work-queue :read-only t)
+  (reactor-queue (make-work-queue) :type work-queue :read-only t)
   (idle-cpu '() :type list)
   (idle-io '() :type list)
+  (reactor-active 0 :type (integer 0))
+  (reactor-limit nil :type (or null (integer 1)) :read-only t)
+  (reactor-live nil :type boolean)
   (requests (make-hash-table) :read-only t)
   (generations (make-hash-table) :read-only t)
   (owner-counts (make-hash-table) :read-only t)
@@ -315,7 +338,8 @@ A VALUE that cannot be sent, or is too long, fails the request instead."
          (ftype (function (t) t) emit)
          (ftype (function (function &key (:cpu-workers (integer 0))
                                     (:io-workers (integer 0))
-                                    (:subworkers (integer 0)))
+                                    (:subworkers (integer 0))
+                                    (:reactor-slots (or null (integer 1))))
                           kernel)
                 start-kernel)
          (ftype (function (kernel &key (:timeout (or null real))) kernel) stop-kernel)
@@ -330,11 +354,17 @@ A VALUE that cannot be sent, or is too long, fails the request instead."
 (defun state-queue (state class)
   (ecase class
     (:cpu (scheduler-state-cpu-queue state))
-    (:io (scheduler-state-io-queue state))))
+    (:io (scheduler-state-io-queue state))
+    (:reactor (scheduler-state-reactor-queue state))))
 
 (defun state-queued-count (state)
   (+ (work-queue-count (scheduler-state-cpu-queue state))
-     (work-queue-count (scheduler-state-io-queue state))))
+     (work-queue-count (scheduler-state-io-queue state))
+     (work-queue-count (scheduler-state-reactor-queue state))))
+
+(defun effective-reactor-limit (state)
+  "Return the maximum concurrent reactor slots permitted in STATE."
+  (or (scheduler-state-reactor-limit state) *max-reactor-slots*))
 
 (defun pop-idle-worker (state class)
   (ecase class
@@ -390,8 +420,21 @@ A VALUE that cannot be sent, or is too long, fails the request instead."
   (tally-state state 'rejected)
   (credit-sink-put-control outbox (message-string (list 'done id 'rejected reason))))
 
-(defun dispatch-class (state class)
-  "Match queued requests of CLASS with idle workers in STATE."
+(defun dispatch-reactor (kernel state)
+  "Dispatch queued `:reactor' requests in KERNEL up to STATE's active slot limit."
+  (let ((reactor (kernel-reactor kernel))
+        (wq (scheduler-state-reactor-queue state))
+        (limit (effective-reactor-limit state)))
+    (when (and reactor (not (scheduler-state-closing state)))
+      (loop while (and (work-queue-head wq)
+                       (< (scheduler-state-reactor-active state) limit))
+            do (let ((best (work-queue-take-best wq (get-internal-real-time))))
+                 (setf (request-state best) :running)
+                 (incf (scheduler-state-reactor-active state))
+                 (funcall (reactor-handle-submit-fn reactor) best))))))
+
+(defun dispatch-worker-class (state class)
+  "Match queued requests of worker CLASS (:cpu or :io) with idle workers."
   (let ((wq (state-queue state class)))
     (loop while (and (work-queue-head wq)
                      (ecase class
@@ -402,7 +445,13 @@ A VALUE that cannot be sent, or is too long, fails the request instead."
                (setf (request-state best) :running)
                (mbox-send worker-mbox best)))))
 
-(defun submit-in-state (state outbox id name input owner generation priority)
+(defun dispatch-class (kernel state class)
+  "Dispatch queued requests of CLASS in KERNEL and STATE."
+  (if (eq class :reactor)
+      (dispatch-reactor kernel state)
+      (dispatch-worker-class state class)))
+
+(defun submit-in-state (kernel state outbox id name input owner generation priority)
   "Evaluate admission for request ID in STATE and enqueue or dispatch it."
   (let* ((job (gethash name *jobs*))
          (requests (scheduler-state-requests state))
@@ -429,7 +478,7 @@ A VALUE that cannot be sent, or is too long, fails the request instead."
           (setf (gethash 'peak-queued (scheduler-state-counts state))
                 (max (gethash 'peak-queued (scheduler-state-counts state) 0)
                      (state-queued-count state)))
-          (dispatch-class state class)))))
+          (dispatch-class kernel state class)))))
 
 (defun snapshot-stats (kernel state)
   "Build the stats plist from KERNEL and single-owner STATE."
@@ -438,6 +487,7 @@ A VALUE that cannot be sent, or is too long, fails the request instead."
     (flet ((count-of (what) (gethash what counts 0)))
       (list :requests (hash-table-count (scheduler-state-requests state))
             :queued (state-queued-count state)
+            :reactor-active (scheduler-state-reactor-active state)
             :accepted (count-of 'accepted)
             :rejected (count-of 'rejected)
             :success (count-of 'success)
@@ -451,7 +501,7 @@ A VALUE that cannot be sent, or is too long, fails the request instead."
             :uptime-milliseconds (floor (* (- (get-internal-real-time) (kernel-started kernel)) 1000)
                                         internal-time-units-per-second)))))
 
-(defun initiate-shutdown (state outbox gate)
+(defun initiate-shutdown (kernel state outbox gate)
   "Transition STATE into closing mode, cancelling queued and running requests."
   (setf (scheduler-state-closing state) t
         (scheduler-state-shutdown-gate state) gate)
@@ -466,7 +516,10 @@ A VALUE that cannot be sent, or is too long, fails the request instead."
     (mbox-send worker-mbox :stop)
     (decf (scheduler-state-live-workers state)))
   (setf (scheduler-state-idle-cpu state) '()
-        (scheduler-state-idle-io state) '()))
+        (scheduler-state-idle-io state) '())
+  (let ((reactor (kernel-reactor kernel)))
+    (when reactor
+      (funcall (reactor-handle-stop-fn reactor)))))
 
 (defun scheduler-step (kernel state event)
   "Process one CSP control EVENT in `P_scheduler'."
@@ -480,13 +533,20 @@ A VALUE that cannot be sent, or is too long, fails the request instead."
                (decf (scheduler-state-live-workers state)))
              (progn
                (push-idle-worker state class worker-mbox)
-               (dispatch-class state class)))))
+               (dispatch-worker-class state class)))))
       (:settled
        (destructuring-bind (request status value) (rest event)
          (settle-request state outbox request status value)))
+      (:reactor-settled
+       (destructuring-bind (request status value) (rest event)
+         (decf (scheduler-state-reactor-active state))
+         (settle-request state outbox request status value)
+         (dispatch-reactor kernel state)))
+      (:reactor-stopped
+       (setf (scheduler-state-reactor-live state) nil))
       (:submit
        (destructuring-bind (id name input owner generation priority) (rest event)
-         (submit-in-state state outbox id name input owner generation priority)))
+         (submit-in-state kernel state outbox id name input owner generation priority)))
       (:cancel
        (let ((request (gethash (second event) (scheduler-state-requests state))))
          (when request
@@ -509,16 +569,17 @@ A VALUE that cannot be sent, or is too long, fails the request instead."
       (:ping
        (credit-sink-put-control outbox (message-string (list* 'pong (second event)))))
       (:shutdown
-       (initiate-shutdown state outbox (second event))))))
+       (initiate-shutdown kernel state outbox (second event))))))
 
-(defun scheduler-loop (kernel total-workers)
+(defun scheduler-loop (kernel total-workers reactor-live reactor-limit)
   "Sequential coordinator process `P_scheduler'."
-  (let ((state (make-scheduler-state total-workers))
+  (let ((state (make-scheduler-state total-workers reactor-live reactor-limit))
         (control (kernel-control kernel)))
     (loop
       (when (and (scheduler-state-closing state)
                  (zerop (hash-table-count (scheduler-state-requests state)))
-                 (<= (scheduler-state-live-workers state) 0))
+                 (<= (scheduler-state-live-workers state) 0)
+                 (not (scheduler-state-reactor-live state)))
         (dolist (event (mbox-drain control))
           (scheduler-step kernel state event))
         (setf (kernel-final-stats kernel) (snapshot-stats kernel state))
@@ -564,14 +625,16 @@ request on its private mailbox, executes it, and posts `:settled'."
         while messages
         do (funcall sink messages)))
 
-(defun start-kernel (sink &key (cpu-workers 2) (io-workers 4) (subworkers 3))
+(defun start-kernel (sink &key (cpu-workers 2) (io-workers 4) (subworkers 3) reactor-slots)
   "Start a CSP kernel process network and return its handle.
-CPU-WORKERS, IO-WORKERS and SUBWORKERS bound the persistent thread pools."
+CPU-WORKERS, IO-WORKERS, SUBWORKERS and REACTOR-SLOTS bound the concurrency pools."
   (let* ((control (make-mbox :name "lispm-kernel control"))
          (outbox (make-credit-sink :limit *outbox-limit*))
          (wg (make-work-group :workers subworkers :name "lispm-kernel subworker"))
          (total (+ cpu-workers io-workers))
          (kernel (make-kernel control outbox wg)))
+    (when *reactor-starter*
+      (setf (kernel-reactor kernel) (funcall *reactor-starter* kernel)))
     (setf (kernel-writer kernel)
           (sb-thread:make-thread #'write-loop
                                  :name "lispm-kernel writer"
@@ -579,7 +642,9 @@ CPU-WORKERS, IO-WORKERS and SUBWORKERS bound the persistent thread pools."
           (kernel-scheduler kernel)
           (sb-thread:make-thread #'scheduler-loop
                                  :name "lispm-kernel scheduler"
-                                 :arguments (list kernel total)))
+                                 :arguments (list kernel total
+                                                  (and (kernel-reactor kernel) t)
+                                                  reactor-slots)))
     (flet ((spawn-pool (class count)
              (loop for index from 1 to count
                    collect (sb-thread:make-thread
@@ -603,8 +668,8 @@ CPU-WORKERS, IO-WORKERS and SUBWORKERS bound the persistent thread pools."
         do (sb-thread:thread-yield)))
 
 (defun stop-kernel (kernel &key (timeout 10))
-  "Close KERNEL cleanly: cancel active work, join scheduler, workers,
-subworkers and writer within TIMEOUT seconds."
+  "Close KERNEL cleanly: cancel active work, join scheduler, reactor,
+workers, subworkers and writer within TIMEOUT seconds."
   (when (cancel! (kernel-closed kernel))
     (close-control-channel kernel)
     (let ((gate (sb-concurrency:make-gate :name "kernel-shutdown" :open nil)))
@@ -612,6 +677,9 @@ subworkers and writer within TIMEOUT seconds."
       (sb-concurrency:wait-on-gate gate :timeout timeout)
       (dolist (worker (kernel-workers kernel))
         (sb-thread:join-thread worker :default nil :timeout timeout))
+      (let ((reactor (kernel-reactor kernel)))
+        (when (and reactor (reactor-handle-thread reactor))
+          (sb-thread:join-thread (reactor-handle-thread reactor) :default nil :timeout timeout)))
       (sb-thread:join-thread (kernel-scheduler kernel) :default nil :timeout timeout)
       (stop-work-group (kernel-subworkers kernel) :timeout timeout)
       (credit-sink-close (kernel-outbox kernel))

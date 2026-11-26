@@ -65,7 +65,44 @@ Nil lets it run for ever."
   "Function returning the runtime whose kernel runs programs, or nil for none.")
 
 (defconst lispm-kernel-exec--owner 4
-  "The owner of the kernel's requests for programs, after package.el's.")
+  "Fallback owner ID when no agent or session owner is supplied.")
+
+(defconst lispm-kernel-exec--agent-owner-base 1000
+  "Starting numeric kernel owner ID allocated for named agents or sessions.")
+
+(defvar lispm-kernel-exec--owners (make-hash-table :test #'equal)
+  "Map from named agent or session owner keys to integer kernel owner IDs.")
+
+(defvar lispm-kernel-exec--next-owner lispm-kernel-exec--agent-owner-base
+  "Next unassigned integer kernel owner ID for named owners.")
+
+(defvar lispm-kernel-exec-owner nil
+  "Dynamic owner key or integer used when `:owner' is omitted.")
+
+(defun lispm-kernel-exec-owner-id (&optional owner)
+  "Return the integer kernel owner ID for OWNER, falling back to default.
+OWNER defaults to `lispm-kernel-exec-owner'.  Integers pass through
+unchanged, named keys allocate a stable ID starting from
+`lispm-kernel-exec--agent-owner-base', and nil uses the shared default."
+  (let ((key (or owner lispm-kernel-exec-owner)))
+    (cond ((null key) lispm-kernel-exec--owner)
+          ((integerp key) key)
+          (t (or (gethash key lispm-kernel-exec--owners)
+                 (let ((id lispm-kernel-exec--next-owner))
+                   (cl-incf lispm-kernel-exec--next-owner)
+                   (puthash key id lispm-kernel-exec--owners)
+                   id))))))
+
+(defun lispm-kernel-exec-release-owner (owner)
+  "Release any cached kernel owner ID mapping associated with OWNER."
+  (when (and owner (not (integerp owner)))
+    (remhash owner lispm-kernel-exec--owners)))
+
+(defun lispm-kernel-exec--strip-owner (plist)
+  "Return a fresh copy of PLIST without any `:owner' entry."
+  (cl-loop for (key val) on plist by #'cddr
+           unless (eq key :owner)
+           append (list key val)))
 
 (defun lispm-kernel-exec--sessions-runtime (&optional directory)
   "Return the agents' kernel for DIRECTORY in `lispm-kernel-sessions-mode'."
@@ -206,12 +243,13 @@ CALLBACK, ARGS, INPUT, TIMEOUT, ON-OUTPUT and COMBINE-ERROR are as
                                 output ""))))
 
 (cl-defun lispm-kernel-exec--submit (program args callback fallback
-                                     &key input timeout on-output combine-error)
+                                     &key input timeout on-output combine-error owner)
   "Submit PROGRAM with ARGS to the kernel and invoke CALLBACK when it ends.
 Return a zero-argument cancellation function when accepted, or nil when no
 eligible kernel runs or PROGRAM is missing.  INPUT, TIMEOUT, ON-OUTPUT and
 COMBINE-ERROR configure standard input, time limit and streaming output.
-When rejected for capacity, delegate to FALLBACK."
+OWNER identifies the submitting agent or session for admission quota
+isolation.  When rejected for capacity, delegate to FALLBACK."
   (let* ((directory (expand-file-name default-directory))
          (remote (file-remote-p directory))
          (runtime (lispm-kernel-exec--runtime :exec directory))
@@ -252,7 +290,7 @@ When rejected for capacity, delegate to FALLBACK."
                            :stdin input
                            :timeout effective-timeout
                            :combine-error (and combine-error t))
-                     :owner lispm-kernel-exec--owner
+                     :owner (lispm-kernel-exec-owner-id owner)
                      ;; The kernel stops the program first, and says so.
                      :timeout (and effective-timeout (+ effective-timeout 10))
                      :on-result
@@ -281,7 +319,7 @@ When rejected for capacity, delegate to FALLBACK."
           (error nil))))))
 
 ;;;###autoload
-(cl-defun lispm-kernel-exec (program args callback &key input timeout on-output combine-error)
+(cl-defun lispm-kernel-exec (program args callback &key input timeout on-output combine-error owner)
   "Run PROGRAM with ARGS in the kernel, then call CALLBACK with how it went.
 CALLBACK gets the exit code, an integer, or a string saying why PROGRAM
 did not run or exit, then what it printed to its standard output and its
@@ -289,7 +327,8 @@ standard error, strings read as UTF-8; it is called later, never before
 this returns.  PROGRAM is found in variable `exec-path' and runs in
 `default-directory' with `process-environment', reading INPUT, a string,
 when given, else nothing.  ON-OUTPUT receives each stdout chunk as it
-arrives, and COMBINE-ERROR merges stderr into stdout.  ARGS are strings.
+arrives, COMBINE-ERROR merges stderr into stdout, and OWNER scopes
+admission quotas per agent or session.  ARGS are strings.
 Where no kernel knowing the `exec' job runs, see
 `lispm-kernel-exec-runtime-function', or PROGRAM or `default-directory'
 is not on this computer, Emacs runs it via `lispm-kernel-exec-locally'.
@@ -297,7 +336,8 @@ The kernel stops a program running past TIMEOUT (by default
 `lispm-kernel-exec-timeout')."
   (unless (lispm-kernel-exec--submit program args callback #'lispm-kernel-exec-locally
                                      :input input :timeout timeout
-                                     :on-output on-output :combine-error combine-error)
+                                     :on-output on-output :combine-error combine-error
+                                     :owner owner)
     (lispm-kernel-exec-locally program args callback
                                :input input :timeout timeout
                                :on-output on-output :combine-error combine-error))
@@ -305,14 +345,14 @@ The kernel stops a program running past TIMEOUT (by default
 
 ;;;; HTTP streaming and parallel file search in the kernel
 
-(cl-defun lispm-kernel-http-stream (url headers body on-chunk on-finish &key curl fallback)
+(cl-defun lispm-kernel-http-stream (url headers body on-chunk on-finish &key curl fallback owner)
   "POST BODY to URL with HEADERS in the kernel's `http-stream' job.
 ON-CHUNK is called with each UTF-8 text chunk as it arrives; ON-FINISH
 is called once at the end with the complete output (or stderr if output
-is empty).  When the kernel rejects the request for capacity and
-FALLBACK is given, call FALLBACK with no arguments.  Return a
-zero-argument cancellation function when the kernel took the request, or
-nil when it cannot."
+is empty).  OWNER scopes kernel admission quotas per agent or session.
+When the kernel rejects the request for capacity and FALLBACK is given,
+call FALLBACK with no arguments.  Return a zero-argument cancellation
+function when the kernel took the request, or nil when it cannot."
   (when-let* ((runtime (lispm-kernel-exec--runtime :http-stream)))
     (let ((chunks nil)
           (aborted nil)
@@ -330,7 +370,7 @@ nil when it cannot."
                                (if (file-remote-p default-directory)
                                    temporary-file-directory
                                  (expand-file-name default-directory))))
-                   :owner lispm-kernel-exec--owner
+                   :owner (lispm-kernel-exec-owner-id owner)
                    :timeout 920
                    :on-result
                    (lambda (kind value)
@@ -380,10 +420,11 @@ nil when it cannot."
 
 (cl-defun lispm-kernel-search-files (files pattern case-fold callback
                                      &key glob glob-dir open-files
-                                     max-file-size max-matches)
+                                     max-file-size max-matches owner)
   "Search FILES for PATTERN in the kernel's `search-files' job.
 When CASE-FOLD is non-nil, match case-insensitively.  GLOB, GLOB-DIR,
 OPEN-FILES, MAX-FILE-SIZE and MAX-MATCHES filter and bound the scan.
+OWNER identifies the agent or session for admission quota isolation.
 Call CALLBACK with (:items ITEMS :large LARGE) on success, or (:error WHY)
 if the job fails or is rejected.  Return a zero-argument cancellation
 function when the kernel took the request, or nil when it cannot."
@@ -411,7 +452,7 @@ function when the kernel took the request, or nil when it cannot."
                              :open-files local-open
                              :max-file-size (or max-file-size 1048576)
                              :max-matches (or max-matches 200))
-                       :owner lispm-kernel-exec--owner
+                       :owner (lispm-kernel-exec-owner-id owner)
                        :timeout 120
                        :on-result
                        (lambda (kind value)
@@ -431,7 +472,7 @@ function when the kernel took the request, or nil when it cannot."
 (defun lispm-kernel-exec--around (original program args callback &rest keys)
   "Run PROGRAM with ARGS in the kernel, else call ORIGINAL with CALLBACK and KEYS."
   (or (apply #'lispm-kernel-exec--submit program args callback original keys)
-      (apply original program args callback keys)))
+      (apply original program args callback (lispm-kernel-exec--strip-owner keys))))
 
 (defun lispm-kernel-exec--hook ()
   "Advise `lispm-exec-function' while the mode is on and it is there."
