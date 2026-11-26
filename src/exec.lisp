@@ -315,7 +315,8 @@ Return (values OPEN-P NEXT-OFFSET), closing STREAM on completion or EPIPE."
 
 (defstruct (exec-spec (:constructor make-exec-spec
                        (&key program args cwd env env-inherit stdin timeout
-                             search combine-error cleanup-path))
+                             search combine-error cleanup-path
+                             chunk-transform finish-transform))
                       (:copier nil))
   "Validated process launch specification executed by `P_reactor'."
   (program "" :type string :read-only t)
@@ -327,7 +328,9 @@ Return (values OPEN-P NEXT-OFFSET), closing STREAM on completion or EPIPE."
   (timeout nil :type (or null (integer 1 86400)) :read-only t)
   (search nil :type boolean :read-only t)
   (combine-error nil :type boolean :read-only t)
-  (cleanup-path nil :type (or null string) :read-only t))
+  (cleanup-path nil :type (or null string) :read-only t)
+  (chunk-transform nil :type (or null function) :read-only t)
+  (finish-transform nil :type (or null function) :read-only t))
 
 (define-job (exec :class :reactor) (input)
   "Validate INPUT for running PROGRAM and return an `exec-spec' for `P_reactor'."
@@ -387,8 +390,8 @@ Return (values OPEN-P NEXT-OFFSET), closing STREAM on completion or EPIPE."
             (handler-case (sb-posix:close fd) (sb-posix:syscall-error () nil))
             (handler-case (sb-posix:unlink path) (sb-posix:syscall-error () nil))))))))
 
-(define-job (http-stream :class :reactor) (input)
-  "Validate INPUT and return an `exec-spec' streaming URL via curl in `P_reactor'."
+(defun make-http-stream-spec (input &key chunk-transform finish-transform)
+  "Validate HTTP request INPUT and return an `exec-spec' with optional transforms."
   (destructuring-bind (&key url headers (body "") (curl "curl")
                             (connect-timeout 30) (speed-time 600) (max-time 900) env)
       input
@@ -419,4 +422,10 @@ Return (values OPEN-P NEXT-OFFSET), closing STREAM on completion or EPIPE."
        :stdin header-config
        :timeout (+ max-time 15)
        :search (not (and (plusp (length curl)) (char= (char curl 0) #\/)))
-       :cleanup-path file))))
+       :cleanup-path file
+       :chunk-transform chunk-transform
+       :finish-transform finish-transform))))
+
+(define-job (http-stream :class :reactor) (input)
+  "Validate INPUT and return an `exec-spec' streaming URL via curl in `P_reactor'."
+  (make-http-stream-spec input))

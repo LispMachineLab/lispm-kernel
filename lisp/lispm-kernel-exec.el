@@ -467,6 +467,124 @@ function when the kernel took the request, or nil when it cannot."
                   (lispm-kernel-cancel runtime id)))
             (error nil)))))))
 
+(defun lispm-kernel-exec--delta-kind (kw)
+  "Convert wire keyword KW (`:text', `:thinking', `:tool', etc.) to symbol."
+  (pcase kw
+    (:text 'text)
+    (:thinking 'thinking)
+    (:tool 'tool)
+    (:tool-input 'tool-input)
+    (_ (if (keywordp kw) (intern (substring (symbol-name kw) 1)) kw))))
+
+(cl-defun lispm-kernel-llm-stream (dialect url headers body on-delta on-done
+                                   &key curl coalesce fallback owner)
+  "POST BODY to URL in the kernel's `llm-stream' job for DIALECT.
+ON-DELTA receives (KIND VALUE) with KIND one of `text', `thinking', `tool',
+or `tool-input'.  ON-DONE receives the canonical kernel result plist once.
+COALESCE defaults to t.  FALLBACK and OWNER behave as in
+`lispm-kernel-http-stream'.  Return a cancellation function or nil."
+  (when-let* ((runtime (lispm-kernel-exec--runtime :llm-stream)))
+    (let ((aborted nil)
+          (fallback-proc nil)
+          id)
+      (condition-case nil
+          (progn
+            (setq id
+                  (lispm-kernel-submit
+                   runtime 'llm-stream
+                   (list :dialect (if (eq dialect 'openai) :openai :anthropic)
+                         :url url
+                         :headers headers
+                         :body body
+                         :curl (or (and curl (executable-find curl)) curl "curl")
+                         :speed-time 600
+                         :coalesce (if (null coalesce) nil t)
+                         :env (lispm-kernel-exec--environment
+                               (if (file-remote-p default-directory)
+                                   temporary-file-directory
+                                 (expand-file-name default-directory))))
+                   :owner (lispm-kernel-exec-owner-id owner)
+                   :timeout 920
+                   :on-result
+                   (lambda (kind value)
+                     (unless aborted
+                       (pcase kind
+                         ('chunk
+                          (when (and on-delta (consp value) (eq (car value) :delta))
+                            (lispm-kernel-exec--call
+                             on-delta
+                             (lispm-kernel-exec--delta-kind (nth 1 value))
+                             (nth 2 value))))
+                         ((and 'rejected (guard fallback))
+                          (setq fallback-proc (funcall fallback)))
+                         ('success
+                          (lispm-kernel-exec--call on-done value))
+                         ('cancelled nil)
+                         (_
+                          (lispm-kernel-exec--call
+                           on-done
+                           (list :ok nil :status 0 :type "network_error"
+                                 :message (format "llm-stream %s: %s" kind (or value ""))))))))))
+            (lambda ()
+              (setq aborted t)
+              (if (processp fallback-proc)
+                  (progn
+                    (process-put fallback-proc 'lispm-aborted t)
+                    (ignore-errors (delete-process fallback-proc)))
+                (lispm-kernel-cancel runtime id))))
+        (error nil)))))
+
+;;;; Agent control-plane client helpers
+
+(defun lispm-kernel-agent-available-p (&optional runtime)
+  "Return non-nil when RUNTIME (or active exec runtime) supports `:agent-actors'."
+  (let ((rt (or runtime (lispm-kernel-exec--runtime :exec))))
+    (and (lispm-kernel-feature-p rt :agent-actors) rt)))
+
+(defun lispm-kernel-agent-start (runtime session config)
+  "Initialize or update agent SESSION in RUNTIME with CONFIG plist."
+  (lispm-kernel-send-control runtime `(agent-start ,session ,config)))
+
+(defun lispm-kernel-agent-turn (runtime session input)
+  "Start a turn for SESSION in RUNTIME with INPUT plist."
+  (lispm-kernel-send-control runtime `(agent-turn ,session ,input)))
+
+(defun lispm-kernel-agent-cancel (runtime session)
+  "Cancel active work of agent SESSION in RUNTIME."
+  (lispm-kernel-send-control runtime `(agent-cancel ,session)))
+
+(defun lispm-kernel-agent-effect-reply (runtime session effect-id status result)
+  "Send Emacs effect reply for SESSION's EFFECT-ID to RUNTIME."
+  (lispm-kernel-send-control runtime `(agent-effect-reply ,session ,effect-id ,status ,result)))
+
+(defun lispm-kernel-agent-approval-decision (runtime session call-id decision &optional reason)
+  "Send approval DECISION for SESSION's CALL-ID with optional REASON to RUNTIME."
+  (lispm-kernel-send-control
+   runtime
+   (if reason
+       `(agent-approval-decision ,session ,call-id ,decision :reason ,reason)
+     `(agent-approval-decision ,session ,call-id ,decision))))
+
+(defun lispm-kernel-agent-viewport-subscribe (runtime session mode)
+  "Set RUNTIME viewport subscription MODE (`:visible' or `:hidden') for SESSION."
+  (lispm-kernel-send-control runtime `(agent-viewport-subscribe ,session ,mode)))
+
+(defun lispm-kernel-agent-resync (runtime session &optional since-seq)
+  "Request snapshot and events since SINCE-SEQ for SESSION from RUNTIME."
+  (lispm-kernel-send-control
+   runtime
+   (if since-seq
+       `(agent-resync ,session :since-seq ,since-seq)
+     `(agent-resync ,session))))
+
+(defun lispm-kernel-agent-list (runtime)
+  "Request a summary list of live agent sessions in RUNTIME."
+  (lispm-kernel-send-control runtime '(agent-list)))
+
+(defun lispm-kernel-agent-stop (runtime session)
+  "Stop and remove agent SESSION from RUNTIME."
+  (lispm-kernel-send-control runtime `(agent-stop ,session)))
+
 ;;;; lispm-agent's programs
 
 (defun lispm-kernel-exec--around (original program args callback &rest keys)

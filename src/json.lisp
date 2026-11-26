@@ -50,9 +50,11 @@
 
 (declaim (type fixnum *max-depth*)
          (ftype (function (t string) t) json-get)
-         (ftype (function (string &key (:start fixnum) (:end fixnum) (:trailing t))
+         (ftype (function (string &key (:start fixnum) (:end fixnum)
+                                 (:trailing t) (:preserve-literals t))
                           (values t &optional fixnum))
-                parse-json))
+                parse-json)
+         (ftype (function (t &optional (or null stream)) (or null string)) encode-json))
 
 (defun json-get (object name)
   "Return the value of the first member NAME of OBJECT, or nil.
@@ -215,16 +217,20 @@ to infinity as a double."
           (json-fail position "number out of range"))
         (values (make-json-number text) position)))))
 
-(defun parse-json (string &key (start 0) (end (length string)) trailing)
+(defun parse-json (string &key (start 0) (end (length string)) trailing preserve-literals)
   "Return the JSON value in STRING between START and END.
 Whitespace may surround it; other text after it is an error unless
 TRAILING, when the position after the value is returned as a second
-value.  Signal `json-error' for anything that is not JSON, or that Emacs
-refuses."
+value.  When PRESERVE-LITERALS is non-nil, JSON false decodes as
+`:false', null as `:null', and arrays as simple vectors so encoding
+round-trips losslessly.  Signal `json-error' for anything that is not
+JSON, or that Emacs refuses."
   (declare (type string string) (type fixnum start end))
   (let ((string (coerce string '(simple-array character (*))))
         (position start)
-        (max-depth *max-depth*))
+        (max-depth *max-depth*)
+        (false-val (if preserve-literals :false nil))
+        (null-val (if preserve-literals :null nil)))
     (declare (type (simple-array character (*)) string)
              (type fixnum position max-depth)
              (optimize (speed 3) (safety 1)))
@@ -257,8 +263,8 @@ refuses."
                    (#\[ (incf position) (array (the fixnum (1+ depth))))
                    (#\" (incf position) (read-str))
                    (#\t (literal "true" t))
-                   (#\f (literal "false" nil))
-                   (#\n (literal "null" nil))
+                   (#\f (literal "false" false-val))
+                   (#\n (literal "null" null-val))
                    (t (if (or (char= character #\-) (ascii-digit-p character))
                           (multiple-value-bind (num next) (parse-json-number string position end)
                             (setf position next)
@@ -269,14 +275,20 @@ refuses."
                (when (> depth max-depth) (fail "nested too deeply"))
                (skip-whitespace)
                (if (char= (peek) #\])
-                   (progn (incf position) '())
+                   (progn
+                     (incf position)
+                     (if preserve-literals #() '()))
                    (let ((items '()))
                      (loop
                        (push (value depth) items)
                        (skip-whitespace)
                        (case (peek)
                          (#\, (incf position))
-                         (#\] (incf position) (return (nreverse items)))
+                         (#\] (incf position)
+                              (let ((list (nreverse items)))
+                                (return (if preserve-literals
+                                            (coerce list 'simple-vector)
+                                            list))))
                          (t (fail "expected , or ]")))))))
              (object (depth)
                (declare (type fixnum depth))
@@ -306,3 +318,59 @@ refuses."
               (skip-whitespace)
               (unless (= position end) (fail "text after the value"))
               result))))))
+
+(defun write-json-string (string stream)
+  "Write STRING as an RFC 8259 JSON string to STREAM."
+  (write-char #\" stream)
+  (loop for char across string
+        for code = (char-code char)
+        do (cond ((char= char #\") (write-string "\\\"" stream))
+                 ((char= char #\\) (write-string "\\\\" stream))
+                 ((= code 8) (write-string "\\b" stream))
+                 ((= code 12) (write-string "\\f" stream))
+                 ((char= char #\Newline) (write-string "\\n" stream))
+                 ((char= char #\Return) (write-string "\\r" stream))
+                 ((char= char #\Tab) (write-string "\\t" stream))
+                 ((< code 32) (format stream "\\u~4,'0X" code))
+                 (t (write-char char stream))))
+  (write-char #\" stream))
+
+(defun encode-json (value &optional stream)
+  "Write VALUE as strict RFC 8259 JSON to STREAM, or return a fresh string."
+  (if (null stream)
+      (with-output-to-string (out)
+        (encode-json value out))
+      (progn
+        (cond ((eq value t) (write-string "true" stream))
+              ((eq value :false) (write-string "false" stream))
+              ((or (null value) (eq value :null)) (write-string "null" stream))
+              ((eq value :empty-array) (write-string "[]" stream))
+              ((eq value :empty-object) (write-string "{}" stream))
+              ((stringp value) (write-json-string value stream))
+              ((integerp value) (princ value stream))
+              ((json-number-p value) (write-string (json-number-text value) stream))
+              ((realp value)
+               (let ((*read-default-float-format* 'double-float))
+                 (format stream "~F" (coerce value 'double-float))))
+              ((json-object-p value)
+               (write-char #\{ stream)
+               (loop for (pair . rest) on (json-object-pairs value)
+                     do (write-json-string (car pair) stream)
+                        (write-char #\: stream)
+                        (encode-json (cdr pair) stream)
+                        (when rest (write-char #\, stream)))
+               (write-char #\} stream))
+              ((vectorp value)
+               (write-char #\[ stream)
+               (loop for i below (length value)
+                     do (when (plusp i) (write-char #\, stream))
+                        (encode-json (aref value i) stream))
+               (write-char #\] stream))
+              ((consp value)
+               (write-char #\[ stream)
+               (loop for (item . rest) on value
+                     do (encode-json item stream)
+                        (when rest (write-char #\, stream)))
+               (write-char #\] stream))
+              (t (json-fail 0 (format nil "cannot encode ~S as JSON" value))))
+        nil)))

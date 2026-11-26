@@ -83,13 +83,16 @@ It is called with the runtime and returns non-nil when it took it; else a
 timer does.  It calls `lispm-kernel-dispatch' later, with
 `lispm-kernel-slice-seconds' bound to its budget.")
 
+(defvar lispm-kernel-event-functions nil
+  "Functions called with `(RUNTIME MESSAGE)' for kernel agent-plane events.")
+
 (defvar lispm-kernel--runtimes nil
   "Runtimes not yet stopped, so unloading can stop them.")
 
 (cl-defstruct (lispm-kernel-runtime (:constructor lispm-kernel--make-runtime)
                                     (:copier nil))
   "A kernel process and what Emacs keeps of its requests."
-  process stderr program host hello
+  process stderr program host hello socket-path event-handler
   (started (float-time))
   (next-id 0)
   ;; Lines received and not yet handled: INCOMING newest first, READY oldest first.
@@ -189,6 +192,47 @@ nil for this computer).  Its standard error goes to the buffer
                           :sentinel (lambda (process _event) (lispm-kernel--sentinel runtime process))))
       (push runtime lispm-kernel--runtimes)
       runtime)))
+
+(defun lispm-kernel-connect (socket-path &optional host)
+  "Connect to a persistent LispM kernel listening on Unix SOCKET-PATH.
+Return a live `lispm-kernel-runtime' speaking over that socket.  HOST,
+when given, names the TRAMP host prefix for remote path translation."
+  (unless (and (stringp socket-path) (not (string-empty-p socket-path)))
+    (signal 'lispm-kernel-state-error
+            (list (format "Invalid kernel socket path: %S" socket-path))))
+  (let ((runtime (lispm-kernel--make-runtime :program socket-path
+                                            :socket-path socket-path
+                                            :host host)))
+    (setf (lispm-kernel-runtime-process runtime)
+          (make-network-process
+           :name (format "lispm-kernel<%s>" (file-name-nondirectory socket-path))
+           :family 'local
+           :service socket-path
+           :coding 'utf-8-unix
+           :noquery t
+           :filter (lambda (_process string) (lispm-kernel--filter runtime string))
+           :sentinel (lambda (process _event) (lispm-kernel--sentinel runtime process))))
+    (push runtime lispm-kernel--runtimes)
+    runtime))
+
+(defun lispm-kernel-detach (runtime)
+  "Close Emacs's socket connection to RUNTIME without stopping its daemon.
+Active `P_agents' sessions inside the kernel stay alive for reconnect."
+  (when runtime
+    (lispm-kernel-stop runtime)))
+
+(defun lispm-kernel-quit (runtime)
+  "Ask RUNTIME's kernel daemon to shut down cleanly and close its client."
+  (when (lispm-kernel-live-p runtime)
+    (ignore-errors (lispm-kernel--send runtime '(quit))))
+  (when runtime
+    (lispm-kernel-stop runtime)))
+
+(defun lispm-kernel-feature-p (runtime feature)
+  "Return non-nil when live RUNTIME advertises capability FEATURE."
+  (and (lispm-kernel-live-p runtime)
+       (memq feature (plist-get (lispm-kernel-runtime-hello runtime) :features))
+       t))
 
 (defun lispm-kernel--stderr-filter (process string)
   "Keep the last 64 KiB of STRING printed by kernel PROCESS on standard error."
@@ -416,6 +460,17 @@ Older requests of OWNER are cancelled, and their callbacks hear nothing more."
   (when (lispm-kernel-live-p runtime)
     (lispm-kernel--send runtime '(clear-caches))))
 
+(defun lispm-kernel-send-control (runtime form)
+  "Validate and send control-plane FORM (without request id) to RUNTIME."
+  (unless (lispm-kernel-live-p runtime)
+    (signal 'lispm-kernel-state-error '("The kernel is not running")))
+  (let ((plain (lispm-kernel--plain form)))
+    (unless (lispm-kernel--wire-p plain)
+      (signal 'lispm-kernel-wire-error
+              (list (format "Control form is not wire-safe: %S" plain))))
+    (lispm-kernel--send runtime plain)
+    t))
+
 ;;;; Receiving
 
 (defun lispm-kernel--filter (runtime string)
@@ -505,6 +560,14 @@ afterwards and rescheduling any remainder.  Never re-enters itself."
     (`(,(and kind (or 'stats 'pong)) . ,arguments)
      (when-let* ((waiter (lispm-kernel--pop-waiter runtime kind)))
        (lispm-kernel--call runtime (cdr waiter) arguments)))
+    ((and message
+          (guard (memq (car message)
+                       '(turn-event editor-effect-request approval-request
+                                    agent-snapshot agent-list))))
+     (when-let* ((handler (lispm-kernel-runtime-event-handler runtime)))
+       (lispm-kernel--call runtime handler message))
+     (dolist (fn lispm-kernel-event-functions)
+       (lispm-kernel--call runtime fn runtime message)))
     (message (setf (lispm-kernel-runtime-last-error runtime) message))))
 
 (defun lispm-kernel--call (runtime function &rest arguments)
