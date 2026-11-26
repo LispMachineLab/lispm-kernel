@@ -49,6 +49,7 @@
   (state :running :type (member :running :draining :terminating))
   (deadline nil :type (or null integer))
   (kill-deadline nil :type (or null integer))
+  (killed nil :type boolean)
   (term-status 'cancelled :type symbol)
   (term-value nil)
   (stdin-stream nil)
@@ -185,13 +186,16 @@ Return `:sent', `:full', `:cancelled', or `:closed'."
                                 (return)))
                             (setf (reactor-slot-carried slot) rem)))))))))
 
-(defun slot-drain-stderr (slot scratch)
-  "Drain available octets from SLOT's stderr descriptor into its byte ring."
+(defun slot-drain-stderr (slot scratch &optional max-reads)
+  "Drain octets from SLOT's stderr into its ring, capped at MAX-READS when non-nil."
   (let ((fd (reactor-slot-error-fd slot))
-        (ring (reactor-slot-stderr-ring slot)))
+        (ring (reactor-slot-stderr-ring slot))
+        (reads 0))
     (when fd
-      (loop while (reactor-slot-errors-open slot)
-            do (let ((count (read-nonblocking fd scratch 0)))
+      (loop while (and (reactor-slot-errors-open slot)
+                       (or (null max-reads) (< reads max-reads)))
+            do (incf reads)
+               (let ((count (read-nonblocking fd scratch 0)))
                  (cond ((eq count :would-block) (return))
                        ((zerop count)
                         (setf (reactor-slot-errors-open slot) nil)
@@ -230,6 +234,7 @@ Always return nil to mark the slot removed."
            (handler-case (sb-ext:process-kill process sb-posix:sigterm :process-group)
              (serious-condition () nil))
            (setf (reactor-slot-state slot) :terminating
+                 (reactor-slot-killed slot) nil
                  (reactor-slot-kill-deadline slot)
                  (+ now (* *exec-kill-seconds* internal-time-units-per-second)))
            t)
@@ -243,14 +248,20 @@ Always return nil to mark the slot removed."
            (reactor-finish-slot reactor slot
                                 (reactor-slot-term-status slot)
                                 (reactor-slot-term-value slot)))
-          ((>= now (reactor-slot-kill-deadline slot))
+          ((and (not (reactor-slot-killed slot))
+                (reactor-slot-kill-deadline slot)
+                (>= now (reactor-slot-kill-deadline slot)))
            (handler-case (sb-ext:process-kill process sb-posix:sigkill :process-group)
              (serious-condition () nil))
-           (handler-case (sb-ext:process-wait process)
-             (serious-condition () nil))
-           (reactor-finish-slot reactor slot
-                                (reactor-slot-term-status slot)
-                                (reactor-slot-term-value slot)))
+           (setf (reactor-slot-killed slot) t
+                 (reactor-slot-kill-deadline slot) nil)
+           ;; Let `:status-hook' reap asynchronously via `SIGCHLD' rather than
+           ;; blocking `P_reactor' inside `sb-ext:process-wait'.
+           (if (not (sb-ext:process-alive-p process))
+               (reactor-finish-slot reactor slot
+                                    (reactor-slot-term-status slot)
+                                    (reactor-slot-term-value slot))
+               t))
           (t t))))
 
 (defun slot-step-draining (reactor slot)
@@ -278,7 +289,7 @@ Always return nil to mark the slot removed."
       (when (reactor-slot-output-open slot)
         (slot-drain-stdout reactor slot nil)))
     (when (reactor-slot-errors-open slot)
-      (slot-drain-stderr slot scratch))
+      (slot-drain-stderr slot scratch nil))
     (when (slot-backpressured-p slot)
       (when (slot-cancelled-p slot)
         (return-from slot-handle-exit (slot-begin-terminate reactor slot 'cancelled nil 0)))
@@ -316,7 +327,8 @@ Always return nil to mark the slot removed."
         (pump-stdin-fd (reactor-slot-stdin-fd slot)
                        (reactor-slot-stdin-octets slot)
                        (reactor-slot-stdin-pos slot)
-                       (reactor-slot-stdin-stream slot))
+                       (reactor-slot-stdin-stream slot)
+                       *reactor-reads-per-tick*)
       (setf (reactor-slot-stdin-open slot) open-p
             (reactor-slot-stdin-pos slot) next-pos)
       (unless open-p
@@ -326,13 +338,15 @@ Always return nil to mark the slot removed."
   "Advance one `:running' reactor SLOT; return t while active, nil once settled."
   (when (slot-cancelled-p slot)
     (return-from slot-step-running (slot-begin-terminate reactor slot 'cancelled nil now)))
-  (when (slot-deadline-expired-p slot now)
-    (return-from slot-step-running
-      (slot-begin-terminate
-       reactor slot 'failed
-       (format nil "~A did not finish in ~D seconds"
-               (reactor-slot-program slot) (reactor-slot-timeout slot))
-       now)))
+  (let ((process (reactor-slot-process slot)))
+    (when (and (sb-ext:process-alive-p process)
+               (slot-deadline-expired-p slot now))
+      (return-from slot-step-running
+        (slot-begin-terminate
+         reactor slot 'failed
+         (format nil "~A did not finish in ~D seconds"
+                 (reactor-slot-program slot) (reactor-slot-timeout slot))
+         now))))
   (handler-case
       (let ((was-backpressured (slot-backpressured-p slot))
             (flush-outcome (if (slot-backpressured-p slot)
@@ -347,7 +361,7 @@ Always return nil to mark the slot removed."
           (slot-drain-stdout reactor slot *reactor-reads-per-tick*))
         (when (and (reactor-slot-errors-open slot) (reactor-slot-error-ready slot))
           (setf (reactor-slot-error-ready slot) nil)
-          (slot-drain-stderr slot scratch))
+          (slot-drain-stderr slot scratch *reactor-reads-per-tick*))
         (if (sb-ext:process-alive-p (reactor-slot-process slot))
             t
             (slot-handle-exit reactor slot scratch)))
@@ -380,7 +394,7 @@ Always return nil to mark the slot removed."
     (when stdin-fd
       (set-fd-nonblocking stdin-fd)
       (multiple-value-setq (stdin-open stdin-pos)
-        (pump-stdin-fd stdin-fd stdin-octets 0 stdin-stream)))
+        (pump-stdin-fd stdin-fd stdin-octets 0 stdin-stream *reactor-reads-per-tick*)))
     (set-fd-nonblocking output-fd)
     (when error-fd
       (set-fd-nonblocking error-fd))
@@ -452,7 +466,8 @@ Always return nil to mark the slot removed."
           (handler-case
               (progn
                 (when (sb-ext:process-alive-p process)
-                  (sb-ext:process-kill process sb-posix:sigkill :process-group)
+                  (sb-ext:process-kill process sb-posix:sigkill :process-group))
+                (unless (sb-ext:process-alive-p process)
                   (sb-ext:process-wait process))
                 (sb-ext:process-close process))
             (serious-condition () nil)))
@@ -542,16 +557,21 @@ Always return nil to mark the slot removed."
 
 (defun slot-needs-immediate-step-p (slot now)
   "Return true when SLOT can advance without waiting on a kernel file descriptor."
-  (or (slot-cancelled-p slot)
-      (ecase (reactor-slot-state slot)
-        (:running
-         (or (and (not (slot-backpressured-p slot))
-                  (not (sb-ext:process-alive-p (reactor-slot-process slot))))
-             (slot-deadline-expired-p slot now)))
-        (:draining nil)
-        (:terminating
-         (or (not (sb-ext:process-alive-p (reactor-slot-process slot)))
-             (>= now (reactor-slot-kill-deadline slot)))))))
+  (ecase (reactor-slot-state slot)
+    (:running
+     (let ((process (reactor-slot-process slot)))
+       (or (slot-cancelled-p slot)
+           (and (not (slot-backpressured-p slot))
+                (not (sb-ext:process-alive-p process)))
+           (and (sb-ext:process-alive-p process)
+                (slot-deadline-expired-p slot now)))))
+    (:draining
+     (slot-cancelled-p slot))
+    (:terminating
+     (or (not (sb-ext:process-alive-p (reactor-slot-process slot)))
+         (and (not (reactor-slot-killed slot))
+              (reactor-slot-kill-deadline slot)
+              (>= now (reactor-slot-kill-deadline slot)))))))
 
 (defun compute-reactor-timeout-ms (reactor now)
   "Compute the `poll(2)' wait in ms: 0 if immediate, -1 if idle, else min deadline."
@@ -564,9 +584,14 @@ Always return nil to mark the slot removed."
                    for slot = (aref slots idx)
                    when (slot-needs-immediate-step-p slot now)
                      do (return-from compute-reactor-timeout-ms 0)
-                   do (let ((dl (if (eq (reactor-slot-state slot) :terminating)
-                                    (reactor-slot-kill-deadline slot)
-                                    (reactor-slot-deadline slot))))
+                   do (let ((dl (ecase (reactor-slot-state slot)
+                                  (:terminating
+                                   (and (not (reactor-slot-killed slot))
+                                        (reactor-slot-kill-deadline slot)))
+                                  (:running
+                                   (and (sb-ext:process-alive-p (reactor-slot-process slot))
+                                        (reactor-slot-deadline slot)))
+                                  (:draining nil))))
                         (when dl
                           (setf min-deadline (if min-deadline (min min-deadline dl) dl)))))
              (compute-poll-timeout-ms t min-deadline))))))

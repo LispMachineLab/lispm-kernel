@@ -278,15 +278,20 @@ When INHERIT is non-nil, merge ENV over the kernel's own environment."
 
 ;;;; Non-blocking stdin pump and poll timeout helper
 
-(defun pump-stdin-fd (fd octets offset stream)
+(defun pump-stdin-fd (fd octets offset stream &optional max-writes)
   "Write available slices of OCTETS from OFFSET to non-blocking FD.
+Stop after MAX-WRITES writes when non-nil so large payloads yield fairly.
 Return (values OPEN-P NEXT-OFFSET), closing STREAM on completion or EPIPE."
-  (let ((total (length octets)))
+  (let ((total (length octets))
+        (writes 0))
     (loop while (< offset total)
+          when (and max-writes (>= writes max-writes))
+            do (return-from pump-stdin-fd (values t offset))
           do (multiple-value-bind (written errno)
                  (sb-unix:unix-write fd octets offset (min 65536 (- total offset)))
                (cond (written
-                      (incf offset written))
+                      (incf offset written)
+                      (incf writes))
                      ((= errno sb-unix:eintr))
                      ((or (= errno sb-posix:eagain) (= errno sb-posix:ewouldblock))
                       (return-from pump-stdin-fd (values t offset)))

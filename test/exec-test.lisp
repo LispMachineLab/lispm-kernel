@@ -373,3 +373,48 @@ b
                (loop for id from 1 to 4
                      do (is (equal `(:done ,id :cancelled nil) (done-of id msgs))))))
         (ignore-errors (lispm-kernel:stop-kernel kernel :timeout 1))))))
+
+(deftest exec-reactor-stderr-fairness-under-flood ()
+  (with-kernel (kernel collector :io-workers 2)
+    (let ((started (get-internal-real-time)))
+      (send kernel
+            (shell-owned 1 501 "while true; do printf 'stderr-flood-0123456789\\n' >&2; done")
+            (shell-owned 2 502 "sleep 0.1; printf 'sibling-ok'"))
+      (let ((sibling-msgs (answered collector 2)))
+        (is (equal '(:done 2 :success (:exit 0 :stderr "")) (done-of 2 sibling-msgs)))
+        (is (equal "sibling-ok" (output-of 2 sibling-msgs)))
+        (is (< (- (get-internal-real-time) started) (* 3 internal-time-units-per-second))))
+      (send kernel "(cancel 1)")
+      (is (equal '(:done 1 :cancelled nil) (done-of 1 (answered collector 1))))
+      (is (= 0 (getf (lispm-kernel:kernel-stats kernel) :reactor-active))))))
+
+(deftest exec-reactor-exited-backpressured-slot-not-timed-out ()
+  (with-globals ((lispm-kernel::*exec-read-octets* 128)
+                 (lispm-kernel::*exec-stream-credit* 256)
+                 (lispm-kernel::*outbox-limit* 65536))
+    (with-kernel (kernel collector :io-workers 2)
+      (setf (collector-stalled collector) t)
+      (send kernel
+            (shell-owned 1 503 "head -c 8192 /dev/zero | tr '\\0' z" :timeout 1))
+      ;; Child exits quickly (< 50ms) with buffered stdout held by backpressure.
+      ;; Waiting past the 1s timeout must not falsely turn an exited slot into a timeout.
+      (sleep 1.3)
+      (setf (collector-stalled collector) nil)
+      (let* ((messages (answered collector 1))
+             (output (output-of 1 messages)))
+        (is (equal '(:done 1 :success (:exit 0 :stderr "")) (done-of 1 messages)))
+        (is (= 8192 (length output)))
+        (is (every (lambda (ch) (char= ch #\z)) output))))))
+
+(deftest exec-reactor-large-stdin-yields-fairly ()
+  (let* ((size (* 512 1024))
+         (payload (make-string size :initial-element #\k)))
+    (with-kernel (kernel collector :io-workers 2)
+      (send kernel
+            (exec-owned 1 504 "/bin/cat" '() :stdin payload)
+            (shell-owned 2 505 "printf 'fast-sibling'"))
+      (let ((messages (answered collector 1 2)))
+        (is (equal '(:done 2 :success (:exit 0 :stderr "")) (done-of 2 messages)))
+        (is (equal "fast-sibling" (output-of 2 messages)))
+        (is (equal '(:done 1 :success (:exit 0 :stderr "")) (done-of 1 messages)))
+        (is (= size (length (output-of 1 messages))))))))
