@@ -17,14 +17,14 @@
 ;; along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 ;;; The program reads Emacs's messages from its standard input, one per
-;;; line, and writes its own to its standard output.  It says hello
-;;; first:
+;;; line, and writes its own to its standard output (or Unix domain
+;;; socket when started with `--socket').  It says hello first:
 ;;;
-;;;   (hello :protocol 1 :pid PID :lisp "SBCL 2.6.9" :workers (:cpu 2 :io 4) ...)
+;;;   (hello :protocol 1 :pid PID :epoch EPOCH :lisp "SBCL 2.6.9" ...)
 ;;;
-;;; It ends when its standard input does, when Emacs closes the pipe or
-;;; goes away, or when Emacs sends (quit), without waiting for the work
-;;; it was doing.
+;;; Over stdio it ends when its standard input does or on `(quit)'.
+;;; Over `--socket' client EOF detaches Emacs while `P_agents' stays
+;;; alive until `(quit)' is received.
 
 (in-package #:lispm-kernel)
 
@@ -86,10 +86,12 @@ Return `:version' when `--version' is passed, or a keyword plist of options."
                           (parse-bounded-integer flag (pop rest) min max)))))))
     options))
 
-(defun hello ()
+(defun hello (&optional kernel)
+  "Construct the initial `(hello ...)' greeting form for optional KERNEL."
   (list 'hello
         :protocol +protocol+
         :pid (sb-posix:getpid)
+        :epoch (if kernel (kernel-epoch kernel) (next-kernel-epoch))
         :lisp (format nil "~A ~A" (lisp-implementation-type) (lisp-implementation-version))
         :machine (string-downcase (machine-type))
         :workers (list :cpu *cpu-workers* :io *io-workers* :reactor *max-reactor-slots*)
@@ -104,14 +106,14 @@ Return `:version' when `--version' is passed, or a keyword plist of options."
 (declaim (ftype (function () *) main))
 
 (defun stream-sink (stream)
-  "Return a sink writing messages to STREAM, one per line.  When Emacs no
-longer reads them, the kernel stops its work and ends."
+  "Return a sink writing messages to STREAM, one per line."
   (lambda (messages)
     (handler-case
         (progn
           (dolist (message messages)
-            (write-string message stream)
-            (write-char #\Newline stream))
+            (when (plusp (length message))
+              (write-string message stream)
+              (write-char #\Newline stream)))
           (finish-output stream))
       (stream-error ()
         (handler-case
@@ -120,88 +122,160 @@ longer reads them, the kernel stops its work and ends."
           (serious-condition () nil))
         (sb-ext:exit :code 0 :abort t)))))
 
-;;;; Reconnectable Unix domain socket daemon transport
+;;;; Reconnectable Unix domain socket daemon transport (single-owner P_writer)
 
-(defstruct (socket-writer-target (:constructor make-socket-writer-target ()) (:copier nil))
-  "Lock-free CAS holder for the currently connected client socket stream."
+(defstruct (socket-writer (:constructor make-socket-writer ()) (:copier nil))
+  "CSP command channel giving `P_writer' exclusive ownership of client write streams."
+  (commands (sb-concurrency:make-queue :name "socket-writer-commands")
+   :type sb-concurrency:queue :read-only t)
+  ;; Owned and mutated strictly by `P_writer'.
   (stream nil))
 
-(defun socket-sink (target)
-  "Return a `P_writer' sink writing to TARGET's connected client, if any.
-When Emacs is detached, messages are dropped without halting active actors."
+(defun socket-writer-drain-commands (writer)
+  "Process pending `:attach' and `:detach' stream handoffs inside `P_writer'."
+  (let ((cmds (socket-writer-commands writer)))
+    (loop
+      (multiple-value-bind (cmd ok) (sb-concurrency:dequeue cmds)
+        (unless ok (return))
+        (ecase (first cmd)
+          (:attach
+           (let ((old (socket-writer-stream writer)))
+             (when old
+               (ignore-errors (close old :abort t))))
+           (setf (socket-writer-stream writer) (second cmd)))
+          (:detach
+           (let ((old (socket-writer-stream writer)))
+             (setf (socket-writer-stream writer) nil)
+             (when old
+               (ignore-errors (close old :abort t)))
+             (sb-concurrency:open-gate (second cmd)))))))))
+
+(defun socket-sink (writer)
+  "Return a `P_writer' sink owning client write streams via WRITER commands."
   (lambda (messages)
-    (let ((stream (socket-writer-target-stream target)))
+    (socket-writer-drain-commands writer)
+    (let ((stream (socket-writer-stream writer)))
       (when stream
         (handler-case
-            (progn
+            (let ((wrote nil))
               (dolist (message messages)
-                (write-string message stream)
-                (write-char #\Newline stream))
-              (finish-output stream))
-          (serious-condition ()
-            (sb-ext:compare-and-swap (socket-writer-target-stream target) stream nil)))))))
+                (when (plusp (length message))
+                  (write-string message stream)
+                  (write-char #\Newline stream)
+                  (setf wrote t)))
+              (when wrote
+                (finish-output stream)))
+          ((or stream-error sb-bsd-sockets:socket-error) ()
+            (setf (socket-writer-stream writer) nil)
+            (ignore-errors (close stream :abort t))))))))
 
 (defun unlink-socket-quietly (path)
-  "Remove Unix domain socket PATH if present, ignoring errors."
-  (ignore-errors (sb-posix:unlink path)))
+  "Remove Unix domain socket PATH if present, ignoring syscall errors."
+  (handler-case (sb-posix:unlink path)
+    (sb-posix:syscall-error () nil)))
+
+(defun socket-in-use-p (path)
+  "Return true when an active listener responds on Unix domain socket PATH."
+  (let ((probe (make-instance 'sb-bsd-sockets:local-socket :type :stream)))
+    (unwind-protect
+         (handler-case
+             (progn
+               (sb-bsd-sockets:socket-connect probe path)
+               t)
+           ((or sb-bsd-sockets:socket-error file-error sb-posix:syscall-error) () nil))
+      (ignore-errors (sb-bsd-sockets:socket-close probe)))))
+
+(defun bind-private-local-socket (server socket-path)
+  "Bind SERVER at SOCKET-PATH atomically with `0700' umask and `0600' mode."
+  (let ((old-mask (sb-posix:umask #o077)))
+    (unwind-protect
+         (sb-bsd-sockets:socket-bind server socket-path)
+      (sb-posix:umask old-mask)))
+  (sb-posix:chmod socket-path #o600)
+  (sb-bsd-sockets:socket-listen server 16))
+
+(defun serve-socket-client (kernel writer client)
+  "Serve one accepted Unix socket CLIENT using split read/write fds; return QUIT-P."
+  (let ((in-stream nil)
+        (out-stream nil)
+        (out-fd nil)
+        (handed-off nil)
+        (quit-requested nil))
+    (unwind-protect
+         (handler-case
+             (progn
+               (setf out-fd (sb-posix:dup (sb-bsd-sockets:socket-file-descriptor client))
+                     in-stream (sb-bsd-sockets:socket-make-stream
+                                client
+                                :input t :output nil
+                                :buffering :full
+                                :element-type 'character
+                                :external-format '(:utf-8 :replacement #\REPLACEMENT_CHARACTER))
+                     out-stream (sb-sys:make-fd-stream
+                                 out-fd
+                                 :output t
+                                 :buffering :full
+                                 :element-type 'character
+                                 :external-format :utf-8
+                                 :name "lispm-socket-out"))
+               (write-line (message-string (hello kernel)) out-stream)
+               (finish-output out-stream)
+               (sb-concurrency:enqueue (list :attach out-stream) (socket-writer-commands writer))
+               (setf handed-off t)
+               (loop for line = (read-line in-stream nil nil)
+                     while line
+                     when (eq (handle-line kernel line) :quit)
+                       do (setf quit-requested t)
+                          (return)))
+           ((or stream-error sb-bsd-sockets:socket-error sb-posix:syscall-error) () nil))
+      (when handed-off
+        (let ((gate (sb-concurrency:make-gate :name "sock-detach" :open nil)))
+          (sb-concurrency:enqueue (list :detach gate) (socket-writer-commands writer))
+          (credit-sink-put-control (kernel-outbox kernel) "")
+          (sb-concurrency:wait-on-gate gate :timeout 2)))
+      (when (and out-stream (not handed-off))
+        (ignore-errors (close out-stream :abort t)))
+      (when (and out-fd (not out-stream) (not handed-off))
+        (ignore-errors (sb-posix:close out-fd)))
+      (when in-stream
+        (ignore-errors (close in-stream :abort t)))
+      (ignore-errors (sb-bsd-sockets:socket-close client)))
+    quit-requested))
 
 (defun run-socket-server (socket-path &key cpu-workers io-workers subworkers reactor-slots on-ready)
   "Serve the CSP kernel over Unix domain socket SOCKET-PATH across reconnects.
 Client EOF detaches Emacs while keeping all running `P_agents' alive; `(quit)'
 shuts down both kernel and socket listener.  ON-READY, when non-nil, is called
 with SOCKET-PATH once bound and listening."
+  (when (socket-in-use-p socket-path)
+    (message-error "Socket ~A is already in use by an active kernel" socket-path))
   (unlink-socket-quietly socket-path)
   (let* ((server (make-instance 'sb-bsd-sockets:local-socket :type :stream))
-         (target (make-socket-writer-target))
+         (writer (make-socket-writer))
          (kernel nil)
-         (quit-requested nil))
+         (bound nil))
     (unwind-protect
          (progn
-           (sb-bsd-sockets:socket-bind server socket-path)
-           (sb-posix:chmod socket-path #o600)
-           (sb-bsd-sockets:socket-listen server 16)
-           (setf kernel (start-kernel (socket-sink target)
+           (bind-private-local-socket server socket-path)
+           (setf bound t
+                 kernel (start-kernel (socket-sink writer)
                                       :cpu-workers (or cpu-workers *cpu-workers*)
                                       :io-workers (or io-workers *io-workers*)
                                       :subworkers (or subworkers *subworkers*)
                                       :reactor-slots (or reactor-slots *max-reactor-slots*)))
            (when on-ready
              (funcall on-ready socket-path))
-           (loop until quit-requested
-                 do (let ((client (handler-case (sb-bsd-sockets:socket-accept server)
-                                    (serious-condition () nil))))
-                      (when client
-                        (let ((client-stream nil))
-                          (unwind-protect
-                               (progn
-                                 (setf client-stream
-                                       (sb-bsd-sockets:socket-make-stream
-                                        client
-                                        :input t :output t
-                                        :buffering :full
-                                        :element-type 'character
-                                        :external-format '(:utf-8 :replacement #\REPLACEMENT_CHARACTER)))
-                                 (write-line (message-string (hello)) client-stream)
-                                 (finish-output client-stream)
-                                 (setf (socket-writer-target-stream target) client-stream)
-                                 (handler-case
-                                     (loop for line = (read-line client-stream nil nil)
-                                           while line
-                                           when (eq (handle-line kernel line) :quit)
-                                             do (setf quit-requested t)
-                                                (return))
-                                   (serious-condition () nil)))
-                            (sb-ext:compare-and-swap (socket-writer-target-stream target)
-                                                     client-stream nil)
-                            (when client-stream
-                              (ignore-errors (close client-stream :abort t)))
-                            (ignore-errors (sb-bsd-sockets:socket-close client))))))))
-      (setf (socket-writer-target-stream target) nil)
+           (loop
+             for client = (handler-case (sb-bsd-sockets:socket-accept server)
+                            ((or sb-bsd-sockets:socket-error sb-posix:syscall-error) () nil))
+             while client
+             until (serve-socket-client kernel writer client)))
       (when kernel
         (handler-case (stop-kernel kernel :timeout 2)
           (serious-condition () nil)))
       (ignore-errors (sb-bsd-sockets:socket-close server))
-      (unlink-socket-quietly socket-path))))
+      (when bound
+        (unlink-socket-quietly socket-path)))))
 
 (defun main ()
   "Run the kernel for Emacs over standard input and output, or `--socket'."
@@ -247,7 +321,7 @@ with SOCKET-PATH once bound and listening."
                                        :subworkers *subworkers*
                                        :reactor-slots *max-reactor-slots*)))
             (setf *kernel* kernel)
-            (credit-sink-put-control (kernel-outbox kernel) (message-string (hello)))
+            (credit-sink-put-control (kernel-outbox kernel) (message-string (hello kernel)))
             (unwind-protect
                  (handler-case
                      (loop for line = (read-line input nil nil)

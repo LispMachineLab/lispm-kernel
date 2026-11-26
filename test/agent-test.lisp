@@ -180,7 +180,9 @@
            (with-kernel (kernel collector)
              (let ((url (format nil "http://127.0.0.1:~D/v1/messages" (mock-http-server-port srv))))
                (send kernel
-                     (message-string `(agent-start "s-auto" (:dialect :anthropic :url ,url :root ,dir :max-steps 8)))
+                     (message-string `(agent-start "s-auto" (:dialect :anthropic :url ,url :root ,dir
+                                                             :max-steps 8
+                                                             :tool-policies (:auto ("run_shell")))))
                      (message-string `(agent-turn "s-auto" (:turn-id "t1" :body "{\"model\":\"claude-x\",\"messages\":[{\"role\":\"user\",\"content\":\"go\"}]}"))))
                (let ((msgs (await collector
                                   (lambda (ms)
@@ -259,7 +261,8 @@
            (with-kernel (kernel collector)
              (let ((url (format nil "http://127.0.0.1:~D/v1/messages" (mock-http-server-port srv))))
                (send kernel
-                     (message-string `(agent-start "s-to" (:dialect :anthropic :url ,url)))
+                     (message-string `(agent-start "s-to" (:dialect :anthropic :url ,url
+                                                           :tool-policies (:auto ("eval_elisp")))))
                      (message-string `(agent-turn "s-to" (:turn-id "t-to" :body "{\"messages\":[{\"role\":\"user\",\"content\":\"eval\"}]}"))))
                (let ((msgs (await collector
                                   (lambda (ms)
@@ -284,7 +287,8 @@
            (with-kernel (kernel collector)
              (let ((url (format nil "http://127.0.0.1:~D/v1/messages" (mock-http-server-port srv))))
                (send kernel
-                     (message-string `(agent-start "s-can" (:dialect :anthropic :url ,url :root ,dir)))
+                     (message-string `(agent-start "s-can" (:dialect :anthropic :url ,url :root ,dir
+                                                            :tool-policies (:auto ("run_shell")))))
                      (message-string `(agent-turn "s-can" (:turn-id "t-can" :body "{\"messages\":[{\"role\":\"user\",\"content\":\"sleep\"}]}"))))
                ;; Wait until HTTP stream finishes step 1 and enters acting
                (await collector (lambda (ms) (some (lambda (m) (turn-event-p m "s-can" :step-response)) ms)))
@@ -345,7 +349,8 @@
                    (sessions (loop for i from 1 to 24 collect (format nil "agent-~2,'0D" i))))
                (dolist (s sessions)
                  (send kernel
-                       (message-string `(agent-start ,s (:dialect :anthropic :url ,url :root ,dir)))
+                       (message-string `(agent-start ,s (:dialect :anthropic :url ,url :root ,dir
+                                                         :tool-policies (:auto ("run_shell")))))
                        (message-string `(agent-turn ,s (:turn-id "t" :body "{\"messages\":[{\"role\":\"user\",\"content\":\"run\"}]}")))))
                (let ((msgs (await collector
                                   (lambda (ms)
@@ -437,3 +442,189 @@
         (stop-mock-http-server srv)
         (sb-thread:join-thread server-thread :default nil :timeout 5)
         (ignore-errors (sb-posix:unlink sock-path)))))
+
+(deftest agent-fsm-safety-deny-no-double-fire-and-dup-ids ()
+  ;; 1. Unconfigured run_shell must default to `:ask', never auto-executing.
+  (with-directory (dir)
+    (let* ((srv (start-mock-http-server
+                 (lambda (body stream)
+                   (let ((msgs (json-get (parse-json body :preserve-literals t) "messages")))
+                     (if (= (length msgs) 1)
+                         (send-http-response
+                          stream 200 "text/event-stream"
+                          (anthropic-tool-sse "tu_def" "run_shell" "{\"command\":\"echo nope\"}"))
+                         (send-http-response
+                          stream 200 "text/event-stream"
+                          (anthropic-text-sse "denied-cleanly"))))))))
+      (unwind-protect
+           (with-kernel (kernel collector)
+             (let ((url (format nil "http://127.0.0.1:~D/v1/messages" (mock-http-server-port srv))))
+               (send kernel
+                     (message-string `(agent-start "s-def" (:dialect :anthropic :url ,url :root ,dir)))
+                     (message-string `(agent-turn "s-def" (:turn-id "td" :body "{\"messages\":[{\"role\":\"user\",\"content\":\"go\"}]}"))))
+               (let* ((msgs1 (await collector
+                                    (lambda (ms)
+                                      (some (lambda (m) (and (eq (first m) :approval-request)
+                                                             (equal (second m) "s-def")))
+                                            ms))))
+                      (ap (find-if (lambda (m) (eq (first m) :approval-request)) msgs1)))
+                 (is ap)
+                 (is (string= "run_shell" (fourth ap)))
+                 (send kernel (message-string '(agent-approval-decision "s-def" "tu_def" :deny :reason "no"))))
+               (await collector (lambda (ms) (some (lambda (m) (turn-event-p m "s-def" :turn-done)) ms)))
+               (is (= 1 (length (getf (lispm-kernel:kernel-agent-snapshot kernel "s-def") :completed-turns))))))
+        (stop-mock-http-server srv))))
+  ;; 2. Sync single-call `:deny' / invalid JSON must trigger step 2 ONCE, never twice.
+  (with-directory (dir)
+    (let* ((req-count 0)
+           (srv (start-mock-http-server
+                 (lambda (body stream)
+                   (incf req-count)
+                   (let ((msgs (json-get (parse-json body :preserve-literals t) "messages")))
+                     (if (= (length msgs) 1)
+                         (send-http-response
+                          stream 200 "text/event-stream"
+                          (anthropic-tool-sse "tu_den" "edit_buffer" "{}"))
+                         (send-http-response
+                          stream 200 "text/event-stream"
+                          (anthropic-text-sse "recovered-once"))))))))
+      (unwind-protect
+           (with-kernel (kernel collector)
+             (let ((url (format nil "http://127.0.0.1:~D/v1/messages" (mock-http-server-port srv))))
+               (send kernel
+                     (message-string `(agent-start "s-nodup" (:dialect :anthropic :url ,url :root ,dir
+                                                              :tool-policies (:deny ("edit_buffer")))))
+                     (message-string `(agent-turn "s-nodup" (:turn-id "tn" :body "{\"messages\":[{\"role\":\"user\",\"content\":\"go\"}]}"))))
+               (let ((msgs (await collector
+                                  (lambda (ms) (some (lambda (m) (turn-event-p m "s-nodup" :turn-done)) ms)))))
+                 (is (= 1 (count-if (lambda (m) (turn-event-p m "s-nodup" :turn-done)) msgs)))
+                 (is (= 2 req-count))
+                 (let ((done (find-if (lambda (m) (turn-event-p m "s-nodup" :turn-done)) msgs)))
+                   (is (string= "recovered-once" (getf (third done) :text)))))))
+        (stop-mock-http-server srv))))
+  ;; 3. Duplicate `tool_use' IDs settle independently without deadlocking the wave.
+  (with-directory (dir)
+    (write-file (path dir "dup.txt") "dup-line-1" "dup-line-2" "dup-line-3")
+    (let* ((sse-dup
+             (concatenate
+              'string
+              (sse-event "{\"type\":\"message_start\",\"message\":{\"id\":\"mdup\"}}" "message_start")
+              (sse-event "{\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"dup_1\",\"name\":\"read_file\",\"input\":{}}}" "content_block_start")
+              (sse-event "{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"path\\\":\\\"dup.txt\\\",\\\"offset\\\":2,\\\"limit\\\":1}\"}}" "content_block_delta")
+              (sse-event "{\"type\":\"content_block_stop\",\"index\":0}" "content_block_stop")
+              (sse-event "{\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"id\":\"dup_1\",\"name\":\"search_files\",\"input\":{}}}" "content_block_start")
+              (sse-event "{\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"pattern\\\":\\\"dup-line-3\\\"}\"}}" "content_block_delta")
+              (sse-event "{\"type\":\"content_block_stop\",\"index\":1}" "content_block_stop")
+              (sse-event "{\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"}}" "message_delta")
+              (sse-event "{\"type\":\"message_stop\"}" "message_stop")))
+           (srv (start-mock-http-server
+                 (lambda (body stream)
+                   (let ((msgs (json-get (parse-json body :preserve-literals t) "messages")))
+                     (if (= (length msgs) 1)
+                         (send-http-response stream 200 "text/event-stream" sse-dup)
+                         (send-http-response stream 200 "text/event-stream" (anthropic-text-sse "dup-ok"))))))))
+      (unwind-protect
+           (with-kernel (kernel collector)
+             (let ((url (format nil "http://127.0.0.1:~D/v1/messages" (mock-http-server-port srv))))
+               (send kernel
+                     (message-string `(agent-start "s-dup" (:dialect :anthropic :url ,url :root ,dir)))
+                     (message-string `(agent-turn "s-dup" (:turn-id "tdp" :body "{\"messages\":[{\"role\":\"user\",\"content\":\"go\"}]}"))))
+               (await collector (lambda (ms) (some (lambda (m) (turn-event-p m "s-dup" :turn-done)) ms)))
+               (let* ((snap (lispm-kernel:kernel-agent-snapshot kernel "s-dup"))
+                      (tools (getf snap :completed-tools)))
+                 (is (= 2 (length tools)))
+                 (is (search "dup-line-2" (getf (first tools) :result)))
+                 (is (search "dup.txt:3:dup-line-3" (getf (second tools) :result))))))
+        (stop-mock-http-server srv)))))
+
+(deftest agent-path-containment-unsaved-fallback-and-socket-guard ()
+  (with-directory (dir)
+    (let ((outside (temporary-directory)))
+      (unwind-protect
+           (progn
+             (write-file (path outside "secret.txt") "outside-secret")
+             (make-directory (path dir "sub"))
+             (write-file (path dir "sub/local.txt") "line-a" "line-b")
+             (let* ((step 0)
+                    (srv (start-mock-http-server
+                          (lambda (_body stream)
+                            (declare (ignore _body))
+                            (incf step)
+                            (case step
+                              ;; 1. Unsaved buffer forces read_file -> editor effect (with :input-json in snapshot!)
+                              (1 (send-http-response
+                                  stream 200 "text/event-stream"
+                                  (anthropic-tool-sse "tu_u" "read_file" "{\"path\":\"sub/local.txt\"}")))
+                              ;; 2. Out-of-root ../ forces read_file -> editor effect
+                              (2 (send-http-response
+                                  stream 200 "text/event-stream"
+                                  (anthropic-tool-sse "tu_o" "read_file" "{\"path\":\"../escape.txt\"}")))
+                              ;; 3. Relative directory in run_shell resolves inside root/sub
+                              (3 (send-http-response
+                                  stream 200 "text/event-stream"
+                                  (anthropic-tool-sse "tu_sh" "run_shell"
+                                                      "{\"command\":\"cat local.txt\",\"directory\":\"sub\"}")))
+                              (t (send-http-response
+                                  stream 200 "text/event-stream"
+                                  (anthropic-text-sse "path-safe-ok"))))))))
+               (unwind-protect
+                    (with-kernel (kernel collector)
+                      (let ((url (format nil "http://127.0.0.1:~D/v1/messages" (mock-http-server-port srv))))
+                        (send kernel
+                              (message-string `(agent-start "s-path" (:dialect :anthropic :url ,url :root ,dir
+                                                                      :tool-policies (:auto ("run_shell")))))
+                              (message-string `(agent-turn "s-path" (:turn-id "tp"
+                                                                     :unsaved-files (,(path dir "sub/local.txt"))
+                                                                     :body "{\"messages\":[{\"role\":\"user\",\"content\":\"go\"}]}"))))
+                        ;; Effect 1: unsaved buffer + check pending-effects :input-json & :epoch in snapshot
+                        (let* ((m1 (await collector
+                                          (lambda (ms) (some (lambda (m) (and (eq (first m) :editor-effect-request)
+                                                                              (equal (second m) "s-path")))
+                                                             ms))))
+                               (eff1 (find-if (lambda (m) (eq (first m) :editor-effect-request)) m1))
+                               (snap (lispm-kernel:kernel-agent-snapshot kernel "s-path")))
+                          (is (integerp (getf snap :epoch)))
+                          (is (stringp (getf (first (getf snap :pending-effects)) :input-json)))
+                          (send kernel (message-string `(agent-effect-reply "s-path" ,(third eff1) :ok "unsaved-text"))))
+                        ;; Effect 2: out-of-root escape blocked to editor
+                        (let* ((m2 (await collector
+                                          (lambda (ms)
+                                            (> (count-if (lambda (m) (and (eq (first m) :editor-effect-request)
+                                                                          (equal (second m) "s-path")))
+                                                         ms)
+                                               1))))
+                               (eff2 (first (last (remove-if-not (lambda (m) (eq (first m) :editor-effect-request)) m2)))))
+                          (send kernel (message-string `(agent-effect-reply "s-path" ,(third eff2) :ok "from-editor"))))
+                        (await collector (lambda (ms) (some (lambda (m) (turn-event-p m "s-path" :turn-done)) ms)))
+                        (let* ((snap (lispm-kernel:kernel-agent-snapshot kernel "s-path"))
+                               (tools (getf snap :completed-tools)))
+                          (is (= 3 (length tools)))
+                          (is (search "line-b" (getf (third tools) :result))))))
+                 (stop-mock-http-server srv))))
+        (delete-tree outside))))
+  ;; Socket server refuses overwriting an active bound socket
+  (let* ((sock-path (format nil "/tmp/lk-dup-~D-~D.sock"
+                            (sb-posix:getpid) (random 100000)))
+         (gate (sb-concurrency:make-gate :name "dup-ready" :open nil))
+         (srv-thread (sb-thread:make-thread
+                      (lambda ()
+                        (lispm-kernel:run-socket-server
+                         sock-path
+                         :on-ready (lambda (_p) (declare (ignore _p)) (sb-concurrency:open-gate gate))))
+                      :name "dup-sock-srv")))
+    (unwind-protect
+         (progn
+           (is (sb-concurrency:wait-on-gate gate :timeout 5))
+           (signals lispm-kernel:message-error
+             (lispm-kernel:run-socket-server sock-path))
+           (let ((c (make-instance 'sb-bsd-sockets:local-socket :type :stream)))
+             (sb-bsd-sockets:socket-connect c sock-path)
+             (let ((s (sb-bsd-sockets:socket-make-stream
+                       c :input t :output t :buffering :full :external-format :utf-8)))
+               (is (eq :hello (first (read-message (read-line s)))))
+               (write-line "(quit)" s)
+               (finish-output s)
+               (ignore-errors (close s))
+               (ignore-errors (sb-bsd-sockets:socket-close c)))))
+      (sb-thread:join-thread srv-thread :default nil :timeout 5)
+      (ignore-errors (sb-posix:unlink sock-path)))))

@@ -30,13 +30,14 @@
 (defparameter *sse-tail-limit* 512
   "Trailing characters always retained so `*http-status-marker*' is intact.")
 
-(defstruct (sse-block (:constructor make-sse-block (type &key id name ephemeral))
+(defstruct (sse-block (:constructor make-sse-block (type &key id name ephemeral raw-json))
                       (:copier nil))
   "Mutable accumulation state for one content block within one `sse-decoder'."
   (type "" :type string)
   (id nil :type (or null string))
   (name nil :type (or null string))
   (ephemeral nil :type boolean)
+  (raw-json nil :type (or null string))
   (text-chunks '() :type list)
   (thinking-chunks '() :type list)
   (signature-chunks '() :type list)
@@ -75,6 +76,16 @@
 (defun sse-nonempty-string (value)
   "Return VALUE if it is a non-empty string, else nil."
   (and (stringp value) (plusp (length value)) value))
+
+(defun sse-json-list (value)
+  "Return list elements from JSON array VALUE (list or vector), else nil."
+  (cond ((listp value) value)
+        ((vectorp value) (coerce value 'list))
+        (t '())))
+
+(defun sse-json-present-p (value)
+  "Return true when parsed JSON VALUE is non-nil and not `:null'."
+  (and value (not (eq value :null))))
 
 (defun sse-string-trim (string)
   "Trim ASCII whitespace from both ends of STRING."
@@ -126,61 +137,67 @@
                 (subseq combined (- (length combined) *sse-tail-limit*))
                 combined)))))
 
+(defun sse-line-end-length (text pos len)
+  "Return line-ending byte count (1 or 2) at POS in TEXT of LEN, or nil."
+  (when (< pos len)
+    (cond ((char= (char text pos) #\Newline) 1)
+          ((and (char= (char text pos) #\Return)
+                (< (1+ pos) len)
+                (char= (char text (1+ pos)) #\Newline))
+           2)
+          (t nil))))
+
+(defun sse-find-event-end (text from len)
+  "Return (values END-POS NEXT-START) of first blank line at/after FROM, or nils."
+  (loop for i from from below len
+        for first-len = (sse-line-end-length text i len)
+        when first-len
+          do (let ((second-len (sse-line-end-length text (+ i first-len) len)))
+               (when second-len
+                 (return-from sse-find-event-end
+                   (values i (+ i first-len second-len))))))
+  (values nil nil))
+
+(defun sse-extract-data (block)
+  "Extract joined `data:' lines from one SSE event BLOCK, or nil."
+  (let ((blen (length block))
+        (pos 0)
+        (parts '()))
+    (loop while (< pos blen)
+          do (let ((eol (or (position #\Newline block :start pos) blen)))
+               (let ((end eol))
+                 (when (and (> end pos) (char= (char block (1- end)) #\Return))
+                   (decf end))
+                 (when (and (>= (- end pos) 5)
+                            (string= block "data:" :start1 pos :end1 (+ pos 5)))
+                   (let ((dstart (+ pos 5)))
+                     (when (and (< dstart end) (char= (char block dstart) #\Space))
+                       (incf dstart))
+                     (push (subseq block dstart end) parts))))
+               (setf pos (1+ eol))))
+    (when parts
+      (let ((joined (apply #'concatenate 'string
+                           (loop for (p . more) on (nreverse parts)
+                                 collect p
+                                 when more collect (string #\Newline)))))
+        (when (plusp (length joined))
+          joined)))))
+
 (defun sse-split-events (text)
   "Split SSE buffer TEXT by blank lines; return (values EVENT-DATA-STRINGS REST)."
   (let ((len (length text))
         (start 0)
         (events '()))
-    (labels ((line-end-length (pos)
-               (when (< pos len)
-                 (cond ((char= (char text pos) #\Newline) 1)
-                       ((and (char= (char text pos) #\Return)
-                             (< (1+ pos) len)
-                             (char= (char text (1+ pos)) #\Newline))
-                        2)
-                       (t nil))))
-             (find-event-end (from)
-               (loop for i from from below len
-                     for first-len = (line-end-length i)
-                     when first-len
-                       do (let ((second-len (line-end-length (+ i first-len))))
-                            (when second-len
-                              (return-from find-event-end
-                                (values i (+ i first-len second-len))))))
-               (values nil nil))
-             (extract-data (block)
-               (let ((blen (length block))
-                     (pos 0)
-                     (parts '()))
-                 (loop while (< pos blen)
-                       do (let ((eol (or (position #\Newline block :start pos) blen)))
-                            (let ((end eol))
-                              (when (and (> end pos) (char= (char block (1- end)) #\Return))
-                                (decf end))
-                              (when (and (>= (- end pos) 5)
-                                         (string= block "data:" :start1 pos :end1 (+ pos 5)))
-                                (let ((dstart (+ pos 5)))
-                                  (when (and (< dstart end) (char= (char block dstart) #\Space))
-                                    (incf dstart))
-                                  (push (subseq block dstart end) parts))))
-                            (setf pos (1+ eol))))
-                 (when parts
-                   (let ((joined (apply #'concatenate 'string
-                                        (loop for (p . more) on (nreverse parts)
-                                              collect p
-                                              when more collect (string #\Newline)))))
-                     (when (plusp (length joined))
-                       joined))))))
-      (loop
-        (multiple-value-bind (ev-end next-start) (find-event-end start)
-          (unless ev-end
-            (return (values (nreverse events) (subseq text start))))
-          (let ((payload (extract-data (subseq text start ev-end))))
-            (when payload
-              (push payload events)))
-          (setf start next-start))))))
+    (loop
+      (multiple-value-bind (ev-end next-start) (sse-find-event-end text start len)
+        (unless ev-end
+          (return (values (nreverse events) (subseq text start))))
+        (let ((payload (sse-extract-data (subseq text start ev-end))))
+          (when payload
+            (push payload events)))
+        (setf start next-start)))))
 
-;;;; Usage helpers
+;;;; Usage & error normalization helpers
 
 (defun sse-merge-anthropic-usage (current json-usage)
   "Merge Anthropic JSON-USAGE object into usage plist CURRENT."
@@ -227,7 +244,7 @@
         :status (or status 0)
         :type (or (sse-nonempty-string (lispm-kernel/json:json-get err "type"))
                   (let ((code (lispm-kernel/json:json-get err "code")))
-                    (and code (not (eq code :null)) (princ-to-string code)))
+                    (and (sse-json-present-p code) (princ-to-string code)))
                   "http_error")
         :message (cond ((stringp err) err)
                        ((sse-nonempty-string (lispm-kernel/json:json-get err "message")))
@@ -256,96 +273,116 @@
         t)
     (lispm-kernel/json:json-error () nil)))
 
-(defun sse-ensure-block (decoder index type &key id name ephemeral)
+(defun sse-ensure-block (decoder index type &key id name ephemeral raw-json)
   "Return DECODER's `sse-block' at INDEX, creating one if absent."
   (or (gethash index (sse-decoder-blocks decoder))
       (setf (gethash index (sse-decoder-blocks decoder))
-            (make-sse-block type :id id :name name :ephemeral ephemeral))))
+            (make-sse-block type :id id :name name :ephemeral ephemeral :raw-json raw-json))))
 
-(defun sse-apply-anthropic-event (decoder ev emit-fn)
-  "Apply one decoded Anthropic SSE event JSON object EV, calling EMIT-FN with deltas."
+(defun sse-anthropic-message-start (decoder ev)
+  "Apply Anthropic `message_start' event EV to DECODER."
+  (let ((msg (lispm-kernel/json:json-get ev "message")))
+    (when (lispm-kernel/json:json-object-p msg)
+      (setf (sse-decoder-message-id decoder) (sse-nonempty-string (lispm-kernel/json:json-get msg "id"))
+            (sse-decoder-model decoder) (sse-nonempty-string (lispm-kernel/json:json-get msg "model"))
+            (sse-decoder-stop-reason decoder) (sse-nonempty-string (lispm-kernel/json:json-get msg "stop_reason")))
+      (let ((usage (sse-merge-anthropic-usage (sse-decoder-usage decoder)
+                                              (lispm-kernel/json:json-get msg "usage"))))
+        (when usage (setf (sse-decoder-usage decoder) usage))))))
+
+(defun sse-anthropic-block-start (decoder ev index emit-fn)
+  "Apply Anthropic `content_block_start' event EV at INDEX to DECODER."
+  (let* ((cb (lispm-kernel/json:json-get ev "content_block"))
+         (btype (or (sse-nonempty-string (lispm-kernel/json:json-get cb "type")) ""))
+         (id (sse-nonempty-string (lispm-kernel/json:json-get cb "id")))
+         (name (sse-nonempty-string (lispm-kernel/json:json-get cb "name")))
+         (known-p (or (equal btype "text") (equal btype "thinking") (equal btype "tool_use")))
+         (raw-json (when (and (not known-p) (lispm-kernel/json:json-object-p cb))
+                     (lispm-kernel/json:encode-json cb)))
+         (block (make-sse-block btype :id id :name name :raw-json raw-json))
+         (init-text (lispm-kernel/json:json-get cb "text"))
+         (init-thinking (lispm-kernel/json:json-get cb "thinking"))
+         (init-sig (lispm-kernel/json:json-get cb "signature"))
+         (init-input (lispm-kernel/json:json-get cb "input")))
+    (when (stringp init-text) (push init-text (sse-block-text-chunks block)))
+    (when (stringp init-thinking) (push init-thinking (sse-block-thinking-chunks block)))
+    (when (stringp init-sig) (push init-sig (sse-block-signature-chunks block)))
+    (when (lispm-kernel/json:json-object-p init-input)
+      (setf (sse-block-fallback-json block)
+            (lispm-kernel/json:encode-json init-input)))
+    (when index
+      (setf (gethash index (sse-decoder-blocks decoder)) block))
+    (when (and (equal btype "tool_use") name)
+      (funcall emit-fn (list :delta :tool name)))))
+
+(defun sse-anthropic-block-delta (decoder ev index emit-fn mark-dirty-fn)
+  "Apply Anthropic `content_block_delta' event EV at INDEX to DECODER."
+  (let* ((block (and index (gethash index (sse-decoder-blocks decoder))))
+         (delta (lispm-kernel/json:json-get ev "delta"))
+         (dtype (lispm-kernel/json:json-get delta "type")))
+    (when block
+      (cond
+        ((equal dtype "text_delta")
+         (let ((text (lispm-kernel/json:json-get delta "text")))
+           (when (stringp text)
+             (push text (sse-block-text-chunks block))
+             (funcall emit-fn (list :delta :text text)))))
+        ((equal dtype "thinking_delta")
+         (let ((text (lispm-kernel/json:json-get delta "thinking")))
+           (when (stringp text)
+             (push text (sse-block-thinking-chunks block))
+             (funcall emit-fn (list :delta :thinking text)))))
+        ((equal dtype "signature_delta")
+         (let ((sig (lispm-kernel/json:json-get delta "signature")))
+           (when (stringp sig)
+             (push sig (sse-block-signature-chunks block)))))
+        ((equal dtype "input_json_delta")
+         (let ((part (lispm-kernel/json:json-get delta "partial_json")))
+           (when (stringp part)
+             (push part (sse-block-json-chunks block))
+             (when mark-dirty-fn
+               (funcall mark-dirty-fn block)))))))))
+
+(defun sse-anthropic-block-stop (decoder index)
+  "Validate completed `tool_use' JSON on `content_block_stop' at INDEX."
+  (let ((block (and index (gethash index (sse-decoder-blocks decoder)))))
+    (when (and block (equal (sse-block-type block) "tool_use"))
+      (let ((raw-json (sse-string-trim (sse-join-chunks (sse-block-json-chunks block)))))
+        (when (and (plusp (length raw-json))
+                   (not (sse-valid-json-string-p raw-json))
+                   (sse-block-id block))
+          (pushnew (sse-block-id block) (sse-decoder-invalid decoder) :test #'string=))))))
+
+(defun sse-anthropic-message-delta (decoder ev)
+  "Apply Anthropic `message_delta' stop_reason and usage updates."
+  (let ((delta (lispm-kernel/json:json-get ev "delta"))
+        (usage (lispm-kernel/json:json-get ev "usage")))
+    (when (lispm-kernel/json:json-object-p delta)
+      (let ((sr (sse-nonempty-string (lispm-kernel/json:json-get delta "stop_reason"))))
+        (when sr (setf (sse-decoder-stop-reason decoder) sr))))
+    (when (lispm-kernel/json:json-object-p usage)
+      (setf (sse-decoder-usage decoder)
+            (sse-merge-anthropic-usage (sse-decoder-usage decoder) usage)))))
+
+(defun sse-apply-anthropic-event (decoder ev emit-fn &optional mark-dirty-fn)
+  "Apply one decoded Anthropic SSE event JSON object EV to DECODER."
   (let ((ev-type (lispm-kernel/json:json-get ev "type"))
         (index (sse-json-integer (lispm-kernel/json:json-get ev "index"))))
     (cond
       ((equal ev-type "message_start")
        (setf (sse-decoder-started decoder) t)
-       (let ((msg (lispm-kernel/json:json-get ev "message")))
-         (when (lispm-kernel/json:json-object-p msg)
-           (setf (sse-decoder-message-id decoder) (sse-nonempty-string (lispm-kernel/json:json-get msg "id"))
-                 (sse-decoder-model decoder) (sse-nonempty-string (lispm-kernel/json:json-get msg "model"))
-                 (sse-decoder-stop-reason decoder) (sse-nonempty-string (lispm-kernel/json:json-get msg "stop_reason")))
-           (let ((usage (sse-merge-anthropic-usage (sse-decoder-usage decoder)
-                                                   (lispm-kernel/json:json-get msg "usage"))))
-             (when usage (setf (sse-decoder-usage decoder) usage))))))
+       (sse-anthropic-message-start decoder ev))
       ((equal ev-type "content_block_start")
        (setf (sse-decoder-started decoder) t)
-       (let* ((cb (lispm-kernel/json:json-get ev "content_block"))
-              (btype (or (sse-nonempty-string (lispm-kernel/json:json-get cb "type")) ""))
-              (id (sse-nonempty-string (lispm-kernel/json:json-get cb "id")))
-              (name (sse-nonempty-string (lispm-kernel/json:json-get cb "name")))
-              (block (make-sse-block btype :id id :name name))
-              (init-text (lispm-kernel/json:json-get cb "text"))
-              (init-thinking (lispm-kernel/json:json-get cb "thinking"))
-              (init-sig (lispm-kernel/json:json-get cb "signature"))
-              (init-input (lispm-kernel/json:json-get cb "input")))
-         (when (stringp init-text) (push init-text (sse-block-text-chunks block)))
-         (when (stringp init-thinking) (push init-thinking (sse-block-thinking-chunks block)))
-         (when (stringp init-sig) (push init-sig (sse-block-signature-chunks block)))
-         (when (lispm-kernel/json:json-object-p init-input)
-           (setf (sse-block-fallback-json block)
-                 (lispm-kernel/json:encode-json init-input)))
-         (when index
-           (setf (gethash index (sse-decoder-blocks decoder)) block))
-         (when (and (equal btype "tool_use") name)
-           (funcall emit-fn (list :delta :tool name)))))
+       (sse-anthropic-block-start decoder ev index emit-fn))
       ((equal ev-type "content_block_delta")
        (setf (sse-decoder-started decoder) t)
-       (let* ((block (and index (gethash index (sse-decoder-blocks decoder))))
-              (delta (lispm-kernel/json:json-get ev "delta"))
-              (dtype (lispm-kernel/json:json-get delta "type")))
-         (when block
-           (cond
-             ((equal dtype "text_delta")
-              (let ((text (lispm-kernel/json:json-get delta "text")))
-                (when (stringp text)
-                  (push text (sse-block-text-chunks block))
-                  (funcall emit-fn (list :delta :text text)))))
-             ((equal dtype "thinking_delta")
-              (let ((text (lispm-kernel/json:json-get delta "thinking")))
-                (when (stringp text)
-                  (push text (sse-block-thinking-chunks block))
-                  (funcall emit-fn (list :delta :thinking text)))))
-             ((equal dtype "signature_delta")
-              (let ((sig (lispm-kernel/json:json-get delta "signature")))
-                (when (stringp sig)
-                  (push sig (sse-block-signature-chunks block)))))
-             ((equal dtype "input_json_delta")
-              (let ((part (lispm-kernel/json:json-get delta "partial_json")))
-                (when (stringp part)
-                  (push part (sse-block-json-chunks block))
-                  (funcall emit-fn
-                           (list :delta :tool-input
-                                 (list :id (or (sse-block-id block) "")
-                                       :name (or (sse-block-name block) "")
-                                       :json (sse-join-chunks (sse-block-json-chunks block))))))))))))
+       (sse-anthropic-block-delta decoder ev index emit-fn mark-dirty-fn))
       ((equal ev-type "content_block_stop")
-       (let ((block (and index (gethash index (sse-decoder-blocks decoder)))))
-         (when (and block (equal (sse-block-type block) "tool_use"))
-           (let ((raw-json (sse-string-trim (sse-join-chunks (sse-block-json-chunks block)))))
-             (when (and (plusp (length raw-json))
-                        (not (sse-valid-json-string-p raw-json))
-                        (sse-block-id block))
-               (pushnew (sse-block-id block) (sse-decoder-invalid decoder) :test #'string=))))))
+       (sse-anthropic-block-stop decoder index))
       ((equal ev-type "message_delta")
        (setf (sse-decoder-started decoder) t)
-       (let ((delta (lispm-kernel/json:json-get ev "delta"))
-             (usage (lispm-kernel/json:json-get ev "usage")))
-         (when (lispm-kernel/json:json-object-p delta)
-           (let ((sr (sse-nonempty-string (lispm-kernel/json:json-get delta "stop_reason"))))
-             (when sr (setf (sse-decoder-stop-reason decoder) sr))))
-         (when (lispm-kernel/json:json-object-p usage)
-           (setf (sse-decoder-usage decoder)
-                 (sse-merge-anthropic-usage (sse-decoder-usage decoder) usage)))))
+       (sse-anthropic-message-delta decoder ev))
       ((equal ev-type "message_stop")
        (setf (sse-decoder-started decoder) t
              (sse-decoder-done decoder) t))
@@ -365,74 +402,76 @@
         ((equal finish "content_filter") "refusal")
         (t "end_turn")))
 
-(defun sse-apply-openai-chunk (decoder chunk emit-fn)
-  "Apply one decoded OpenAI Chat Completions chunk, calling EMIT-FN with deltas."
+(defun sse-openai-apply-tool-call (decoder call emit-fn mark-dirty-fn)
+  "Apply one OpenAI delta `tool_calls' item CALL onto DECODER."
+  (let* ((raw-idx (or (sse-json-integer (lispm-kernel/json:json-get call "index")) 0))
+         ;; Offset tool indices by +1000 so synthetic thinking(0)/text(1) never collide.
+         (slot-idx (+ 1000 raw-idx))
+         (block (sse-ensure-block decoder slot-idx "tool_use"))
+         (fn (lispm-kernel/json:json-get call "function"))
+         (id (sse-nonempty-string (lispm-kernel/json:json-get call "id")))
+         (name (and (lispm-kernel/json:json-object-p fn)
+                    (sse-nonempty-string (lispm-kernel/json:json-get fn "name"))))
+         (args (and (lispm-kernel/json:json-object-p fn)
+                    (lispm-kernel/json:json-get fn "arguments"))))
+    (when id (setf (sse-block-id block) id))
+    (when (and name (null (sse-block-name block)))
+      (setf (sse-block-name block) name)
+      (funcall emit-fn (list :delta :tool name)))
+    (when (stringp args)
+      (push args (sse-block-json-chunks block))
+      (when (and (sse-block-name block) mark-dirty-fn)
+        (funcall mark-dirty-fn block)))))
+
+(defun sse-apply-openai-chunk (decoder chunk emit-fn &optional mark-dirty-fn)
+  "Apply one decoded OpenAI Chat Completions chunk onto DECODER."
   (setf (sse-decoder-started decoder) t)
   (let ((err (lispm-kernel/json:json-get chunk "error")))
-    (when (and err (not (eq err :null)))
+    (when (sse-json-present-p err)
       (setf (sse-decoder-error decoder)
             (let ((pl (sse-error-plist 200 err)))
               (list :type (getf pl :type) :message (getf pl :message))))))
   (let ((usage (lispm-kernel/json:json-get chunk "usage")))
     (when (lispm-kernel/json:json-object-p usage)
       (setf (sse-decoder-openai-usage decoder) usage)))
-  (let ((choices (lispm-kernel/json:json-get chunk "choices")))
-    (dolist (choice (if (listp choices) choices (coerce choices 'list)))
-      (let ((delta (lispm-kernel/json:json-get choice "delta"))
-            (finish (lispm-kernel/json:json-get choice "finish_reason")))
-        (when (lispm-kernel/json:json-object-p delta)
-          (let ((thought (or (sse-nonempty-string (lispm-kernel/json:json-get delta "reasoning_content"))
-                             (sse-nonempty-string (lispm-kernel/json:json-get delta "reasoning")))))
-            (when thought
-              (let* ((idx (or (sse-decoder-thinking-index decoder)
-                              (setf (sse-decoder-thinking-index decoder) 0)))
-                     (block (sse-ensure-block decoder idx "thinking" :ephemeral t)))
-                (push thought (sse-block-thinking-chunks block))
-                (funcall emit-fn (list :delta :thinking thought)))))
-          (let ((text (sse-nonempty-string (lispm-kernel/json:json-get delta "content"))))
-            (when text
-              (let* ((idx (or (sse-decoder-text-index decoder)
-                              (setf (sse-decoder-text-index decoder) 1)))
-                     (block (sse-ensure-block decoder idx "text")))
-                (push text (sse-block-text-chunks block))
-                (funcall emit-fn (list :delta :text text)))))
-          (let ((calls (lispm-kernel/json:json-get delta "tool_calls")))
-            (dolist (call (if (listp calls) calls (coerce calls 'list)))
-              (let* ((raw-idx (or (sse-json-integer (lispm-kernel/json:json-get call "index"))
-                                  0))
-                     ;; Offset tool indices by +1000 so synthetic thinking(0)/text(1) never collide.
-                     (slot-idx (+ 1000 raw-idx))
-                     (block (sse-ensure-block decoder slot-idx "tool_use"))
-                     (fn (lispm-kernel/json:json-get call "function"))
-                     (id (sse-nonempty-string (lispm-kernel/json:json-get call "id")))
-                     (name (and (lispm-kernel/json:json-object-p fn)
-                                (sse-nonempty-string (lispm-kernel/json:json-get fn "name"))))
-                     (args (and (lispm-kernel/json:json-object-p fn)
-                                (lispm-kernel/json:json-get fn "arguments"))))
-                (when id (setf (sse-block-id block) id))
-                (when (and name (null (sse-block-name block)))
-                  (setf (sse-block-name block) name)
-                  (funcall emit-fn (list :delta :tool name)))
-                (when (stringp args)
-                  (push args (sse-block-json-chunks block))
-                  (when (sse-block-name block)
-                    (funcall emit-fn
-                             (list :delta :tool-input
-                                   (list :id (or (sse-block-id block) "")
-                                         :name (sse-block-name block)
-                                         :json (sse-join-chunks (sse-block-json-chunks block)))))))))))
-        (when (stringp finish)
-          (setf (sse-decoder-stop-reason decoder) (sse-openai-finish-to-stop finish)
-                (sse-decoder-done decoder) t))))))
+  (dolist (choice (sse-json-list (lispm-kernel/json:json-get chunk "choices")))
+    (let ((delta (lispm-kernel/json:json-get choice "delta"))
+          (finish (lispm-kernel/json:json-get choice "finish_reason")))
+      (when (lispm-kernel/json:json-object-p delta)
+        (let ((thought (or (sse-nonempty-string (lispm-kernel/json:json-get delta "reasoning_content"))
+                           (sse-nonempty-string (lispm-kernel/json:json-get delta "reasoning")))))
+          (when thought
+            (let* ((idx (or (sse-decoder-thinking-index decoder)
+                            (setf (sse-decoder-thinking-index decoder) 0)))
+                   (block (sse-ensure-block decoder idx "thinking" :ephemeral t)))
+              (push thought (sse-block-thinking-chunks block))
+              (funcall emit-fn (list :delta :thinking thought)))))
+        (let ((text (sse-nonempty-string (lispm-kernel/json:json-get delta "content"))))
+          (when text
+            (let* ((idx (or (sse-decoder-text-index decoder)
+                            (setf (sse-decoder-text-index decoder) 1)))
+                   (block (sse-ensure-block decoder idx "text")))
+              (push text (sse-block-text-chunks block))
+              (funcall emit-fn (list :delta :text text)))))
+        (dolist (call (sse-json-list (lispm-kernel/json:json-get delta "tool_calls")))
+          (sse-openai-apply-tool-call decoder call emit-fn mark-dirty-fn)))
+      (when (stringp finish)
+        (setf (sse-decoder-stop-reason decoder) (sse-openai-finish-to-stop finish)
+              (sse-decoder-done decoder) t)))))
 
-(defun sse-feed (decoder chunk &key coalesce)
+(defun sse-feed (decoder chunk &key coalesce (emit-tool-input t))
   "Feed raw HTTP SSE text CHUNK into DECODER; return list of delta plists.
 When COALESCE is non-nil, adjacent `:text' or `:thinking' deltas within this
-feed call are combined."
+feed call are combined.  When EMIT-TOOL-INPUT is non-nil, at most one
+`:tool-input' delta per modified tool block is emitted per `sse-feed' call."
   (check-type chunk string)
   (sse-record-raw decoder chunk)
-  (let ((events-out '()))
-    (flet ((emit-delta (delta) (push delta events-out)))
+  (let ((events-out '())
+        (dirty-tools '()))
+    (labels ((emit-delta (delta) (push delta events-out))
+             (mark-dirty (block)
+               (when emit-tool-input
+                 (pushnew block dirty-tools :test #'eq))))
       (handler-case
           (multiple-value-bind (events rest)
               (sse-split-events (concatenate 'string (sse-decoder-pending decoder) chunk))
@@ -444,12 +483,18 @@ feed call are combined."
                     (t
                      (let ((parsed (lispm-kernel/json:parse-json data :preserve-literals t)))
                        (ecase (sse-decoder-dialect decoder)
-                         (:anthropic (sse-apply-anthropic-event decoder parsed #'emit-delta))
-                         (:openai (sse-apply-openai-chunk decoder parsed #'emit-delta))))))))
+                         (:anthropic (sse-apply-anthropic-event decoder parsed #'emit-delta #'mark-dirty))
+                         (:openai (sse-apply-openai-chunk decoder parsed #'emit-delta #'mark-dirty))))))))
         (serious-condition (condition)
           (unless (sse-decoder-client-error decoder)
             (setf (sse-decoder-client-error decoder)
                   (list :type "client_error" :message (condition-text condition)))))))
+    (dolist (block (nreverse dirty-tools))
+      (push (list :delta :tool-input
+                  (list :id (or (sse-block-id block) "")
+                        :name (or (sse-block-name block) "")
+                        :json (sse-join-chunks (sse-block-json-chunks block))))
+            events-out))
     (let ((ordered (nreverse events-out)))
       (if coalesce (sse-coalesce-deltas ordered) ordered))))
 
@@ -469,7 +514,7 @@ feed call are combined."
                 (nthcdr cut blocks)))))
 
 (defun sse-canonical-block (decoder block &optional validate-json-p)
-  "Convert `sse-block' BLOCK to a wire-safe plist; push invalid IDs if invalid."
+  "Convert `sse-block' BLOCK to a wire-safe plist; record invalid tool IDs."
   (let ((btype (sse-block-type block)))
     (cond
       ((string= btype "text")
@@ -499,8 +544,10 @@ feed call are combined."
                :name (or (sse-block-name block) "")
                :input-json json-str)))
       (t
-       (list :type :other :type-raw btype
-             :text (sse-join-chunks (sse-block-text-chunks block)))))))
+       (append (list :type :other :type-raw btype
+                     :text (sse-join-chunks (sse-block-text-chunks block)))
+               (when (sse-block-raw-json block)
+                 (list :json (sse-block-raw-json block))))))))
 
 (defun sse-strip-internal-block-keys (block)
   "Return BLOCK plist without internal helper keys like `:type-raw'."
@@ -517,8 +564,7 @@ feed call are combined."
 (defun sse-decode-whole-anthropic (decoder json)
   "Build canonical result plist from non-streamed Anthropic response JSON."
   (when (equal (lispm-kernel/json:json-get json "type") "message")
-    (let* ((raw-content (lispm-kernel/json:json-get json "content"))
-           (raw-list (if (listp raw-content) raw-content (coerce raw-content 'list)))
+    (let* ((raw-list (sse-json-list (lispm-kernel/json:json-get json "content")))
            (blocks
              (loop for cb in raw-list
                    for btype = (or (sse-nonempty-string (lispm-kernel/json:json-get cb "type")) "")
@@ -526,18 +572,22 @@ feed call are combined."
                    (cond
                      ((string= btype "text")
                       (list :type :text :type-raw "text"
-                            :text (or (lispm-kernel/json:json-get cb "text") "")))
+                            :text (or (sse-nonempty-string (lispm-kernel/json:json-get cb "text")) "")))
                      ((string= btype "thinking")
                       (let ((sig (sse-nonempty-string (lispm-kernel/json:json-get cb "signature"))))
                         (append (list :type :thinking :type-raw "thinking"
-                                      :thinking (or (lispm-kernel/json:json-get cb "thinking") ""))
+                                      :thinking (or (sse-nonempty-string
+                                                     (lispm-kernel/json:json-get cb "thinking"))
+                                                    ""))
                                 (when sig (list :signature sig)))))
                      ((string= btype "tool_use")
                       (let ((inp (lispm-kernel/json:json-get cb "input")))
                         (list :type :tool-use :type-raw "tool_use"
                               :id (or (sse-nonempty-string (lispm-kernel/json:json-get cb "id")) "")
                               :name (or (sse-nonempty-string (lispm-kernel/json:json-get cb "name")) "")
-                              :input-json (if inp (lispm-kernel/json:encode-json inp) "{}"))))
+                              :input-json (if (sse-json-present-p inp)
+                                              (lispm-kernel/json:encode-json inp)
+                                              "{}"))))
                      (t
                       (list :type :other :type-raw btype
                             :json (lispm-kernel/json:encode-json cb))))))
@@ -555,16 +605,14 @@ feed call are combined."
 (defun sse-decode-whole-openai (decoder json)
   "Build canonical result plist from non-streamed OpenAI response JSON."
   (declare (ignore decoder))
-  (let* ((choices (lispm-kernel/json:json-get json "choices"))
-         (choice-list (when choices (if (listp choices) choices (coerce choices 'list)))))
+  (let ((choice-list (sse-json-list (lispm-kernel/json:json-get json "choices"))))
     (when (first choice-list)
       (let* ((choice (first choice-list))
              (message (lispm-kernel/json:json-get choice "message"))
              (reasoning (or (sse-nonempty-string (lispm-kernel/json:json-get message "reasoning_content"))
                             (sse-nonempty-string (lispm-kernel/json:json-get message "reasoning"))))
              (text (sse-nonempty-string (lispm-kernel/json:json-get message "content")))
-             (calls (lispm-kernel/json:json-get message "tool_calls"))
-             (call-list (when calls (if (listp calls) calls (coerce calls 'list))))
+             (call-list (sse-json-list (lispm-kernel/json:json-get message "tool_calls")))
              (finish (lispm-kernel/json:json-get choice "finish_reason"))
              (usage (sse-convert-openai-usage (lispm-kernel/json:json-get json "usage")))
              (blocks '())
@@ -581,7 +629,7 @@ feed call are combined."
                  (name (or (sse-nonempty-string (lispm-kernel/json:json-get fn "name")) ""))
                  (raw-args (lispm-kernel/json:json-get fn "arguments"))
                  (arg-str (cond ((stringp raw-args) (sse-string-trim raw-args))
-                                (raw-args (lispm-kernel/json:encode-json raw-args))
+                                ((sse-json-present-p raw-args) (lispm-kernel/json:encode-json raw-args))
                                 (t "{}"))))
             (when (and (plusp (length arg-str)) (not (sse-valid-json-string-p arg-str)))
               (push id invalid)
@@ -590,7 +638,7 @@ feed call are combined."
                   blocks)))
         (list :ok t
               :status 200
-              :stop-reason (sse-openai-finish-to-stop finish)
+              :stop-reason (sse-openai-finish-to-stop (if (stringp finish) finish "stop"))
               :usage usage
               :invalid (nreverse invalid)
               :blocks (nreverse blocks))))))
@@ -659,7 +707,7 @@ feed call are combined."
                       (:openai (sse-decode-whole-openai decoder json))))
                (let ((api-err (and (lispm-kernel/json:json-object-p json)
                                    (lispm-kernel/json:json-get json "error"))))
-                 (if api-err
+                 (if (sse-json-present-p api-err)
                      (sse-error-plist status api-err)
                      (list :ok nil :status status :type "bad_response"
                            :message (sse-truncate body 500)))))))
@@ -687,7 +735,9 @@ feed call are combined."
                         (lispm-kernel/json:json-error () nil)))
                 (api-err (and (lispm-kernel/json:json-object-p json)
                               (lispm-kernel/json:json-get json "error"))))
-           (sse-error-plist status (or api-err (sse-truncate body 500)))))))))
+           (sse-error-plist status (if (sse-json-present-p api-err)
+                                       api-err
+                                       (sse-truncate body 500)))))))))
 
 ;;;; `:llm-stream' reactor job (decoded off-thread SSE chunks + normalized outcome)
 
@@ -701,7 +751,7 @@ feed call are combined."
       (make-http-stream-spec
        http-input
        :chunk-transform (lambda (chunk)
-                          (sse-feed decoder chunk :coalesce coalesce))
+                          (sse-feed decoder chunk :coalesce coalesce :emit-tool-input t))
        :finish-transform (lambda (status value)
                            (cond
                              ((eq status 'cancelled) (values 'cancelled nil nil))

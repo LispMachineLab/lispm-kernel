@@ -70,6 +70,7 @@
   (stderr-ring (make-byte-ring 0) :type byte-ring :read-only t)
   (credit (make-stream-credit :limit 0) :type stream-credit :read-only t)
   (pending-wire nil :type list)
+  (pending-chunk nil :type (or null string))
   (stdin-poll-idx -1 :type fixnum)
   (output-poll-idx -1 :type fixnum)
   (error-poll-idx -1 :type fixnum)
@@ -116,8 +117,9 @@
   (cancelled-p (request-token (reactor-slot-request slot))))
 
 (defun slot-backpressured-p (slot)
-  "Return true when SLOT is waiting on outbox room for a pending chunk."
-  (not (null (reactor-slot-pending-wire slot))))
+  "Return true when SLOT is waiting on outbox or sink room for a pending chunk."
+  (or (not (null (reactor-slot-pending-wire slot)))
+      (not (null (reactor-slot-pending-chunk slot)))))
 
 (defun reactor-post-settled (reactor request status value)
   "Report completion of REQUEST to `P_scheduler'."
@@ -160,8 +162,11 @@ Return `:sent', `:full', `:cancelled', or `:closed'."
   (let* ((req (reactor-slot-request slot))
          (chunk-sink (request-chunk-sink req)))
     (when chunk-sink
-      (funcall chunk-sink text)
-      (return-from slot-try-emit :sent))
+      (let ((outcome (funcall chunk-sink text)))
+        (when (eq outcome :full)
+          (setf (reactor-slot-pending-chunk slot) text)
+          (return-from slot-try-emit :full))
+        (return-from slot-try-emit :sent)))
     (let* ((transform (reactor-slot-chunk-transform slot))
            (items (if transform (funcall transform text) (list text)))
            (id (request-id req))
@@ -172,7 +177,15 @@ Return `:sent', `:full', `:cancelled', or `:closed'."
           :sent))))
 
 (defun slot-flush-pending (reactor slot)
-  "Flush SLOT's held pending wires if present; return outcome or `:empty'."
+  "Flush SLOT's held pending chunk/wires if present; return outcome or `:empty'."
+  (let ((pending-chunk (reactor-slot-pending-chunk slot)))
+    (when pending-chunk
+      (let* ((chunk-sink (request-chunk-sink (reactor-slot-request slot)))
+             (outcome (if chunk-sink (funcall chunk-sink pending-chunk) :sent)))
+        (when (eq outcome :full)
+          (return-from slot-flush-pending :full))
+        (setf (reactor-slot-pending-chunk slot) nil)
+        (return-from slot-flush-pending :sent))))
   (let ((pending (reactor-slot-pending-wire slot)))
     (if pending
         (slot-try-send-wires reactor slot pending)
@@ -272,6 +285,7 @@ Return (values NEW-STATUS NEW-VALUE TRAILING-WIRES)."
       (multiple-value-setq (status value)
         (slot-apply-finish-transform slot status value)))
     (setf (reactor-slot-pending-wire slot) nil
+          (reactor-slot-pending-chunk slot) nil
           (reactor-slot-stdin-open slot) nil
           (reactor-slot-output-open slot) nil
           (reactor-slot-errors-open slot) nil
@@ -315,7 +329,8 @@ Return (values NEW-STATUS NEW-VALUE TRAILING-WIRES)."
 (defun slot-step-draining (reactor slot)
   "Flush final pending chunk for an exited process before settling it."
   (when (slot-cancelled-p slot)
-    (setf (reactor-slot-pending-wire slot) nil)
+    (setf (reactor-slot-pending-wire slot) nil
+          (reactor-slot-pending-chunk slot) nil)
     (return-from slot-step-draining
       (reactor-finish-slot reactor slot 'cancelled nil)))
   (let ((outcome (slot-flush-pending reactor slot)))
@@ -745,6 +760,8 @@ Return (values NEW-STATUS NEW-VALUE TRAILING-WIRES)."
        (wakeup-poke pipe))
      (lambda ()
        (mbox-send inbox :stop)
+       (wakeup-poke pipe))
+     (lambda ()
        (wakeup-poke pipe)))))
 
 (setf *reactor-starter* #'start-exec-reactor)

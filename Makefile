@@ -15,6 +15,7 @@ EMACS ?= emacs
 # lisp/ of lispm-agent, the editor's agents, whose session readers the
 # kernel feeds: a checkout beside this one by default.
 LISPM_AGENT ?= ../lispm-agent/lisp
+LISPM_AGENT_DEPS ?= $(dir $(patsubst %/,%,$(LISPM_AGENT))).deps
 # LispM UI (including Kit), which translates the agent's words and asks
 # for it: a checkout beside this one by default.
 LISPM_UI ?= ../lispm-ui
@@ -28,6 +29,8 @@ LISPM_DESKTOP ?= ../lispm-desktop/lisp
 BENCH_REPEATS ?= 4
 BENCH_TERMINALS ?= 0
 BENCH_OUTPUT ?= docs/session-benchmark.json
+BENCH_AGENTS ?= 8,24,32
+BENCH_AGENT_OUTPUT ?= docs/agent-benchmark.json
 SBCL_RUN = $(SBCL) --non-interactive --no-sysinit --no-userinit
 PROGRAM = build/lispm-kernel
 SOURCES = lispm-kernel.asd scripts/build.lisp $(wildcard src/*.lisp)
@@ -35,7 +38,7 @@ AGENTS = $(wildcard $(LISPM_AGENT)/lispm-agents.el)
 AUTH = $(wildcard $(LISPM_AUTH)/lispm-auth.el)
 EMACS_BATCH = $(EMACS) -Q --batch -L lisp $(if $(AGENTS),-L $(LISPM_UI) $(if $(AUTH),-L $(LISPM_AUTH)) -L $(LISPM_AGENT))
 
-.PHONY: all test test-lisp test-emacs compile bench pin check-pins clean
+.PHONY: all test test-lisp test-emacs compile bench bench-agents pin check-pins clean
 
 all: $(PROGRAM)
 
@@ -66,6 +69,13 @@ bench: $(PROGRAM)
 	  --repeats $(BENCH_REPEATS) --terminals $(BENCH_TERMINALS) \
 	  --agent $(LISPM_AGENT) --ui $(LISPM_UI) \
 	  --desktop $(LISPM_DESKTOP) --output $(BENCH_OUTPUT)
+
+bench-agents: $(PROGRAM)
+	python3 scripts/bench-agents.py --emacs $(EMACS) --program $(PROGRAM) \
+	  --agent $(LISPM_AGENT) --agent-deps $(LISPM_AGENT_DEPS) \
+	  --ui $(LISPM_UI) --auth $(LISPM_AUTH) \
+	  --agents $(BENCH_AGENTS) --repeats $(BENCH_REPEATS) \
+	  --output $(BENCH_AGENT_OUTPUT)
 
 pin:
 	$(EMACS) -Q --batch -L lisp -l lispm-kernel-program -f lispm-kernel-program-batch-pin

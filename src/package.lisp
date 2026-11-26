@@ -116,6 +116,7 @@
            #:read-file-octets
            #:with-regular-file
            #:read-range
+           #:octets-text
            #:octet-lines
            #:native-stat-p))
 
@@ -154,6 +155,8 @@
            #:*agent-hidden-flush-ms*
            #:*agent-effect-timeout*
            #:*agent-max-events*
+           #:*agent-chunk-limit*
+           #:kernel-epoch
            #:kernel-agent-snapshot
            #:kernel-agent-list
            #:run-socket-server))

@@ -289,12 +289,14 @@ A VALUE that cannot be sent, or is too long, fails the request instead."
 
 ;;;; Kernel handle and P_scheduler private state
 
-(defstruct (reactor-handle (:constructor make-reactor-handle (thread submit-fn stop-fn))
+(defstruct (reactor-handle (:constructor make-reactor-handle
+                            (thread submit-fn stop-fn &optional (wake-fn #'identity)))
                            (:copier nil))
   "Handle to the CSP multiplexed I/O reactor process `P_reactor'."
   (thread nil :read-only t)
   (submit-fn #'identity :type function :read-only t)
-  (stop-fn #'identity :type function :read-only t))
+  (stop-fn #'identity :type function :read-only t)
+  (wake-fn #'identity :type function :read-only t))
 
 (defvar *reactor-starter* nil
   "Function (KERNEL) returning a `reactor-handle', installed by `reactor.lisp'.")
@@ -313,8 +315,22 @@ A VALUE that cannot be sent, or is too long, fails the request instead."
 (defvar *agent-manager-starter* nil
   "Function (KERNEL) returning an `agent-manager-handle', installed by `agent.lisp'.")
 
+(defstruct (epoch-counter (:constructor make-epoch-counter ()) (:copier nil))
+  "Atomic counter cell for monotonic kernel epochs."
+  (value 0 :type sb-ext:word))
+
+(defvar *kernel-epoch-counter* (make-epoch-counter)
+  "Process-wide counter distinguishing kernel restarts within the same second.")
+
+(defun next-kernel-epoch ()
+  "Return a fresh monotonic integer epoch for a newly started kernel."
+  (let ((n (1+ (sb-ext:atomic-incf (epoch-counter-value *kernel-epoch-counter*)))))
+    (+ (* (get-universal-time) 1048576)
+       (mod n 1048576))))
+
 (defstruct (kernel (:constructor make-kernel (control outbox subworkers)) (:copier nil))
   "Handle to a running CSP kernel process network."
+  (epoch (next-kernel-epoch) :type integer :read-only t)
   (control nil :type mbox :read-only t)
   (outbox nil :type credit-sink :read-only t)
   (subworkers nil :type work-group :read-only t)

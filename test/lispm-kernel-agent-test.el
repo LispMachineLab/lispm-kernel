@@ -141,7 +141,8 @@
               (lispm-kernel-agent-start rt1 "sess-1"
                                         (list :dialect :anthropic
                                               :url (concat (cdr srv) "/v1/messages")
-                                              :root dir))
+                                              :root dir
+                                              :tool-policies '(:auto ("eval_elisp"))))
               (lispm-kernel-agent-turn rt1 "sess-1"
                                        (list :turn-id "t1"
                                              :body "{\"messages\":[{\"role\":\"user\",\"content\":\"go\"}]}"))
@@ -149,19 +150,25 @@
               ;; Reply to effect and immediately detach socket!
               (lispm-kernel-agent-effect-reply rt1 "sess-1" (nth 2 effect-seen) :ok "eval-ok")
               (lispm-kernel-detach rt1))
-            ;; Give daemon 150ms to finish step 2 while Emacs is detached
-            (sleep-for 0.15)
-            ;; Second connection: resync and verify completed turn is intact!
+            ;; Second connection: poll resync until detached background turn completes!
             (let* ((rt2 (lispm-kernel-connect sock))
-                   (snap nil))
+                   (snap nil)
+                   (deadline (+ (float-time) 10)))
               (setf (lispm-kernel-runtime-event-handler rt2)
                     (lambda (msg)
                       (when (eq (car msg) 'agent-snapshot)
                         (setq snap (nth 2 msg)))))
               (should (lispm-kernel-test--wait rt2 (lambda () (lispm-kernel-runtime-hello rt2))))
-              (lispm-kernel-agent-resync rt2 "sess-1" 0)
-              (should (lispm-kernel-test--wait rt2 (lambda () snap)))
+              (while (and (not (and snap (eq (plist-get snap :state) :idle)))
+                          (< (float-time) deadline))
+                (setq snap nil)
+                (lispm-kernel-agent-resync rt2 "sess-1" 0)
+                (lispm-kernel-test--wait rt2 (lambda () snap) 2)
+                (unless (and snap (eq (plist-get snap :state) :idle))
+                  (accept-process-output nil 0.05)))
+              (should snap)
               (should (eq (plist-get snap :state) :idle))
+              (should (integerp (plist-get snap :epoch)))
               (should (string= "final-ok" (plist-get (plist-get snap :stream) :text)))
               (should (= 1 (length (plist-get snap :completed-turns))))
               (lispm-kernel-quit rt2))))

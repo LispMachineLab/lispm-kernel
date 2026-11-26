@@ -151,6 +151,29 @@
     (is (= 30 (getf (getf res :usage) :cache-read-input-tokens)))
     (is (= 20 (getf (getf res :usage) :output-tokens)))
     (is (= 3 (length (getf res :blocks)))))
+  ;; OpenAI streaming `:null' fields (`tool_calls: null`, `choices: null`) never crash
+  (let* ((dec-null (lispm-kernel:make-sse-decoder :openai))
+         (chunk-null
+           (concatenate
+            'string
+            "data: {\"choices\":null}" (string #\Newline) (string #\Newline)
+            "data: {\"choices\":[{\"delta\":{\"content\":\"ok\",\"tool_calls\":null},\"finish_reason\":\"stop\"}]}" (string #\Newline) (string #\Newline)
+            "data: [DONE]" (string #\Newline) (string #\Newline)
+            lispm-kernel::*http-status-marker* "200" (string #\Newline))))
+    (lispm-kernel:sse-feed dec-null chunk-null :coalesce t)
+    (let ((res (lispm-kernel:sse-finish dec-null '(:exit 0 :stderr ""))))
+      (is (eq t (getf res :ok)))
+      (is (string= "ok" (getf (first (getf res :blocks)) :text)))))
+  ;; Non-streamed OpenAI `:null' arguments & `:tool-input' batching
+  (let ((dec-args (lispm-kernel:make-sse-decoder :openai)))
+    (lispm-kernel:sse-feed
+     dec-args
+     (concatenate 'string
+                  "{\"choices\":[{\"message\":{\"tool_calls\":[{\"id\":\"c1\",\"function\":{\"name\":\"list_buffers\",\"arguments\":null}}]},\"finish_reason\":\"tool_calls\"}]}"
+                  lispm-kernel::*http-status-marker* "200" (string #\Newline)))
+    (let ((res (lispm-kernel:sse-finish dec-args '(:exit 0 :stderr ""))))
+      (is (eq t (getf res :ok)))
+      (is (string= "{}" (getf (first (getf res :blocks)) :input-json)))))
   ;; Non-streamed whole JSON response + HTTP 429 error
   (let ((dec-whole (lispm-kernel:make-sse-decoder :openai)))
     (lispm-kernel:sse-feed
@@ -172,3 +195,24 @@
       (is (= 429 (getf res :status)))
       (is (string= "rate_limit_error" (getf res :type)))
       (is (string= "slow down" (getf res :message))))))
+
+(deftest sse-tool-input-batching-and-other-block-json ()
+  ;; Multi-chunk `input_json_delta' emits once per `sse-feed', or 0 times when `:emit-tool-input nil'
+  (let* ((dec1 (lispm-kernel:make-sse-decoder :anthropic))
+         (ev (concatenate
+              'string
+              "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"redacted_thinking\",\"data\":\"enc\"}}" (string #\Newline) (string #\Newline)
+              "data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"id\":\"tu_1\",\"name\":\"run_shell\",\"input\":{}}}" (string #\Newline) (string #\Newline)
+              "data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"a\\\":\"}}" (string #\Newline) (string #\Newline)
+              "data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"1}\"}}" (string #\Newline) (string #\Newline)
+              "data: {\"type\":\"content_block_stop\",\"index\":1}" (string #\Newline) (string #\Newline)
+              "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"}}" (string #\Newline) (string #\Newline)
+              "data: {\"type\":\"message_stop\"}" (string #\Newline) (string #\Newline)
+              lispm-kernel::*http-status-marker* "200" (string #\Newline)))
+         (d1 (lispm-kernel:sse-feed dec1 ev :coalesce t :emit-tool-input t))
+         (res1 (lispm-kernel:sse-finish dec1 '(:exit 0 :stderr ""))))
+    (is (= 1 (count :tool-input d1 :key #'second)))
+    (is (string= "enc" (json-get (parse-json (getf (first (getf res1 :blocks)) :json)) "data")))
+    (let* ((dec2 (lispm-kernel:make-sse-decoder :anthropic))
+           (d2 (lispm-kernel:sse-feed dec2 ev :coalesce t :emit-tool-input nil)))
+      (is (= 0 (count :tool-input d2 :key #'second))))))

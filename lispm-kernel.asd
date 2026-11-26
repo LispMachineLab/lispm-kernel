@@ -38,6 +38,7 @@
                (:file "fetch")
                (:file "search")
                (:file "sessions")
+               (:file "agent-tools")
                (:file "agent")
                (:file "main"))
   :in-order-to ((test-op (test-op "lispm-kernel/test"))))
