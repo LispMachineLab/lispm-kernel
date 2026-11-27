@@ -81,7 +81,9 @@
   (:documentation "Strict RFC 8259 JSON parser matching Emacs's json-parse-string.")
   (:export #:json-error
            #:parse-json
+           #:encode-json
            #:json-object
+           #:make-json-object
            #:json-object-p
            #:json-object-pairs
            #:json-number
@@ -114,6 +116,7 @@
            #:read-file-octets
            #:with-regular-file
            #:read-range
+           #:octets-text
            #:octet-lines
            #:native-stat-p))
 
@@ -143,7 +146,20 @@
            #:stop-background-helpers
            #:handle-message
            #:handle-line
-           #:kernel-stats))
+           #:kernel-stats
+           ;; SSE decoding and agent control plane
+           #:make-sse-decoder
+           #:sse-feed
+           #:sse-finish
+           #:*agent-visible-flush-ms*
+           #:*agent-hidden-flush-ms*
+           #:*agent-effect-timeout*
+           #:*agent-max-events*
+           #:*agent-chunk-limit*
+           #:kernel-epoch
+           #:kernel-agent-snapshot
+           #:kernel-agent-list
+           #:run-socket-server))
 
 (defpackage #:lispm-kernel/sessions
   (:use #:common-lisp #:lispm-kernel/csp #:lispm-kernel/json #:lispm-kernel/files)

@@ -143,14 +143,18 @@ cancelled request stops.  An error it signals fails the request."
 
 ;;;; Requests and cancellation tokens
 
-(defstruct (request (:constructor make-request (id job input owner generation priority))
+(defstruct (request (:constructor make-request
+                     (id job input owner generation priority
+                      &optional chunk-sink done-sink))
                     (:copier nil))
-  (id 0 :type (integer 0) :read-only t)
+  (id 0 :type integer :read-only t)
   (job nil :type job :read-only t)
   (input nil :read-only t)
   (owner 0 :type integer :read-only t)
   (generation 0 :type integer :read-only t)
   (priority 0 :type integer :read-only t)
+  (chunk-sink nil :type (or null function) :read-only t)
+  (done-sink nil :type (or null function) :read-only t)
   (submitted (get-internal-real-time) :type integer :read-only t)
   ;; Owned exclusively by P_scheduler (:queued -> :running -> :answered).
   (state :queued :type (member :queued :running :answered))
@@ -285,22 +289,53 @@ A VALUE that cannot be sent, or is too long, fails the request instead."
 
 ;;;; Kernel handle and P_scheduler private state
 
-(defstruct (reactor-handle (:constructor make-reactor-handle (thread submit-fn stop-fn))
+(defstruct (reactor-handle (:constructor make-reactor-handle
+                            (thread submit-fn stop-fn &optional (wake-fn #'identity)))
                            (:copier nil))
   "Handle to the CSP multiplexed I/O reactor process `P_reactor'."
   (thread nil :read-only t)
   (submit-fn #'identity :type function :read-only t)
-  (stop-fn #'identity :type function :read-only t))
+  (stop-fn #'identity :type function :read-only t)
+  (wake-fn #'identity :type function :read-only t))
 
 (defvar *reactor-starter* nil
   "Function (KERNEL) returning a `reactor-handle', installed by `reactor.lisp'.")
 
+(defstruct (agent-manager-handle
+            (:constructor make-agent-manager-handle
+             (thread send-fn stop-fn snapshot-fn list-fn))
+            (:copier nil))
+  "Handle to the CSP agent control-plane actor `P_agents'."
+  (thread nil :read-only t)
+  (send-fn #'identity :type function :read-only t)
+  (stop-fn #'identity :type function :read-only t)
+  (snapshot-fn #'identity :type function :read-only t)
+  (list-fn #'identity :type function :read-only t))
+
+(defvar *agent-manager-starter* nil
+  "Function (KERNEL) returning an `agent-manager-handle', installed by `agent.lisp'.")
+
+(defstruct (epoch-counter (:constructor make-epoch-counter ()) (:copier nil))
+  "Atomic counter cell for monotonic kernel epochs."
+  (value 0 :type sb-ext:word))
+
+(defvar *kernel-epoch-counter* (make-epoch-counter)
+  "Process-wide counter distinguishing kernel restarts within the same second.")
+
+(defun next-kernel-epoch ()
+  "Return a fresh monotonic integer epoch for a newly started kernel."
+  (let ((n (1+ (sb-ext:atomic-incf (epoch-counter-value *kernel-epoch-counter*)))))
+    (+ (* (get-universal-time) 1048576)
+       (mod n 1048576))))
+
 (defstruct (kernel (:constructor make-kernel (control outbox subworkers)) (:copier nil))
   "Handle to a running CSP kernel process network."
+  (epoch (next-kernel-epoch) :type integer :read-only t)
   (control nil :type mbox :read-only t)
   (outbox nil :type credit-sink :read-only t)
   (subworkers nil :type work-group :read-only t)
   (reactor nil :type (or null reactor-handle))
+  (agents nil :type (or null agent-manager-handle))
   (scheduler nil)
   (writer nil)
   (workers '() :type list)
@@ -389,14 +424,18 @@ A VALUE that cannot be sent, or is too long, fails the request instead."
         (decf (gethash owner counts)))))
 
 (defun settle-request (state outbox request status value)
-  "Finalize REQUEST in STATE and post its `done' message to OUTBOX."
+  "Finalize REQUEST in STATE and post its outcome to `done-sink' or OUTBOX."
   (unless (eq (request-state request) :answered)
     (when (cancelled-p (request-token request))
       (setf status 'cancelled value nil))
     (setf (request-state request) :answered)
     (forget-request state request)
     (tally-state state status)
-    (credit-sink-put-control outbox (final-message request status value))))
+    (let ((done-sink (request-done-sink request)))
+      (if done-sink
+          (handler-case (funcall done-sink status value)
+            (serious-condition () nil))
+          (credit-sink-put-control outbox (final-message request status value))))))
 
 (defun cancel-in-state (state outbox request)
   "Signal REQUEST's cancel token; if still queued, settle it immediately."
@@ -416,9 +455,12 @@ A VALUE that cannot be sent, or is too long, fails the request instead."
       (dolist (request older)
         (cancel-in-state state outbox request)))))
 
-(defun reject-in-state (state outbox id reason)
+(defun reject-in-state (state outbox id reason &optional done-sink)
   (tally-state state 'rejected)
-  (credit-sink-put-control outbox (message-string (list 'done id 'rejected reason))))
+  (if done-sink
+      (handler-case (funcall done-sink 'rejected reason)
+        (serious-condition () nil))
+      (credit-sink-put-control outbox (message-string (list 'done id 'rejected reason)))))
 
 (defun dispatch-reactor (kernel state)
   "Dispatch queued `:reactor' requests in KERNEL up to STATE's active slot limit."
@@ -451,7 +493,8 @@ A VALUE that cannot be sent, or is too long, fails the request instead."
       (dispatch-reactor kernel state)
       (dispatch-worker-class state class)))
 
-(defun submit-in-state (kernel state outbox id name input owner generation priority)
+(defun submit-in-state (kernel state outbox id name input owner generation priority
+                        &optional chunk-sink done-sink)
   "Evaluate admission for request ID in STATE and enqueue or dispatch it."
   (let* ((job (gethash name *jobs*))
          (requests (scheduler-state-requests state))
@@ -468,8 +511,8 @@ A VALUE that cannot be sent, or is too long, fails the request instead."
                        *max-requests-per-owner*)
                    'capacity))))
     (if reason
-        (reject-in-state state outbox id reason)
-        (let ((request (make-request id job input owner generation priority))
+        (reject-in-state state outbox id reason done-sink)
+        (let ((request (make-request id job input owner generation priority chunk-sink done-sink))
               (class (job-class job)))
           (setf (gethash id requests) request)
           (incf (gethash owner (scheduler-state-owner-counts state) 0))
@@ -547,6 +590,11 @@ A VALUE that cannot be sent, or is too long, fails the request instead."
       (:submit
        (destructuring-bind (id name input owner generation priority) (rest event)
          (submit-in-state kernel state outbox id name input owner generation priority)))
+      (:submit-internal
+       (destructuring-bind (id name input owner generation priority chunk-sink done-sink)
+           (rest event)
+         (submit-in-state kernel state outbox id name input owner generation priority
+                          chunk-sink done-sink)))
       (:cancel
        (let ((request (gethash (second event) (scheduler-state-requests state))))
          (when request
@@ -653,6 +701,8 @@ CPU-WORKERS, IO-WORKERS, SUBWORKERS and REACTOR-SLOTS bound the concurrency pool
                             :arguments (list kernel class)))))
       (setf (kernel-workers kernel)
             (append (spawn-pool :cpu cpu-workers) (spawn-pool :io io-workers))))
+    (when *agent-manager-starter*
+      (setf (kernel-agents kernel) (funcall *agent-manager-starter* kernel)))
     kernel))
 
 (defun close-control-channel (kernel)
@@ -668,9 +718,16 @@ CPU-WORKERS, IO-WORKERS, SUBWORKERS and REACTOR-SLOTS bound the concurrency pool
         do (sb-thread:thread-yield)))
 
 (defun stop-kernel (kernel &key (timeout 10))
-  "Close KERNEL cleanly: cancel active work, join scheduler, reactor,
-workers, subworkers and writer within TIMEOUT seconds."
+  "Close KERNEL cleanly: cancel active work, join agents, scheduler,
+reactor, workers, subworkers and writer within TIMEOUT seconds."
   (when (cancel! (kernel-closed kernel))
+    (let ((agents (kernel-agents kernel)))
+      (when agents
+        (handler-case (funcall (agent-manager-handle-stop-fn agents))
+          (serious-condition () nil))
+        (when (agent-manager-handle-thread agents)
+          (sb-thread:join-thread (agent-manager-handle-thread agents)
+                                 :default nil :timeout timeout))))
     (close-control-channel kernel)
     (let ((gate (sb-concurrency:make-gate :name "kernel-shutdown" :open nil)))
       (mbox-send (kernel-control kernel) (list :shutdown gate))
@@ -748,20 +805,23 @@ calling thread (work-helping), without spawning per-request OS threads."
 ;;;; Emitting chunks
 
 (defun emit (datum)
-  "Send DATUM to Emacs as a chunk of the current request.
-Applies byte-credit backpressure against `*outbox-limit*' and wakes
-immediately if the request's cancellation token fires."
+  "Send DATUM to Emacs (or the request's internal `chunk-sink') as a chunk.
+Applies byte-credit backpressure against `*outbox-limit*' when writing to
+Emacs and wakes immediately if the request's cancellation token fires."
   (let ((request *request*))
     (checkpoint)
     (when request
-      (credit-sink-put-chunk (kernel-outbox *kernel*)
-                             (message-string (list 'chunk (request-id request) datum))
-                             :token (request-token request)
-                             :limit *outbox-limit*)
+      (let ((sink (request-chunk-sink request)))
+        (if sink
+            (funcall sink datum)
+            (credit-sink-put-chunk (kernel-outbox *kernel*)
+                                   (message-string (list 'chunk (request-id request) datum))
+                                   :token (request-token request)
+                                   :limit *outbox-limit*)))
       (checkpoint))
     datum))
 
-;;;; Messages from Emacs (P_reader -> P_scheduler channel)
+;;;; Messages from Emacs (P_reader -> P_scheduler / P_agents channels)
 
 (defun post-control (kernel event)
   "Send EVENT to KERNEL's coordinator, or handle closed-kernel rejection.
@@ -769,10 +829,16 @@ Uses lock-free sender pinning so every accepted EVENT arrives before `:shutdown'
   (loop
     (let ((old (kernel-control-state kernel)))
       (unless (logbitp 0 old)
-        (when (eq (first event) :submit)
-          (credit-sink-put-control
-           (kernel-outbox kernel)
-           (message-string (list 'done (second event) 'rejected 'closed))))
+        (case (first event)
+          (:submit
+           (credit-sink-put-control
+            (kernel-outbox kernel)
+            (message-string (list 'done (second event) 'rejected 'closed))))
+          (:submit-internal
+           (let ((done-sink (eighth event)))
+             (when done-sink
+               (handler-case (funcall done-sink 'rejected 'closed)
+                 (serious-condition () nil))))))
         (return nil))
       (when (eql old (sb-ext:compare-and-swap (kernel-control-state kernel) old (+ old 2)))
         (unwind-protect
@@ -780,8 +846,15 @@ Uses lock-free sender pinning so every accepted EVENT arrives before `:shutdown'
           (sb-ext:atomic-decf (kernel-control-state kernel) 2))
         (return t)))))
 
+(defun send-agent-command (kernel command)
+  "Forward COMMAND to KERNEL's `P_agents' coordinator if active and open."
+  (let ((agents (kernel-agents kernel)))
+    (when (and agents (logbitp 0 (kernel-control-state kernel)))
+      (funcall (agent-manager-handle-send-fn agents) command)
+      t)))
+
 (defun handle-message (kernel message)
-  "Validate MESSAGE from Emacs and forward it to `P_scheduler'.
+  "Validate MESSAGE from Emacs and forward it to `P_scheduler' or `P_agents'.
 Return :quit when Emacs asks the kernel to end."
   (unless (and (consp message) (keywordp (first message)))
     (message-error "A message is a list headed by a symbol, not ~S" message))
@@ -810,6 +883,50 @@ Return :quit when Emacs asks the kernel to end."
        (post-control kernel '(:clear-caches)))
       (:ping
        (post-control kernel (list :ping arguments)))
+      (:agent-start
+       (destructuring-bind (session config) arguments
+         (check-type session string)
+         (check-type config list)
+         (send-agent-command kernel (list :agent-start session config))))
+      (:agent-turn
+       (destructuring-bind (session input) arguments
+         (check-type session string)
+         (check-type input list)
+         (send-agent-command kernel (list :agent-turn session input))))
+      (:agent-cancel
+       (destructuring-bind (session) arguments
+         (check-type session string)
+         (send-agent-command kernel (list :agent-cancel session))))
+      (:agent-effect-reply
+       (destructuring-bind (session effect-id status result) arguments
+         (check-type session string)
+         (check-type effect-id integer)
+         (check-type status keyword)
+         (send-agent-command kernel (list :agent-effect-reply session effect-id status result))))
+      (:agent-approval-decision
+       (destructuring-bind (session call-id decision &key reason) arguments
+         (check-type session string)
+         (check-type call-id string)
+         (check-type decision keyword)
+         (send-agent-command kernel (list :agent-approval-decision session call-id decision reason))))
+      (:agent-viewport-subscribe
+       (destructuring-bind (session mode) arguments
+         (check-type session string)
+         (check-type mode keyword)
+         (send-agent-command kernel (list :agent-viewport-subscribe session mode))))
+      (:agent-resync
+       (destructuring-bind (session &key since-seq) arguments
+         (check-type session string)
+         (check-type since-seq (or null integer))
+         (send-agent-command kernel (list :agent-resync session since-seq))))
+      (:agent-list
+       (when arguments
+         (message-error "(agent-list) takes no arguments"))
+       (send-agent-command kernel '(:agent-list)))
+      (:agent-stop
+       (destructuring-bind (session) arguments
+         (check-type session string)
+         (send-agent-command kernel (list :agent-stop session))))
       (:quit :quit))))
 
 (defun submit-id (line)

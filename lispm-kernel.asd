@@ -21,7 +21,8 @@
   :author "Ryan.K"
   :license "AGPL-3.0-or-later"
   :depends-on ((:require "sb-posix")
-               (:require "sb-concurrency"))
+               (:require "sb-concurrency")
+               (:require "sb-bsd-sockets"))
   :pathname "src/"
   :serial t
   :components ((:file "package")
@@ -33,9 +34,12 @@
                (:file "jobs")
                (:file "exec")
                (:file "reactor")
+               (:file "sse")
                (:file "fetch")
                (:file "search")
                (:file "sessions")
+               (:file "agent-tools")
+               (:file "agent")
                (:file "main"))
   :in-order-to ((test-op (test-op "lispm-kernel/test"))))
 
@@ -55,7 +59,9 @@
                (:file "sessions-test")
                (:file "fetch-test")
                (:file "exec-test")
-               (:file "search-test"))
+               (:file "search-test")
+               (:file "sse-test")
+               (:file "agent-test"))
   :perform (test-op (operation component)
              (unless (uiop:symbol-call :lispm-kernel/test :run-tests)
                (error "The kernel's tests failed"))))
