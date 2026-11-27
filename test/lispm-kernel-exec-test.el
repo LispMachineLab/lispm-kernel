@@ -302,5 +302,93 @@ holding FOO and BAR; return a function that does, given a callback."
       (lispm-kernel-stop runtime)
       (delete-directory dir t))))
 
+(ert-deftest lispm-kernel-exec-owner-partitioning ()
+  (let ((lispm-kernel-exec--owners (make-hash-table :test #'equal))
+        (lispm-kernel-exec--next-owner lispm-kernel-exec--agent-owner-base)
+        (lispm-kernel-exec-owner nil))
+    ;; Default owner stays 4; integers pass through; named agents isolate deterministically.
+    (should (eql 4 (lispm-kernel-exec-owner-id)))
+    (should (eql 77 (lispm-kernel-exec-owner-id 77)))
+    (let ((id-a (lispm-kernel-exec-owner-id "agent-alpha"))
+          (id-b (lispm-kernel-exec-owner-id "agent-beta")))
+      (should (>= id-a lispm-kernel-exec--agent-owner-base))
+      (should (not (eql id-a id-b)))
+      (should (eql id-a (lispm-kernel-exec-owner-id "agent-alpha")))
+      (let ((lispm-kernel-exec-owner "agent-alpha"))
+        (should (eql id-a (lispm-kernel-exec-owner-id))))
+      (lispm-kernel-exec-release-owner "agent-alpha")
+      (should (> (lispm-kernel-exec-owner-id "agent-alpha") id-a)))
+    ;; Strip :owner cleanly without mutating caller plist.
+    (let ((orig (list :owner "agent-beta" :timeout 5 :input "x")))
+      (should (equal (list :timeout 5 :input "x") (lispm-kernel-exec--strip-owner orig)))
+      (should (equal (list :owner "agent-beta" :timeout 5 :input "x") orig)))
+    ;; Submission APIs forward per-owner IDs and fallback strips :owner.
+    (let ((submitted-owners nil)
+          (had (boundp 'lispm-exec-function))
+          (old (bound-and-true-p lispm-exec-function))
+          (fallback-keys nil))
+      (unwind-protect
+          (lispm-kernel-exec-test--with (runtime _local)
+            (cl-letf (((symbol-function 'lispm-kernel-submit)
+                       (lambda (_rt _job _input &rest keys)
+                         (push (plist-get keys :owner) submitted-owners)
+                         (run-at-time 0 nil (plist-get keys :on-result) 'cancelled nil)
+                         1)))
+              (let ((default-directory temporary-file-directory))
+                (lispm-kernel-exec "sh" '("-c" "true") #'ignore :owner "exec-owner")
+                (lispm-kernel-http-stream "https://example.test" nil "" #'ignore #'ignore
+                                          :owner "http-owner")
+                (lispm-kernel-search-files (list (expand-file-name "a.el" temporary-file-directory))
+                                           "foo" nil #'ignore :owner "search-owner")))
+            (should (= 3 (length submitted-owners)))
+            (should (= 3 (length (delete-dups (copy-sequence submitted-owners)))))
+            ;; Without kernel runtime, `lispm-kernel-exec--around' strips :owner.
+            (setq lispm-exec-function (lambda (_prog _args _cb &rest keys) (setq fallback-keys keys)))
+            (let ((lispm-kernel-exec-runtime-function (lambda () nil)))
+              (lispm-kernel-exec-mode 1)
+              (funcall lispm-exec-function "sh" '("-c" "true") #'ignore
+                       :timeout 3 :owner "fallback-owner")
+              (should (equal '(:timeout 3) fallback-keys))))
+        (lispm-kernel-exec-mode -1)
+        (if had (setq lispm-exec-function old) (makunbound 'lispm-exec-function))))))
+
+(ert-deftest lispm-kernel-exec-concurrent-streams-and-exec ()
+  (let ((dir (make-temp-file "lispm-kernel-concurrent" t)))
+    (unwind-protect
+        (lispm-kernel-exec-test--with (runtime local)
+          (let ((default-directory (file-name-as-directory dir))
+                (sample (expand-file-name "stream.txt" dir))
+                (exec-results (make-hash-table :test #'eql))
+                (http-results (make-hash-table :test #'eql)))
+            (with-temp-file sample (insert "concurrent stream line\n"))
+            (dotimes (i 12)
+              (let ((idx i))
+                (lispm-kernel-exec
+                 "sh" (list "-c" (format "sleep 0.1; printf 'exec-%d'" idx))
+                 (lambda (exit out _err)
+                   (puthash idx (list exit out) exec-results))
+                 :owner (format "agent-exec-%d" idx))))
+            (dotimes (i 8)
+              (let ((idx i))
+                (lispm-kernel-http-stream
+                 (concat "file://" (file-truename sample))
+                 '("X-Agent: parallel")
+                 "{}"
+                 nil
+                 (lambda (out)
+                   (puthash idx out http-results))
+                 :owner (format "agent-http-%d" idx))))
+            (should (lispm-kernel-test--wait
+                     runtime
+                     (lambda ()
+                       (and (= 12 (hash-table-count exec-results))
+                            (= 8 (hash-table-count http-results))))))
+            (should-not local)
+            (dotimes (i 12)
+              (should (equal (list 0 (format "exec-%d" i)) (gethash i exec-results))))
+            (dotimes (i 8)
+              (should (string-match-p "concurrent stream line" (gethash i http-results))))))
+      (delete-directory dir t))))
+
 (provide 'lispm-kernel-exec-test)
 ;;; lispm-kernel-exec-test.el ends here

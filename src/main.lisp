@@ -37,13 +37,57 @@
 (defparameter *subworkers* 3
   "Persistent subworker threads shared by data-parallel batches.")
 
+(defparameter *cli-integer-options*
+  '(("--cpu-workers" :cpu-workers 1 64)
+    ("--io-workers" :io-workers 1 64)
+    ("--subworkers" :subworkers 0 64)
+    ("--max-requests" :max-requests 1 65536)
+    ("--max-requests-per-owner" :max-requests-per-owner 1 65536)
+    ("--max-reactor-slots" :max-reactor-slots 1 16384)
+    ("--stream-credit" :stream-credit 1024 67108864))
+  "Supported integer CLI option specifications: (FLAG KEY MIN MAX).")
+
+(defun parse-bounded-integer (flag text min max)
+  "Parse TEXT as an integer in [MIN, MAX] for CLI FLAG, or signal `message-error'."
+  (let ((value (and (plusp (length text))
+                    (every #'digit-char-p text)
+                    (handler-case (parse-integer text)
+                      (parse-error () nil)))))
+    (unless (and (integerp value) (<= min value max))
+      (message-error "Option ~A requires an integer in [~D, ~D], not ~S" flag min max text))
+    value))
+
+(defun parse-cli-options (argv)
+  "Parse command-line options ARGV.
+Return `:version' when `--version' is passed, or a keyword plist of options."
+  (let ((options nil)
+        (rest argv))
+    (loop while rest
+          for flag = (pop rest)
+          do (when (string= flag "--version")
+               (return-from parse-cli-options :version))
+             (let ((spec (assoc flag *cli-integer-options* :test #'string=)))
+               (unless spec
+                 (message-error "Unknown option ~S" flag))
+               (unless rest
+                 (message-error "Option ~A requires an integer argument" flag))
+               (destructuring-bind (_ key min max) spec
+                 (declare (ignore _))
+                 (setf (getf options key)
+                       (parse-bounded-integer flag (pop rest) min max)))))
+    options))
+
 (defun hello ()
   (list 'hello
         :protocol +protocol+
         :pid (sb-posix:getpid)
         :lisp (format nil "~A ~A" (lisp-implementation-type) (lisp-implementation-version))
         :machine (string-downcase (machine-type))
-        :workers (list :cpu *cpu-workers* :io *io-workers*)
+        :workers (list :cpu *cpu-workers* :io *io-workers* :reactor *max-reactor-slots*)
+        :limits (list :requests *max-requests*
+                      :per-owner *max-requests-per-owner*
+                      :reactor *max-reactor-slots*
+                      :stream-credit *exec-stream-credit*)
         :nanoseconds (and (lispm-kernel/files:native-stat-p) t)
         :jobs (sort (loop for name being the hash-keys of *jobs* collect name) #'string<)))
 
@@ -69,29 +113,45 @@ longer reads them, the kernel stops its work and ends."
 (defun main ()
   "Run the kernel for Emacs over standard input and output."
   (sb-ext:disable-debugger)
-  (when (member "--version" (rest sb-ext:*posix-argv*) :test #'string=)
-    (format t "lispm-kernel, protocol ~D, ~A ~A~%"
-            +protocol+ (lisp-implementation-type) (lisp-implementation-version))
-    (finish-output)
-    (sb-ext:exit :code 0))
-  (setf (sb-ext:bytes-consed-between-gcs) (* 16 1024 1024))
-  (let* ((input (sb-sys:make-fd-stream 0 :input t :buffering :full :name "Emacs"
-                                         :external-format '(:utf-8 :replacement #\REPLACEMENT_CHARACTER)))
-         (output (sb-sys:make-fd-stream 1 :output t :buffering :full :name "Emacs"
-                                          :external-format :utf-8))
-         (kernel (start-kernel (stream-sink output)
-                               :cpu-workers *cpu-workers*
-                               :io-workers *io-workers*
-                               :subworkers *subworkers*)))
-    (setf *kernel* kernel)
-    (credit-sink-put-control (kernel-outbox kernel) (message-string (hello)))
-    (unwind-protect
-         (handler-case
-             (loop for line = (read-line input nil nil)
-                   while line
-                   until (eq (handle-line kernel line) :quit))
-           (error (condition)
-             (format *error-output* "lispm-kernel: ~A~%" (condition-text condition))))
-      (handler-case (stop-kernel kernel :timeout 2)
-        (serious-condition () nil)))
-    (sb-ext:exit :code 0 :abort t)))
+  (let ((options (handler-case (parse-cli-options (rest sb-ext:*posix-argv*))
+                   (message-error (condition)
+                     (format *error-output* "lispm-kernel: ~A~%" (condition-text condition))
+                     (finish-output *error-output*)
+                     (sb-ext:exit :code 2)))))
+    (when (eq options :version)
+      (format t "lispm-kernel, protocol ~D, ~A ~A~%"
+              +protocol+ (lisp-implementation-type) (lisp-implementation-version))
+      (finish-output)
+      (sb-ext:exit :code 0))
+    (setf (sb-ext:bytes-consed-between-gcs) (* 16 1024 1024))
+    (let* ((*cpu-workers* (or (getf options :cpu-workers) *cpu-workers*))
+           (*io-workers* (or (getf options :io-workers) *io-workers*))
+           (*subworkers* (or (getf options :subworkers) *subworkers*))
+           (*max-requests* (or (getf options :max-requests) *max-requests*))
+           (*max-requests-per-owner*
+             (or (getf options :max-requests-per-owner) *max-requests-per-owner*))
+           (*max-reactor-slots*
+             (or (getf options :max-reactor-slots) *max-reactor-slots*))
+           (*exec-stream-credit*
+             (or (getf options :stream-credit) *exec-stream-credit*))
+           (input (sb-sys:make-fd-stream 0 :input t :buffering :full :name "Emacs"
+                                           :external-format '(:utf-8 :replacement #\REPLACEMENT_CHARACTER)))
+           (output (sb-sys:make-fd-stream 1 :output t :buffering :full :name "Emacs"
+                                            :external-format :utf-8))
+           (kernel (start-kernel (stream-sink output)
+                                 :cpu-workers *cpu-workers*
+                                 :io-workers *io-workers*
+                                 :subworkers *subworkers*
+                                 :reactor-slots *max-reactor-slots*)))
+      (setf *kernel* kernel)
+      (credit-sink-put-control (kernel-outbox kernel) (message-string (hello)))
+      (unwind-protect
+           (handler-case
+               (loop for line = (read-line input nil nil)
+                     while line
+                     until (eq (handle-line kernel line) :quit))
+             (error (condition)
+               (format *error-output* "lispm-kernel: ~A~%" (condition-text condition))))
+        (handler-case (stop-kernel kernel :timeout 2)
+          (serious-condition () nil)))
+      (sb-ext:exit :code 0 :abort t))))

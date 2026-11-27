@@ -131,6 +131,12 @@ otherwise return true."
 
 ;;;; Credit-bounded outbox sink
 
+(defstruct (stream-credit (:constructor make-stream-credit (&key (limit (* 256 1024))))
+                          (:copier nil))
+  "Lock-free per-stream byte budget isolating one noisy stream from sibling streams."
+  (limit (* 256 1024) :type sb-ext:word :read-only t)
+  (waiting 0 :type sb-ext:word))
+
 (defstruct (credit-sink (:constructor make-credit-sink (&key (limit (* 4 1024 1024))))
                         (:copier nil))
   "A FIFO message channel where control messages pass freely while data chunks
@@ -138,23 +144,47 @@ respect a byte credit budget and wake individually on cancellation."
   (wire (make-mbox :name "credit-sink wire") :type mbox :read-only t)
   (room-waiters (sb-concurrency:make-queue :name "credit-sink waiters")
    :type sb-concurrency:queue :read-only t)
+  (room-hooks '() :type list)
   (limit 0 :type sb-ext:word)
   (waiting 0 :type sb-ext:word)
   (peak 0 :type sb-ext:word)
   (closed nil :type boolean))
 
 (declaim (ftype (function (credit-sink) boolean) credit-sink-closed-p)
+         (ftype (function (credit-sink function) boolean) credit-sink-register-room-hook)
          (ftype (function (credit-sink string) boolean) credit-sink-put-control)
          (ftype (function (credit-sink string &key (:token (or null cancel-token))
                                                    (:limit (or null (integer 0))))
                           boolean)
                 credit-sink-put-chunk)
+         (ftype (function (credit-sink string &key (:token (or null cancel-token))
+                                                   (:limit (or null (integer 0)))
+                                                   (:stream-credit (or null stream-credit)))
+                          (member :sent :full :cancelled :closed))
+                credit-sink-try-put-chunk)
          (ftype (function (credit-sink) list) credit-sink-take)
          (ftype (function (credit-sink) credit-sink) credit-sink-close))
 
 (defun credit-sink-closed-p (sink)
   "Return true when SINK has been closed."
   (credit-sink-closed sink))
+
+(defun credit-sink-register-room-hook (sink hook)
+  "Register zero-argument HOOK to run when SINK frees credit or closes.
+Invoke HOOK immediately and return nil when SINK is already closed."
+  (check-type hook function)
+  (loop
+    (when (credit-sink-closed sink)
+      (handler-case (funcall hook)
+        (serious-condition () nil))
+      (return nil))
+    (let* ((old (credit-sink-room-hooks sink))
+           (next (cons hook old)))
+      (when (eq old (sb-ext:compare-and-swap (credit-sink-room-hooks sink) old next))
+        (when (credit-sink-closed sink)
+          (handler-case (funcall hook)
+            (serious-condition () nil)))
+        (return t)))))
 
 (defun update-peak-waiting (sink current)
   "Monotonically raise SINK's peak queued byte count to at least CURRENT."
@@ -164,6 +194,18 @@ respect a byte credit budget and wake individually on cancellation."
       (when (or (>= old current)
                 (eql old (sb-ext:compare-and-swap (credit-sink-peak sink) old current)))
         (return)))))
+
+(defun try-acquire-stream-credit (sc bytes)
+  "Atomically reserve BYTES in per-stream budget SC when room allows."
+  (declare (type stream-credit sc) (type sb-ext:word bytes))
+  (let ((limit (stream-credit-limit sc)))
+    (loop
+      (let ((current (stream-credit-waiting sc)))
+        (when (and (plusp current) (> (+ current bytes) limit))
+          (return nil))
+        (when (eql current (sb-ext:compare-and-swap (stream-credit-waiting sc)
+                                                  current (+ current bytes)))
+          (return t))))))
 
 (defun try-acquire-credit (sink bytes limit)
   "Atomically reserve BYTES against LIMIT in SINK when room allows."
@@ -178,12 +220,15 @@ respect a byte credit budget and wake individually on cancellation."
           (return t))))))
 
 (defun wake-room-waiters (sink)
-  "Wake all senders currently waiting for byte credit in SINK."
+  "Wake all senders and room hooks currently waiting on SINK."
   (let ((queue (credit-sink-room-waiters sink)))
     (loop
       (multiple-value-bind (gate found) (sb-concurrency:dequeue queue)
         (unless found (return))
-        (sb-concurrency:open-gate gate)))))
+        (sb-concurrency:open-gate gate))))
+  (dolist (hook (credit-sink-room-hooks sink))
+    (handler-case (funcall hook)
+      (serious-condition () nil))))
 
 (defun credit-sink-put-control (sink string)
   "Send control or final message STRING to SINK without waiting for credit.
@@ -193,6 +238,42 @@ Return nil when SINK is already closed."
       (progn
         (mbox-send (credit-sink-wire sink) (cons string nil))
         t)))
+
+(defun release-chunk-credit (sink bytes stream-credit)
+  "Return reserved BYTES to SINK and STREAM-CREDIT after an aborted send."
+  (declare (type credit-sink sink)
+           (type sb-ext:word bytes)
+           (type (or null stream-credit) stream-credit))
+  (sb-ext:atomic-decf (credit-sink-waiting sink) bytes)
+  (when stream-credit
+    (sb-ext:atomic-decf (stream-credit-waiting stream-credit) bytes))
+  (wake-room-waiters sink))
+
+(defun credit-sink-try-put-chunk (sink string &key token limit stream-credit)
+  "Send chunk STRING to SINK without blocking.
+Return `:sent' when accepted, `:full' when global or STREAM-CREDIT budget is
+exhausted, `:cancelled' when TOKEN fired, or `:closed' when SINK is closed."
+  (when (and token (cancelled-p token))
+    (return-from credit-sink-try-put-chunk :cancelled))
+  (when (credit-sink-closed sink)
+    (return-from credit-sink-try-put-chunk :closed))
+  (let ((bytes (length string))
+        (effective-limit (max 0 (or limit (credit-sink-limit sink)))))
+    (when (and stream-credit (not (try-acquire-stream-credit stream-credit bytes)))
+      (return-from credit-sink-try-put-chunk :full))
+    (unless (try-acquire-credit sink bytes effective-limit)
+      (when stream-credit
+        (sb-ext:atomic-decf (stream-credit-waiting stream-credit) bytes))
+      (return-from credit-sink-try-put-chunk :full))
+    (when (and token (cancelled-p token))
+      (release-chunk-credit sink bytes stream-credit)
+      (return-from credit-sink-try-put-chunk :cancelled))
+    (when (credit-sink-closed sink)
+      (release-chunk-credit sink bytes stream-credit)
+      (return-from credit-sink-try-put-chunk :closed))
+    (mbox-send (credit-sink-wire sink)
+               (cons string (if stream-credit (cons bytes stream-credit) bytes)))
+    :sent))
 
 (defun credit-sink-put-chunk (sink string &key token limit)
   "Send chunk STRING to SINK, waiting when queued chunks exceed LIMIT.
@@ -236,6 +317,23 @@ When TOKEN is cancelled while waiting, nothing is queued and nil is returned."
                (sb-concurrency:wait-on-gate gate :timeout 0.05))))
       (setf active-gate nil))))
 
+(defun release-entry-credits (sink entries)
+  "Credit back global and per-stream byte budgets for drained ENTRIES in SINK."
+  (let ((freed 0))
+    (declare (type sb-ext:word freed))
+    (dolist (entry entries)
+      (let ((meta (cdr entry)))
+        (cond ((integerp meta)
+               (incf freed (the sb-ext:word meta)))
+              ((consp meta)
+               (let ((bytes (the sb-ext:word (car meta)))
+                     (sc (the stream-credit (cdr meta))))
+                 (incf freed bytes)
+                 (sb-ext:atomic-decf (stream-credit-waiting sc) bytes))))))
+    (when (plusp freed)
+      (sb-ext:atomic-decf (credit-sink-waiting sink) freed)
+      (wake-room-waiters sink))))
+
 (defun credit-sink-take (sink)
   "Block until at least one message arrives in SINK, then drain and return a
 batch of strings in FIFO order.  Return nil once SINK is closed and empty."
@@ -245,19 +343,17 @@ batch of strings in FIFO order.  Return nil once SINK is closed and empty."
              (rest (mbox-drain wire))
              (entries (cons first rest))
              (messages '())
-             (freed 0)
+             (credit-entries '())
              (saw-eof nil))
-        (declare (type sb-ext:word freed))
         (dolist (entry entries)
           (if (eq entry :eof)
               (setf saw-eof t)
               (progn
                 (push (car entry) messages)
                 (when (cdr entry)
-                  (incf freed (the sb-ext:word (cdr entry)))))))
-        (when (plusp freed)
-          (sb-ext:atomic-decf (credit-sink-waiting sink) freed)
-          (wake-room-waiters sink))
+                  (push entry credit-entries)))))
+        (when credit-entries
+          (release-entry-credits sink credit-entries))
         (when messages
           (when saw-eof
             (mbox-send wire :eof))

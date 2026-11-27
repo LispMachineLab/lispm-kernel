@@ -200,6 +200,10 @@ END, or where a sequence begins that END cuts short."
           (sb-sys:signed-sap-ref-16 sap (+ offset 4)) events
           (sb-sys:signed-sap-ref-16 sap (+ offset 6)) 0)))
 
+(defun pollfd-revents (pollbuf slot)
+  "Read the 16-bit `revents' field of `struct pollfd' entry SLOT in POLLBUF."
+  (sb-sys:signed-sap-ref-16 (sb-sys:vector-sap pollbuf) (+ (* slot 8) 6)))
+
 (defun wait-wakeup-pipe (pipe timeout-ms)
   "Wait up to TIMEOUT-MS milliseconds on PIPE via `poll(2)' and drain it."
   (let ((pollbuf (make-array 8 :element-type '(unsigned-byte 8) :initial-element 0))
@@ -272,44 +276,22 @@ When INHERIT is non-nil, merge ENV over the kernel's own environment."
                      (push entry merged))))
                (nreverse merged))))))
 
-;;;; Single-thread non-blocking stream multiplexer
+;;;; Non-blocking stdin pump and poll timeout helper
 
-(defun drain-stdout-fd (fd buffer carried)
-  "Drain available octets from FD, emitting whole UTF-8 chunks.
-Return (values OPEN-P NEW-CARRIED)."
-  (loop
-    (let ((count (read-nonblocking fd buffer carried)))
-      (cond ((eq count :would-block)
-             (return (values t carried)))
-            ((zerop count)
-             (when (plusp carried)
-               (emit (utf-8-text buffer 0 carried)))
-             (return (values nil 0)))
-            (t
-             (let* ((end (+ carried count))
-                    (whole (complete-utf-8-end buffer end)))
-               (when (plusp whole)
-                 (emit (utf-8-text buffer 0 whole)))
-               (replace buffer buffer :start2 whole :end2 end)
-               (setf carried (- end whole))))))))
-
-(defun drain-stderr-fd (fd scratch ring)
-  "Drain available octets from FD into RING; return OPEN-P."
-  (loop
-    (let ((count (read-nonblocking fd scratch 0)))
-      (cond ((eq count :would-block) (return t))
-            ((zerop count) (return nil))
-            (t (byte-ring-write ring scratch count))))))
-
-(defun pump-stdin-fd (fd octets offset stream)
+(defun pump-stdin-fd (fd octets offset stream &optional max-writes)
   "Write available slices of OCTETS from OFFSET to non-blocking FD.
+Stop after MAX-WRITES writes when non-nil so large payloads yield fairly.
 Return (values OPEN-P NEXT-OFFSET), closing STREAM on completion or EPIPE."
-  (let ((total (length octets)))
+  (let ((total (length octets))
+        (writes 0))
     (loop while (< offset total)
+          when (and max-writes (>= writes max-writes))
+            do (return-from pump-stdin-fd (values t offset))
           do (multiple-value-bind (written errno)
                  (sb-unix:unix-write fd octets offset (min 65536 (- total offset)))
                (cond (written
-                      (incf offset written))
+                      (incf offset written)
+                      (incf writes))
                      ((= errno sb-unix:eintr))
                      ((or (= errno sb-posix:eagain) (= errno sb-posix:ewouldblock))
                       (return-from pump-stdin-fd (values t offset)))
@@ -329,110 +311,26 @@ Return (values OPEN-P NEXT-OFFSET), closing STREAM on completion or EPIPE."
                (min 1000 (ceiling (* remaining 1000) internal-time-units-per-second)))))
         (t 1000)))
 
-(defun multiplex-process-io (process pipe stdin deadline program timeout combine-error)
-  "Multiplex non-blocking stdin, stdout and stderr for PROCESS until completion.
-Return the captured UTF-8 stderr tail string."
-  (let* ((stdin-stream (and stdin (sb-ext:process-input process)))
-         (stdin-octets (and stdin (sb-ext:string-to-octets stdin :external-format :utf-8)))
-         (stdin-fd (and stdin-stream (sb-sys:fd-stream-fd stdin-stream)))
-         (stdin-pos 0)
-         (stdin-open (and stdin-fd t))
-         (output-fd (sb-sys:fd-stream-fd (sb-ext:process-output process)))
-         (error-fd (and (not combine-error)
-                        (sb-ext:process-error process)
-                        (sb-sys:fd-stream-fd (sb-ext:process-error process))))
-         (output-buf (make-array (+ *exec-read-octets* 3) :element-type '(unsigned-byte 8)))
-         (scratch (make-array 4096 :element-type '(unsigned-byte 8)))
-         (stderr-ring (make-byte-ring *exec-stderr-limit*))
-         (pollbuf (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0))
-         (output-open t)
-         (errors-open (and error-fd t))
-         (carried 0))
-    (when stdin-fd
-      (set-fd-nonblocking stdin-fd)
-      (multiple-value-setq (stdin-open stdin-pos)
-        (pump-stdin-fd stdin-fd stdin-octets stdin-pos stdin-stream)))
-    (set-fd-nonblocking output-fd)
-    (when error-fd (set-fd-nonblocking error-fd))
-    (loop while (or output-open errors-open)
-          do (checkpoint)
-             (when (and deadline (> (get-internal-real-time) deadline))
-               (exec-error "~A did not finish in ~D seconds" program timeout))
-             (let ((nfds 1))
-               (sb-sys:with-pinned-objects (pollbuf)
-                 (set-pollfd pollbuf 0 (wakeup-pipe-rfd pipe) +pollin+)
-                 (when stdin-open (set-pollfd pollbuf nfds stdin-fd +pollout+) (incf nfds))
-                 (when output-open (set-pollfd pollbuf nfds output-fd +pollin+) (incf nfds))
-                 (when errors-open (set-pollfd pollbuf nfds error-fd +pollin+) (incf nfds)))
-               (unix-poll-fds pollbuf nfds
-                              (compute-poll-timeout-ms (sb-ext:process-alive-p process) deadline))
-               (drain-wakeup-pipe pipe scratch)
-               (checkpoint)
-               (when stdin-open
-                 (multiple-value-setq (stdin-open stdin-pos)
-                   (pump-stdin-fd stdin-fd stdin-octets stdin-pos stdin-stream)))
-               (when output-open
-                 (multiple-value-setq (output-open carried)
-                   (drain-stdout-fd output-fd output-buf carried)))
-               (when errors-open
-                 (setf errors-open (drain-stderr-fd error-fd scratch stderr-ring)))
-               (when (and (not (sb-ext:process-alive-p process))
-                          (or output-open errors-open))
-                 (when output-open
-                   (multiple-value-setq (output-open carried)
-                     (drain-stdout-fd output-fd output-buf carried)))
-                 (when errors-open
-                   (setf errors-open (drain-stderr-fd error-fd scratch stderr-ring)))
-                 (when (plusp carried)
-                   (emit (utf-8-text output-buf 0 carried))
-                   (setf carried 0))
-                 (return))))
-    (byte-ring-string stderr-ring)))
+;;;; Validated reactor job specs (`exec' and `http-stream')
 
-(defun run-streaming-program (program args &key cwd env env-inherit stdin timeout search combine-error)
-  "Run PROGRAM with ARGS via a single-thread `poll(2)' multiplexer."
-  (checkpoint)
-  (let* ((pipe (open-wakeup-pipe))
-         (token (current-cancel-token))
-         (deadline (and timeout
-                        (+ (get-internal-real-time)
-                           (* timeout internal-time-units-per-second))))
-         (process nil))
-    (unwind-protect
-         (progn
-           (setf process
-                 (sb-ext:run-program
-                  program args
-                  :search search :wait nil :directory cwd
-                  :environment (exec-environment env env-inherit)
-                  :input (if stdin :stream nil)
-                  :output :stream
-                  :error (if combine-error :output :stream)
-                  :external-format '(:utf-8 :replacement #\?)
-                  :status-hook (lambda (proc)
-                                 (unless (sb-ext:process-alive-p proc)
-                                   (wakeup-poke pipe)))))
-           (when token
-             (register-cancel-hook token (lambda () (wakeup-poke pipe))))
-           (let ((stderr (multiplex-process-io process pipe stdin deadline
-                                               program timeout combine-error)))
-             (loop while (sb-ext:process-alive-p process)
-                   do (checkpoint)
-                      (when (and deadline (> (get-internal-real-time) deadline))
-                        (exec-error "~A did not finish in ~D seconds" program timeout))
-                      (wait-wakeup-pipe pipe (compute-poll-timeout-ms t deadline)))
-             (if (eq (sb-ext:process-status process) :signaled)
-                 (list :signal (sb-ext:process-exit-code process) :stderr stderr)
-                 (list :exit (sb-ext:process-exit-code process) :stderr stderr))))
-      (when process
-        (stop-process process pipe)
-        (sb-ext:process-close process))
-      (close-wakeup-pipe pipe))))
+(defstruct (exec-spec (:constructor make-exec-spec
+                       (&key program args cwd env env-inherit stdin timeout
+                             search combine-error cleanup-path))
+                      (:copier nil))
+  "Validated process launch specification executed by `P_reactor'."
+  (program "" :type string :read-only t)
+  (args '() :type list :read-only t)
+  (cwd nil :type (or null string) :read-only t)
+  (env nil :type list :read-only t)
+  (env-inherit nil :type boolean :read-only t)
+  (stdin nil :type (or null string) :read-only t)
+  (timeout nil :type (or null (integer 1 86400)) :read-only t)
+  (search nil :type boolean :read-only t)
+  (combine-error nil :type boolean :read-only t)
+  (cleanup-path nil :type (or null string) :read-only t))
 
-(define-job (exec :class :io) (input)
-  "Run PROGRAM with ARGS in CWD, its environment ENV, reading STDIN, at most
-TIMEOUT seconds; emit its standard output and return how it ended.
-INPUT is a plist of them."
+(define-job (exec :class :reactor) (input)
+  "Validate INPUT for running PROGRAM and return an `exec-spec' for `P_reactor'."
   (destructuring-bind (&key program args cwd env env-inherit stdin timeout combine-error search) input
     (check-type program string)
     (check-type args list)
@@ -443,11 +341,15 @@ INPUT is a plist of them."
     (unless (and (plusp (length program))
                  (or search (char= (char program 0) #\/)))
       (exec-error "The program to run is a file, not ~S" program))
-    (run-streaming-program program args
-                           :cwd cwd :env env :env-inherit (and env-inherit t)
-                           :stdin stdin :timeout timeout
-                           :search (and search t)
-                           :combine-error (and combine-error t))))
+    (make-exec-spec :program program
+                    :args args
+                    :cwd cwd
+                    :env (exec-environment env env-inherit)
+                    :env-inherit (and env-inherit t)
+                    :stdin stdin
+                    :timeout timeout
+                    :search (and search t)
+                    :combine-error (and combine-error t))))
 
 (defparameter *http-status-marker* (format nil "~%__LISPM_HTTP_STATUS__:")
   "Separator curl prints before the HTTP status code.")
@@ -485,10 +387,8 @@ INPUT is a plist of them."
             (handler-case (sb-posix:close fd) (sb-posix:syscall-error () nil))
             (handler-case (sb-posix:unlink path) (sb-posix:syscall-error () nil))))))))
 
-(define-job (http-stream :class :io) (input)
-  "POST BODY to URL with HEADERS using curl, streaming the response as chunks.
-INPUT is (:url URL :headers HEADERS :body BODY :curl CURL :connect-timeout INT
-:speed-time INT :max-time INT :env ENV)."
+(define-job (http-stream :class :reactor) (input)
+  "Validate INPUT and return an `exec-spec' streaming URL via curl in `P_reactor'."
   (destructuring-bind (&key url headers (body "") (curl "curl")
                             (connect-timeout 30) (speed-time 600) (max-time 900) env)
       input
@@ -499,23 +399,24 @@ INPUT is (:url URL :headers HEADERS :body BODY :curl CURL :connect-timeout INT
     (check-type connect-timeout (integer 1 3600))
     (check-type speed-time (integer 1 86400))
     (check-type max-time (integer 1 86400))
-    (let ((file (temporary-request-file body)))
-      (unwind-protect
-           (run-streaming-program
-            curl
-            (list "--silent" "--show-error" "--no-buffer"
-                  "-H" "Expect:"
-                  "--connect-timeout" (princ-to-string connect-timeout)
-                  "--speed-limit" "1"
-                  "--speed-time" (princ-to-string speed-time)
-                  "--max-time" (princ-to-string max-time)
-                  "--config" "-"
-                  "--data-binary" (concatenate 'string "@" file)
-                  "--write-out" (concatenate 'string *http-status-marker* "%{http_code}" (string #\Newline))
-                  url)
-            :env env
-            :stdin (curl-header-config headers)
-            :timeout (+ max-time 15)
-            :search (not (and (plusp (length curl)) (char= (char curl 0) #\/))))
-        (handler-case (sb-posix:unlink file)
-          (sb-posix:syscall-error () nil))))))
+    (let* ((header-config (curl-header-config headers))
+           (resolved-env (exec-environment env nil))
+           (file (temporary-request-file body)))
+      (make-exec-spec
+       :program curl
+       :args (list "--silent" "--show-error" "--no-buffer"
+                   "-H" "Expect:"
+                   "--connect-timeout" (princ-to-string connect-timeout)
+                   "--speed-limit" "1"
+                   "--speed-time" (princ-to-string speed-time)
+                   "--max-time" (princ-to-string max-time)
+                   "--config" "-"
+                   "--data-binary" (concatenate 'string "@" file)
+                   "--write-out" (concatenate 'string *http-status-marker* "%{http_code}"
+                                              (string #\Newline))
+                   url)
+       :env resolved-env
+       :stdin header-config
+       :timeout (+ max-time 15)
+       :search (not (and (plusp (length curl)) (char= (char curl 0) #\/)))
+       :cleanup-path file))))

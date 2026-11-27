@@ -154,3 +154,43 @@
                 nil (lambda (_) (declare (ignore _)) (error "must not run"))
                 '(1 2) :threads 1 :token token)))))
 
+(deftest csp-credit-sink-try-put-and-stream-credit-isolation ()
+  (let* ((sink (lispm-kernel/csp:make-credit-sink :limit 30))
+         (sc1 (lispm-kernel/csp:make-stream-credit :limit 10))
+         (sc2 (lispm-kernel/csp:make-stream-credit :limit 10))
+         (sc3 (lispm-kernel/csp:make-stream-credit :limit 100))
+         (cancel-tok (lispm-kernel/csp:make-cancel-token :name "try-cancel"))
+         (woken (lispm-kernel/csp:make-mbox :name "room-hook")))
+    (lispm-kernel/csp:credit-sink-register-room-hook
+     sink (lambda () (lispm-kernel/csp:mbox-send woken :woke)))
+    ;; Stream 1 fills its 10-byte limit; extra chunks return :full immediately.
+    (is (eq :sent (lispm-kernel/csp:credit-sink-try-put-chunk sink "12345" :stream-credit sc1)))
+    (is (eq :sent (lispm-kernel/csp:credit-sink-try-put-chunk sink "67890" :stream-credit sc1)))
+    (is (= 10 (lispm-kernel/csp:stream-credit-waiting sc1)))
+    (is (eq :full (lispm-kernel/csp:credit-sink-try-put-chunk sink "x" :stream-credit sc1)))
+    (is (= 10 (lispm-kernel/csp:stream-credit-waiting sc1)))
+    ;; Sibling stream 2 remains unblocked while stream 1 is saturated.
+    (is (eq :sent (lispm-kernel/csp:credit-sink-try-put-chunk sink "alpha" :stream-credit sc2)))
+    (is (= 5 (lispm-kernel/csp:stream-credit-waiting sc2)))
+    ;; Global limit exhaustion rolls back per-stream credit cleanly.
+    (is (eq :sent (lispm-kernel/csp:credit-sink-try-put-chunk sink "0123456789abcde" :stream-credit sc3)))
+    (is (= 30 (lispm-kernel/csp:credit-sink-waiting sink)))
+    (is (eq :full (lispm-kernel/csp:credit-sink-try-put-chunk sink "z" :stream-credit sc3)))
+    (is (= 15 (lispm-kernel/csp:stream-credit-waiting sc3)))
+    ;; Cancelled token rejects without consuming credit.
+    (lispm-kernel/csp:cancel! cancel-tok)
+    (is (eq :cancelled (lispm-kernel/csp:credit-sink-try-put-chunk sink "skip" :token cancel-tok :stream-credit sc3)))
+    (is (= 15 (lispm-kernel/csp:stream-credit-waiting sc3)))
+    ;; Taking messages frees both global and per-stream credits and fires room hooks.
+    (is (equal '("12345" "67890" "alpha" "0123456789abcde")
+               (lispm-kernel/csp:credit-sink-take sink)))
+    (is (= 0 (lispm-kernel/csp:credit-sink-waiting sink)))
+    (is (= 0 (lispm-kernel/csp:stream-credit-waiting sc1)))
+    (is (= 0 (lispm-kernel/csp:stream-credit-waiting sc2)))
+    (is (= 0 (lispm-kernel/csp:stream-credit-waiting sc3)))
+    (is (eq :woke (lispm-kernel/csp:mbox-recv woken :timeout 1)))
+    ;; Closed sink rejects without queueing.
+    (lispm-kernel/csp:credit-sink-close sink)
+    (is (eq :closed (lispm-kernel/csp:credit-sink-try-put-chunk sink "after" :stream-credit sc1)))
+    (is (null (lispm-kernel/csp:credit-sink-take sink)))))
+

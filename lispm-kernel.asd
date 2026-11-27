@@ -32,6 +32,7 @@
                (:file "runtime")
                (:file "jobs")
                (:file "exec")
+               (:file "reactor")
                (:file "fetch")
                (:file "search")
                (:file "sessions")

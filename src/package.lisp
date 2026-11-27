@@ -49,8 +49,15 @@
            #:register-cancel-hook
            #:credit-sink
            #:make-credit-sink
+           #:stream-credit
+           #:make-stream-credit
+           #:stream-credit-p
+           #:stream-credit-waiting
+           #:stream-credit-limit
            #:credit-sink-put-control
            #:credit-sink-put-chunk
+           #:credit-sink-try-put-chunk
+           #:credit-sink-register-room-hook
            #:credit-sink-take
            #:credit-sink-close
            #:credit-sink-waiting

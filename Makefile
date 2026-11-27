@@ -18,6 +18,8 @@ LISPM_AGENT ?= ../lispm-agent/lisp
 # LispM UI (including Kit), which translates the agent's words and asks
 # for it: a checkout beside this one by default.
 LISPM_UI ?= ../lispm-ui
+# LispM Auth, which `lispm-agent' requires for encrypted secrets.
+LISPM_AUTH ?= ../lispm-auth
 # LispM Desktop's lisp/, whose terminals and frame clock the terminals
 # benchmark runs with: a checkout beside this one by default.
 LISPM_DESKTOP ?= ../lispm-desktop/lisp
@@ -30,7 +32,8 @@ SBCL_RUN = $(SBCL) --non-interactive --no-sysinit --no-userinit
 PROGRAM = build/lispm-kernel
 SOURCES = lispm-kernel.asd scripts/build.lisp $(wildcard src/*.lisp)
 AGENTS = $(wildcard $(LISPM_AGENT)/lispm-agents.el)
-EMACS_BATCH = $(EMACS) -Q --batch -L lisp $(if $(AGENTS),-L $(LISPM_UI) -L $(LISPM_AGENT))
+AUTH = $(wildcard $(LISPM_AUTH)/lispm-auth.el)
+EMACS_BATCH = $(EMACS) -Q --batch -L lisp $(if $(AGENTS),-L $(LISPM_UI) $(if $(AUTH),-L $(LISPM_AUTH)) -L $(LISPM_AGENT))
 
 .PHONY: all test test-lisp test-emacs compile bench pin check-pins clean
 
